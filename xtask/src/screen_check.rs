@@ -1335,6 +1335,138 @@ pub fn context_menu_open(before: &Image, after: &Image, x: usize, y: usize) -> R
     }
 }
 
+// ---- janela nova e texto digitado --------------------------------------------
+//
+// O `--double-click`, o `--run` e o `--open` do test-boot abrem um programa
+// como uma pessoa (o duplo clique num ícone, a caixa Executar, um atalho de
+// teclado) e conferem a janela dele na tela ([`window_opened`]); o `--type`
+// digita numa janela e confere o texto ([`text_typed`]).
+
+/// O marcador da janela nova na tela.
+pub const WINDOW_OPENED_MARKER: &str = "WINDOW_OPENED_OK";
+/// O marcador do texto digitado que apareceu na janela.
+pub const TEXT_TYPED_MARKER: &str = "TEXT_TYPED_OK";
+/// As linhas de cima de uma janela em que fica a barra de título.
+const TITLE_ROWS: usize = 30;
+
+/// As linhas da tela acima da barra de tarefas (a faixa escura de baixo de
+/// `image`, [`taskbar_rows`]; a tela inteira sem ela).
+fn above_taskbar(image: &Image) -> usize {
+    image.height - taskbar_rows(image)
+}
+
+/// Uma janela nova em `after` sobre `before`. Acima da barra de tarefas
+/// (que pode mudar: o botão da janela nova), o maior grupo de mudanças tem
+/// 240x160 pixels ou mais e 3/4 ou mais deles mudados; nas primeiras
+/// [`TITLE_ROWS`] linhas dele fica a barra de título do tema claro do 19041
+/// (branca, com o título e os botões escuros): metade ou mais dos pixels
+/// claros e 1/500 ou mais escuros; fora dele, acima da barra, a tela muda em
+/// até 1/8 (o ícone que ficou selecionado).
+/// Um menu, uma dica, a tela inteira trocada, lixo e a tela parada não
+/// passam.
+pub fn window_opened(before: &Image, after: &Image) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    if after.rgb.chunks_exact(3).filter(|pixel| [pixel[0], pixel[1], pixel[2]] == BUGCHECK_BACKGROUND).count() * 2 > after.width * after.height {
+        return Err("a tela de bugcheck".into());
+    }
+    let (width, area) = (before.width, above_taskbar(before));
+    let at = |x: usize, y: usize| (y * width + x) * 3;
+    let groups = changes(&top_rows(before, area), &top_rows(after, area));
+    let Some(window) = groups.iter().max_by_key(|group| group.width() * group.height()) else {
+        return Err("a tela acima da barra de tarefas nao mudou".into());
+    };
+    let inside = |x: usize, y: usize| (window.left..=window.right).contains(&x) && (window.top..=window.bottom).contains(&y);
+    let (mut changed_in, mut changed_out) = (0usize, 0usize);
+    for y in 0..area {
+        for x in 0..width {
+            if before.rgb[at(x, y)..at(x, y) + 3] != after.rgb[at(x, y)..at(x, y) + 3] {
+                if inside(x, y) {
+                    changed_in += 1;
+                } else {
+                    changed_out += 1;
+                }
+            }
+        }
+    }
+    let size = window.width() * window.height();
+    let title = Change { left: window.left, top: window.top, right: window.right, bottom: (window.top + TITLE_ROWS - 1).min(window.bottom) };
+    let title_size = title.width() * title.height();
+    let (mut light, mut dark) = (0usize, 0usize);
+    for y in title.top..=title.bottom {
+        for x in title.left..=title.right {
+            let value = luma(&after.rgb[at(x, y)..at(x, y) + 3]);
+            light += usize::from(value >= LIGHT_LUMA);
+            dark += usize::from(value < DARK_LUMA);
+        }
+    }
+    let mut missing = Vec::new();
+    if window.width() < 240 || window.height() < 160 {
+        missing.push(format!("o maior grupo de mudancas {} e menor que uma janela (240x160)", window.describe()));
+    }
+    if changed_in * 4 < size * 3 {
+        missing.push(format!("{}% do grupo mudou (minimo 75%)", changed_in * 100 / size));
+    }
+    if light * 2 < title_size {
+        missing.push(format!("{}% da barra de titulo clara (minimo 50%)", light * 100 / title_size));
+    }
+    if dark * 500 < title_size {
+        missing.push(format!("{}% da barra de titulo escura, sem titulo nem botoes (minimo 0,2%)", dark * 100 / title_size));
+    }
+    let outside = width * area - size.min(width * area);
+    if changed_out * 8 > outside.max(1) {
+        missing.push(format!("{}% da tela fora do grupo mudou (maximo 12%)", changed_out * 100 / outside.max(1)));
+    }
+    if missing.is_empty() {
+        Ok(format!("janela {}: {}% dela mudou, barra de titulo {}% clara e {}% escura, fora dela {changed_out} pixels mudaram", window.describe(), changed_in * 100 / size, light * 100 / title_size, dark * 100 / title_size))
+    } else {
+        Err(missing.join("; "))
+    }
+}
+
+/// O texto digitado apareceu em `after` sobre `before`: acima da barra de
+/// tarefas, a tela muda em até 1/20 dos pixels, e algum grupo de mudanças
+/// é uma linha de texto: de 8 a 48 linhas de altura, 6 colunas ou mais por
+/// caractere digitado (`typed`), metade ou mais no fundo (a até 0x20 da
+/// luminância mediana do grupo: o branco do Bloco de Notas, o preto do
+/// console) e 1/100 ou mais de letras (a [`TEXT_CONTRAST`] ou mais da
+/// mediana, escuras no claro ou claras no escuro). O título da janela que
+/// muda junto (o * do Bloco de Notas) é outro grupo, menor.
+pub fn text_typed(before: &Image, after: &Image, typed: usize) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let (width, area) = (before.width, above_taskbar(before));
+    let at = |x: usize, y: usize| (y * width + x) * 3;
+    let changed = (0..area).map(|y| (0..width).filter(|&x| before.rgb[at(x, y)..at(x, y) + 3] != after.rgb[at(x, y)..at(x, y) + 3]).count()).sum::<usize>();
+    if changed == 0 {
+        return Err("a tela acima da barra de tarefas nao mudou".into());
+    }
+    if changed * 20 > width * area {
+        return Err(format!("{}% da tela mudou (maximo 5%): nao e so o texto", changed * 100 / (width * area)));
+    }
+    let groups = changes(&top_rows(before, area), &top_rows(after, area));
+    let describe: Vec<String> = groups.iter().take(6).map(Change::describe).collect();
+    let line = groups.iter().find(|group| {
+        let size = group.width() * group.height();
+        let median = median_luma(after, group.left..group.right + 1, group.top..group.bottom + 1);
+        let (mut background, mut ink) = (0usize, 0usize);
+        for y in group.top..=group.bottom {
+            for x in group.left..=group.right {
+                let distance = luma(&after.rgb[at(x, y)..at(x, y) + 3]).abs_diff(median);
+                background += usize::from(distance <= 0x20);
+                ink += usize::from(distance >= TEXT_CONTRAST);
+            }
+        }
+        (8..=48).contains(&group.height()) && group.width() >= 6 * typed && background * 2 >= size && ink * 100 >= size
+    });
+    match line {
+        Some(line) => Ok(format!("linha de texto {} com {typed} caracteres; {changed} pixels mudaram acima da barra", line.describe())),
+        None => Err(format!("nenhuma das mudancas ({}) e uma linha de texto de {} colunas ou mais sobre um fundo liso", describe.join(", "), 6 * typed)),
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -1428,6 +1560,28 @@ pub mod samples {
             paint(&mut out, x + 34..x + 34 + 60 + item * 7, top..top + 9, |px, py| if (px + py) % 3 == 0 { color } else { [0xEE, 0xEE, 0xEE] });
         }
         pointer(&mut out, x, y);
+        out
+    }
+
+    /// Uma janela do tema claro do 19041 em (`x`, `y`), `width` x `height`:
+    /// borda de 1 pixel na cor de destaque, barra de título branca de 30
+    /// linhas com o título e os três botões escuros, e o corpo `body`.
+    pub fn window(image: &Image, x: usize, y: usize, width: usize, height: usize, body: [u8; 3]) -> Image {
+        let mut out = image.clone();
+        paint(&mut out, x..x + width, y..y + height, |px, py| {
+            if px == x || py == y || px + 1 == x + width || py + 1 == y + height {
+                [0x00, 0x78, 0xD7]
+            } else if py < y + 30 {
+                [0xFF, 0xFF, 0xFF]
+            } else {
+                body
+            }
+        });
+        paint(&mut out, x + 12..x + 140, y + 10..y + 20, |px, py| if (px + py) % 3 == 0 { [0x10, 0x10, 0x10] } else { [0xFF, 0xFF, 0xFF] });
+        for button in 0..3 {
+            let left = x + width - 46 * (button + 1) + 18;
+            paint(&mut out, left..left + 10, y + 10..y + 20, |px, py| if px - left == py - y - 10 || px - left == y + 19 - py { [0x10, 0x10, 0x10] } else { [0xFF, 0xFF, 0xFF] });
+        }
         out
     }
 
@@ -1986,5 +2140,56 @@ mod tests {
         });
         assert!(context_menu_open(&before, &garbage, 360, 308).is_err());
         assert!(context_menu_open(&before, &before, 360, 308).unwrap_err().contains("nao mudou"));
+    }
+
+    /// Uma janela do tema claro (do Bloco de Notas, do console preto) sobre
+    /// a área de trabalho passa, também com a caixa Executar que saiu e o
+    /// botão novo na barra de tarefas; um menu pequeno, a janela sem barra de
+    /// título, a tela inteira trocada e a tela parada não.
+    #[test]
+    fn window_opened_sees_a_new_window_with_a_title_bar() {
+        let before = desktop(40, 218, true);
+        let opened = window_opened(&before, &window(&before, 120, 80, 640, 420, [0xFF, 0xFF, 0xFF])).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(opened.starts_with("janela 640x420 em (120,80)"), "{opened}");
+        assert!(window_opened(&before, &window(&before, 200, 100, 600, 400, [0x0C, 0x0C, 0x0C])).is_ok());
+        let mut with_run = window(&before, 10, 450, 400, 220, [0xF0, 0xF0, 0xF0]);
+        let mut both = window(&with_run, 300, 60, 640, 420, [0xFF, 0xFF, 0xFF]);
+        paint(&mut both, 10..410, 450..670, |x, y| {
+            let at = (y * WIDTH + x) * 3;
+            [before.rgb[at], before.rgb[at + 1], before.rgb[at + 2]]
+        });
+        paint(&mut both, 400..448, HEIGHT - 40..HEIGHT, |_, _| [0x40, 0x40, 0x40]);
+        assert!(window_opened(&with_run, &both).is_err(), "a comparacao e com a tela de antes do Win+R");
+        assert!(window_opened(&before, &both).is_ok(), "{:?}", window_opened(&before, &both));
+        assert!(window_opened(&before, &context_menu(&before, 360, 308, 186, 5, 2)).unwrap_err().contains("menor que uma janela"));
+        let mut plain = before.clone();
+        paint(&mut plain, 120..760, 80..500, |_, _| [0x30, 0x30, 0x30]);
+        assert!(window_opened(&before, &plain).unwrap_err().contains("barra de titulo"));
+        assert!(window_opened(&before, &filled(WIDTH, HEIGHT, [0xFF, 0xFF, 0xFF])).is_err());
+        assert!(window_opened(&before, &before).unwrap_err().contains("nao mudou"));
+        with_run = before.clone();
+        assert!(window_opened(&before, &with_run).is_err());
+    }
+
+    /// Uma linha de texto escuro sobre o branco da janela passa, também com o
+    /// título que mudou; uma linha curta demais para o texto, a janela inteira
+    /// redesenhada e a tela parada não.
+    #[test]
+    fn text_typed_sees_a_line_of_dark_text() {
+        let desk = desktop(40, 218, true);
+        let before = window(&desk, 120, 80, 640, 420, [0xFF, 0xFF, 0xFF]);
+        let mut after = before.clone();
+        paint(&mut after, 126..216, 116..132, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] });
+        paint(&mut after, 132..140, 90..100, |_, _| [0x10, 0x10, 0x10]);
+        let typed = text_typed(&before, &after, 10).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(typed.starts_with("linha de texto 90x16 em (126,116)"), "{typed}");
+        assert!(text_typed(&before, &after, 20).unwrap_err().contains("nenhuma das mudancas"));
+        assert!(text_typed(&before, &window(&desk, 120, 80, 640, 420, [0x80, 0x80, 0x80]), 10).unwrap_err().contains("nao e so o texto"));
+        assert!(text_typed(&before, &before, 10).unwrap_err().contains("nao mudou"));
+        // O texto claro do console sobre o preto também é texto.
+        let console = window(&desk, 120, 80, 640, 420, [0x0C, 0x0C, 0x0C]);
+        let mut echoed = console.clone();
+        paint(&mut echoed, 126..216, 116..132, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0xCC, 0xCC, 0xCC] } else { [0x0C, 0x0C, 0x0C] });
+        assert!(text_typed(&console, &echoed, 10).is_ok(), "{:?}", text_typed(&console, &echoed, 10));
     }
 }

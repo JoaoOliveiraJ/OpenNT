@@ -7745,9 +7745,41 @@ aberto e parado e aperta o Esc até a tela de antes voltar
 12 pixels do clique, tem de 80x40 a 600x700 pixels, 3/4 ou mais claros, de
 1/500 a 1/5 de texto escuro em duas linhas ou mais, e fora dele a tela muda
 em até 1/64; o menu do 19041 na área de trabalho mede 187x127, 91% claro e
-1% de texto escuro em 3 linhas), e o log ganha o `CONTEXT_MENU_OK`. Um
-`--dismiss`, `--mouse`, `--start-menu` ou `--context-menu` que não vê a tela
-mudar encerra o teste com o que faltou na última leitura.
+1% de texto escuro em 3 linhas), e o log ganha o `CONTEXT_MENU_OK`.
+
+Três entradas abrem um programa como uma pessoa e conferem a janela dele na
+tela (`screen_check::window_opened`, por até 90 s, em duas leituras seguidas
+iguais): acima da barra de tarefas, que pode mudar (o botão da janela nova),
+o maior grupo de mudanças tem 240x160 pixels ou mais, 3/4 deles mudados, e
+nas 30 linhas de cima a barra de título do tema claro do 19041 (metade ou
+mais dos pixels claros e 1/500 ou mais escuros: o título e os botões); fora
+dele a tela muda em até 1/8 (o ícone que ficou
+selecionado). O log ganha o `WINDOW_OPENED_OK`. O `--double-click=...:X,Y`
+leva o ponteiro a (X, Y) como o `--context-menu` e aperta duas vezes o botão
+esquerdo, dentro do tempo do clique duplo do Windows (os quatro
+`mouse_button` a 40 ms um do outro). O `--run=...:COMANDO` aperta Win+R,
+confere a caixa Executar (uma janela nova), digita o comando, espera a
+tela parada com ele e, depois do Enter, confere a janela do programa contra
+a tela de antes do Win+R, numa tela diferente da do comando digitado (a
+caixa Executar parada seria a janela nova). O
+`--open=...:TECLAS` digita um atalho (`{ctrl-shift-esc}`, o Gerenciador de
+Tarefas) e confere a janela nova. O `--type=...:TEXTO` digita letras,
+algarismos e espaços na janela que tem o foco e espera a tela parada com
+uma linha de texto (`screen_check::text_typed`: acima da barra, a tela muda
+em até 1/20, e algum grupo de mudanças tem de 8 a 48 linhas de altura, 6
+colunas ou mais por caractere, metade ou mais no fundo, a até 0x20 da
+luminância mediana do grupo, e 1/100 ou mais de letras, a 0x60 ou mais
+dela: o texto escuro do Bloco de Notas e o claro do console), e o log ganha
+o `TEXT_TYPED_OK`. As janelas dos programas
+também saem do kernel, como observação (`init/initial_process.rs`,
+`program_window_created`): o primeiro NtUserCreateWindowEx de cada programa
+da sessão 1 com a classe da janela principal dele põe na serial o
+`EXPLORER_WINDOW_CREATED` (a CabinetWClass do explorer.exe), o
+`NOTEPAD_WINDOW_CREATED` (a Notepad do notepad.exe), o
+`CONSOLE_WINDOW_CREATED` (a ConsoleWindowClass do conhost.exe) ou o
+`TASKMGR_WINDOW_CREATED` (a TaskManagerWindow do Taskmgr.exe). Uma entrada
+de tela que não vê a tela mudar como esperado encerra o teste com o que
+faltou na última leitura.
 
 ## 7. O nome OpenNT nos arquivos
 

@@ -213,7 +213,15 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    Iniciar aberto e que o Esc o fecha: START_MENU_OK na serial)
                    --context-menu=MARCADOR[+MS]:X,Y (repetivel: leva o ponteiro do mouse PS/2 ao
                    ponto X,Y da tela, olhando onde a seta esta, aperta o botao direito, confere o
-                   menu de contexto aberto no ponto e que o Esc o fecha: CONTEXT_MENU_OK na serial)";
+                   menu de contexto aberto no ponto e que o Esc o fecha: CONTEXT_MENU_OK na serial)
+                   --double-click=MARCADOR[+MS]:X,Y (repetivel: leva o ponteiro ao ponto X,Y, aperta
+                   duas vezes o botao esquerdo e confere a janela nova na tela: WINDOW_OPENED_OK)
+                   --run=MARCADOR[+MS]:COMANDO (repetivel: Win+R, a caixa Executar, o comando e o
+                   Enter; confere a janela do programa na tela: WINDOW_OPENED_OK)
+                   --open=MARCADOR[+MS]:TECLAS (repetivel: digita as teclas, um atalho que abre um
+                   programa, e confere a janela nova na tela: WINDOW_OPENED_OK)
+                   --type=MARCADOR[+MS]:TEXTO (repetivel: digita o texto, letras, algarismos e
+                   espacos, e confere que ele apareceu numa linha da janela: TEXT_TYPED_OK)";
 
 struct Arguments {
     command: String,
@@ -427,6 +435,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--dismiss" => parsed.inputs.push(qemu::InputSend::dismiss(&required()?)?),
             "--start-menu" => parsed.inputs.push(qemu::InputSend::start_menu(&required()?)?),
             "--context-menu" => parsed.inputs.push(qemu::InputSend::context_menu(&required()?)?),
+            "--double-click" => parsed.inputs.push(qemu::InputSend::double_click(&required()?)?),
+            "--run" => parsed.inputs.push(qemu::InputSend::run(&required()?)?),
+            "--open" => parsed.inputs.push(qemu::InputSend::open(&required()?)?),
+            "--type" => parsed.inputs.push(qemu::InputSend::type_text(&required()?)?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
@@ -507,7 +519,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss, --mouse, --start-menu e --context-menu sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse, --start-menu, --context-menu, --double-click, --run, --open e --type sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -830,6 +842,19 @@ mod tests {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         assert!(parse_words(&["run", "--context-menu=X:1,1"]).is_err());
+        let parsed = parse_words(&["test-boot", "--double-click=DESKTOP_OK+5000:38,140", "--run=DESKTOP_OK:notepad", "--open=X:{ctrl-shift-esc}", "--type=WINDOW_OPENED_OK+2000:ola 123"]).unwrap();
+        assert_eq!(
+            parsed.inputs,
+            vec![
+                InputSend { after: "DESKTOP_OK".into(), delay: Duration::from_millis(5000), action: InputAction::DoubleClick { x: 38, y: 140 } },
+                InputSend { after: "DESKTOP_OK".into(), delay: Duration::ZERO, action: InputAction::Run("notepad".into()) },
+                InputSend { after: "X".into(), delay: Duration::ZERO, action: InputAction::Open("{ctrl-shift-esc}".into()) },
+                InputSend { after: "WINDOW_OPENED_OK".into(), delay: Duration::from_millis(2000), action: InputAction::Type("ola 123".into()) },
+            ]
+        );
+        for bad in ["--double-click=X:1024,1", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}"] {
+            assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
+        }
         // Os nomes do QEMU passam, também nos combos e no --keys.
         assert!(parse_words(&["test-boot", "--send=X:{meta_l}", "--send=X:{ctrl_r-scroll_lock-scroll_lock}{clique}", "--keys=run hello\nps\n{kp_enter}"]).is_ok());
     }

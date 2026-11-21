@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CONTEXT_MENU_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, CONTEXT_MENU_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -626,6 +626,20 @@ pub enum InputAction {
     /// ([`screen_check::context_menu_open`]) e que o Esc o fecha (o
     /// `CONTEXT_MENU_OK`).
     ContextMenu { x: usize, y: usize },
+    /// Leva o ponteiro a (`x`, `y`) ([`point_at`]), aperta duas vezes o
+    /// botão esquerdo e confere a janela nova ([`screen_check::window_opened`],
+    /// o `WINDOW_OPENED_OK`).
+    DoubleClick { x: usize, y: usize },
+    /// Aperta Win+R, espera a caixa Executar, digita o comando e o Enter e
+    /// confere a janela do programa sobre a tela de antes do Win+R (o
+    /// `WINDOW_OPENED_OK`).
+    Run(String),
+    /// Digita as teclas (um atalho que abre um programa) e confere a janela
+    /// nova (o `WINDOW_OPENED_OK`).
+    Open(String),
+    /// Digita o texto na janela que tem o foco e confere que ele apareceu
+    /// ([`screen_check::text_typed`], o `TEXT_TYPED_OK`).
+    Type(String),
 }
 
 /// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
@@ -683,6 +697,39 @@ impl InputSend {
             Some((x, y)) => Ok(InputSend { after, delay, action: InputAction::ContextMenu { x, y } }),
             None => Err(format!("--context-menu={text}: o ponto e X,Y inteiros dentro da tela de 1024x768")),
         }
+    }
+
+    /// `--double-click=MARCADOR[+MS]:X,Y`, um ponto da tela de 1024x768.
+    pub fn double_click(text: &str) -> Result<InputSend, String> {
+        let (after, delay, point) = Self::when("--double-click", text)?;
+        match screen_point(point) {
+            Some((x, y)) => Ok(InputSend { after, delay, action: InputAction::DoubleClick { x, y } }),
+            None => Err(format!("--double-click={text}: o ponto e X,Y inteiros dentro da tela de 1024x768")),
+        }
+    }
+
+    /// `--run=MARCADOR[+MS]:COMANDO`; o comando vai na sintaxe do `--keys`.
+    pub fn run(text: &str) -> Result<InputSend, String> {
+        let (after, delay, command) = Self::when("--run", text)?;
+        key_names(command)?;
+        Ok(InputSend { after, delay, action: InputAction::Run(command.to_string()) })
+    }
+
+    /// `--open=MARCADOR[+MS]:TECLAS`.
+    pub fn open(text: &str) -> Result<InputSend, String> {
+        let (after, delay, keys) = Self::when("--open", text)?;
+        key_names(keys)?;
+        Ok(InputSend { after, delay, action: InputAction::Open(keys.to_string()) })
+    }
+
+    /// `--type=MARCADOR[+MS]:TEXTO`: letras, algarismos e espaço (o texto que
+    /// a conferência conta).
+    pub fn type_text(text: &str) -> Result<InputSend, String> {
+        let (after, delay, typed) = Self::when("--type", text)?;
+        if !typed.chars().all(|character| character.is_ascii_alphanumeric() || character == ' ') {
+            return Err(format!("--type={text}: o texto e de letras, algarismos e espacos"));
+        }
+        Ok(InputSend { after, delay, action: InputAction::Type(typed.to_string()) })
     }
 
     /// `--mouse=MARCADOR[+MS]:DX,DY`.
@@ -1710,6 +1757,82 @@ fn open_context_menu(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, se
     Ok(format!("{opened}; fechou com o Esc"))
 }
 
+/// Quanto o `--double-click`, o `--run` e o `--open` esperam a janela nova
+/// aparecer e parar (o primeiro desenho de um programa pode esperar o
+/// carregamento das DLLs dele).
+const WINDOW_WAIT: Duration = Duration::from_secs(90);
+
+/// Espera a janela nova sobre `before` aparecer e parar
+/// ([`screen_check::window_opened`] em duas leituras seguidas iguais), por
+/// até [`WINDOW_WAIT`]. Devolve a janela achada, ou o que faltou.
+fn new_window(monitor: &mut TcpStream, ppm: &Path, before: &crate::png::Image, what: &str) -> Result<String, String> {
+    let opened = still_screen(monitor, ppm, WINDOW_WAIT, |image| screen_check::window_opened(before, image)).map_err(|missing| format!("a janela nao abriu {what}: {missing}"))?;
+    screen_check::window_opened(before, &opened)
+}
+
+/// O `--double-click`: espera a tela desenhada parada, leva o ponteiro a
+/// (`x`, `y`) ([`point_at`]), espera a tela parada de novo, aperta duas
+/// vezes o botão esquerdo (a hora vai para `sent`), dentro do tempo do
+/// clique duplo do Windows (500 ms), e espera a janela nova ([`new_window`]).
+fn double_click(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, sent: &mut Option<Instant>) -> Result<String, String> {
+    still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    let (px, py) = point_at(monitor, ppm, x, y)?;
+    let before = still_screen(monitor, ppm, WINDOW_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    for press in ["mouse_button 1\n", "mouse_button 0\n", "mouse_button 1\n", "mouse_button 0\n"] {
+        monitor.write_all(press.as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+        thread::sleep(Duration::from_millis(40));
+    }
+    new_window(monitor, ppm, &before, &format!("com o clique duplo em ({px},{py})"))
+}
+
+/// O `--run`: espera a tela desenhada parada, aperta Win+R (a hora vai para
+/// `sent`), espera a caixa Executar ([`new_window`]), digita o comando,
+/// espera a tela parada com ele e, depois do Enter, a janela do programa
+/// sobre a tela de antes do Win+R, numa tela diferente da do comando
+/// digitado (a caixa Executar fechou: parada, ela seria a janela nova).
+fn run_command(monitor: &mut TcpStream, ppm: &Path, command: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, "{meta_l-r}")?;
+    let dialog = new_window(monitor, ppm, &before, "com o Win+R (a caixa Executar)")?;
+    type_keys(monitor, command)?;
+    let typed = still_screen(monitor, ppm, WINDOW_WAIT, screen_check::drawn_screen)?;
+    type_keys(monitor, "{ret}")?;
+    let opened = still_screen(monitor, ppm, WINDOW_WAIT, |image| {
+        if screen_check::same_screen(&typed, image) {
+            return Err("a tela e a do comando digitado: a caixa Executar nao fechou".to_string());
+        }
+        screen_check::window_opened(&before, image)
+    })
+    .map_err(|missing| format!("a janela nao abriu com o comando {command}: {missing}"))?;
+    let program = screen_check::window_opened(&before, &opened)?;
+    Ok(format!("caixa Executar ({dialog}); {command}: {program}"))
+}
+
+/// O `--open`: espera a tela desenhada parada, digita as teclas (a hora vai
+/// para `sent`) e espera a janela nova ([`new_window`]).
+fn open_with_keys(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, keys)?;
+    new_window(monitor, ppm, &before, &format!("com as teclas {keys}"))
+}
+
+/// Quanto o `--type` espera o texto aparecer.
+const TYPE_WAIT: Duration = Duration::from_secs(30);
+
+/// O `--type`: espera a tela desenhada parada, digita o texto (a hora vai
+/// para `sent`) e espera a tela parada com ele ([`screen_check::text_typed`]).
+fn type_text(monitor: &mut TcpStream, ppm: &Path, text: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, text)?;
+    let typed = text.chars().count();
+    let after = still_screen(monitor, ppm, TYPE_WAIT, |image| screen_check::text_typed(&before, image, typed)).map_err(|missing| format!("o texto {text:?} nao apareceu: {missing}"))?;
+    screen_check::text_typed(&before, &after, typed)
+}
+
 /// O `sendkey` da parada manual: Ctrl direito segurado e Scroll Lock duas
 /// vezes. O i8042prt.sys real (CrashOnCtrlScroll=1 na semente do Registro)
 /// chama o KeBugCheckEx(0xE2) na ISR do teclado; com CrashDumpEnabled o
@@ -2208,6 +2331,58 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] botao direito em ({x},{y}) pelo monitor (aos {at:.1} s), sem o menu de contexto: {missing}"));
                             return Err(format!("o menu de contexto nao abriu e fechou com o botao direito em ({x},{y}): {missing}"));
+                        }
+                    }
+                }
+                InputAction::DoubleClick { x, y } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| double_click(monitor, &ppm, *x, *y, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] clique duplo em ({x},{y}) pelo monitor (aos {at:.1} s): {description}\n{WINDOW_OPENED_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] clique duplo em ({x},{y}) pelo monitor (aos {at:.1} s), sem janela nova: {missing}"));
+                            return Err(format!("o clique duplo em ({x},{y}) nao abriu janela: {missing}"));
+                        }
+                    }
+                }
+                InputAction::Run(command) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| run_command(monitor, &ppm, command, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] Win+R e {command} pelo monitor (aos {at:.1} s): {description}\n{WINDOW_OPENED_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] Win+R e {command} pelo monitor (aos {at:.1} s), sem a janela: {missing}"));
+                            return Err(format!("o comando {command} da caixa Executar nao abriu janela: {missing}"));
+                        }
+                    }
+                }
+                InputAction::Open(keys) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| open_with_keys(monitor, &ppm, keys, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("{KEYS_SENT}: {keys} (aos {at:.1} s)\n[xtask] janela nova: {description}\n{WINDOW_OPENED_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] teclas {keys} pelo monitor (aos {at:.1} s), sem janela nova: {missing}"));
+                            return Err(format!("as teclas {keys} nao abriram janela: {missing}"));
+                        }
+                    }
+                }
+                InputAction::Type(text) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| type_text(monitor, &ppm, text, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] texto digitado pelo monitor (aos {at:.1} s): {description}\n{TEXT_TYPED_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] texto digitado pelo monitor (aos {at:.1} s), sem aparecer: {missing}"));
+                            return Err(format!("o texto {text:?} nao apareceu na janela: {missing}"));
                         }
                     }
                 }
