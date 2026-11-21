@@ -9,9 +9,13 @@
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 
+use crate::ntos::cm::key::security as key_security;
 use crate::ntos::cm::registry::{self, NodeId};
-use crate::ntos::ob::object_types;
+use crate::ntos::ob::object_manager::ObjectData;
+use crate::ntos::ob::object_types::{self, ObjectType};
+use crate::ntos::ob::open_pointer::{Described, ObjectOwner, QueryRecord};
 use crate::ntos::ps::process;
+use crate::ntos::se::model::SecurityPolicy;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{CmKeyBody, NtStruct};
@@ -212,6 +216,47 @@ pub fn temporary(node: NodeId, path: &str) -> Option<u64> {
 
 pub fn get(pointer: u64) -> Option<KeyBody> {
     with(|bodies| bodies.by_pointer.get(&pointer).cloned())
+}
+
+/// O dono dos corpos de chave para quem guarda um objeto pelo ponteiro (o
+/// `Described` do Ob): o tipo Key, a retenção de operação ([`hold`] e
+/// [`release`], a referência do ObReferenceObject num CM_KEY_BODY) e o
+/// descritor do nó. Um handle da chave não passa pelo `open_handle` do Ob:
+/// ele sai de `key_services::insert_for`, com um handle interno da hive
+/// ligado ao mesmo corpo.
+struct KeyOwner;
+
+impl ObjectOwner for KeyOwner {
+    fn object_type(&self, _pointer: u64) -> ObjectType {
+        object_types::key_type()
+    }
+    fn reference(&self, pointer: u64) {
+        hold(pointer);
+    }
+    fn dereference(&self, pointer: u64) {
+        let _ = release(pointer);
+    }
+    fn security(&self, pointer: u64) -> SecurityPolicy {
+        get(pointer).and_then(|body| registry::with_node(body.node, |key| key_security::access_policy(&key.security))).unwrap_or_default()
+    }
+    fn data(&self, pointer: u64) -> ObjectData {
+        ObjectData::pointer(pointer)
+    }
+    fn query_record(&self, pointer: u64) -> QueryRecord {
+        get(pointer).map(|body| QueryRecord { handles: Some(body.handles), references: body.references, permanent: false, name: body.path }).unwrap_or_default()
+    }
+}
+
+static OWNER: KeyOwner = KeyOwner;
+
+/// O CM_KEY_BODY vivo `pointer` descrito pelo dono das chaves; `None` para
+/// outro endereço. É como a captura do atributo de handles do ALPC guarda
+/// uma chave (`alpc/message/handles.rs`): o services.exe responde ao
+/// GetServiceRegistryStateKey do sechost com o handle da chave de estado do
+/// serviço, que o 19041 duplica no cliente.
+pub fn describe(pointer: u64) -> Option<Described> {
+    get(pointer)?;
+    Some(Described { pointer, object_type: object_types::key_type(), owner: &OWNER })
 }
 
 /// O CM_KEY_BODY de um corpo vivo deste módulo.

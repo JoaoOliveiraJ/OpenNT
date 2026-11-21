@@ -519,7 +519,7 @@ pub fn reply(handle: u64, message: u64) -> Result<u32, KernelError> {
             if !server::owns(port) {
                 return client_reply(port, message);
             }
-            Ok(server::reply_legacy(port, message))
+            server::reply_legacy(port, message)
         })
     })
 }

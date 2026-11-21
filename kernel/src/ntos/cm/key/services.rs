@@ -61,6 +61,9 @@ pub struct UserHandles {
     /// Aloca o handle de usuário para o handle interno, direitos, atributos
     /// (só OBJ_INHERIT) e o corpo Key (retido/solto por `key_objects`).
     pub allocate: fn(u32, u32, u32, u64) -> Result<u64, KernelError>,
+    /// [`UserHandles::allocate`] na tabela do processo do primeiro
+    /// argumento (o EPROCESS de destino).
+    pub allocate_in: fn(u64, u32, u32, u32, u64) -> Result<u64, KernelError>,
     pub close: fn(u64),
 }
 
@@ -429,6 +432,47 @@ fn publish_key_handle(output: u64, khandle: u32, attributes: u32, granted: u32, 
         return Err(error.into());
     }
     Ok(())
+}
+
+/// Um handle novo do corpo de chave `body` (vivo, retido por quem chama) na
+/// tabela do processo `target`, com o acesso `access` e só o OBJ_INHERIT de
+/// `attributes`: o ObDuplicateObject de uma chave capturada (o
+/// AlpcpExposeHandleAttribute e a classe 3 do NtAlpcQueryInformationMessage
+/// com a chave de uma mensagem). O handle é um handle interno novo da hive
+/// sobre o nó do corpo, ligado ao mesmo corpo, como o que o NtOpenKey
+/// publica: num processo comum, na tabela de usuário, onde os serviços de
+/// chave o procuram; no System, um handle de kernel com o valor do handle
+/// interno (o do ZwOpenKey com OBJ_KERNEL_HANDLE). Devolve o valor do
+/// handle. Um nó que já saiu da arena dá STATUS_KEY_DELETED.
+pub fn insert_for(body: u64, access: u32, attributes: u32, target: u64) -> Result<u32, KernelError> {
+    let Some(key) = key_objects::get(body) else { return Err(KernelError::new("captured key body is not alive")) };
+    let khandle = registry::open_node(key.node, &key.path)?;
+    if let Err(error) = key_objects::attach(khandle, body) {
+        registry::close_raw(khandle);
+        return Err(error);
+    }
+    let inserted = if target == process::get_system_process() {
+        let description = HandleDescription { pointer: body, type_name: object_types::key_type().name, identity: body, native_body: body, attributes: attributes & 2, access };
+        process_handles::publish(
+            target,
+            khandle as u64,
+            &description,
+            close_from_table,
+            Some(&mut |binding: &Binding| {
+                with(|state| state.records.insert(khandle, NativeRecord { owner_process: target, kernel_handle: true, attributes: attributes & 2, access, binding: Some(*binding), closing: false }));
+                Ok(())
+            }),
+        )
+        .map(|_| khandle)
+    } else {
+        match with(|state| state.user) {
+            Some(provider) => (provider.allocate_in)(target, khandle, access, attributes & 2, body).map(|handle| handle as u32),
+            None => Err(KernelError::new("user handle table unavailable")),
+        }
+    };
+    inserted.inspect_err(|_| {
+        registry::close_raw(khandle);
+    })
 }
 
 /// O caminho de usuário aplica a política compartilhada; o de kernel

@@ -5556,13 +5556,17 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     traz o único handle já duplicado no cliente, e a mensagem sai. Um token
     entra no destino como os handles de token dele (a tabela de usuário de
     um processo comum, onde o NtQueryInformationToken os procura, ou um
-    handle de kernel no System); os outros tipos, como linha do Object
+    handle de kernel no System); uma chave do Cm (o CM_KEY_BODY da linha,
+    descrito pelo dono das chaves de `cm/key/objects.rs`, código 0x100)
+    entra como um handle interno novo da hive sobre o mesmo corpo
+    (`key_services::insert_for`: na tabela de usuário, ou o handle de
+    kernel do ZwOpenKey no System); os outros tipos, como linha do Object
     Manager. É o `[system_handle]` do RPC: o UMgrLogonUser do UserManager
-    devolve assim o token do logon ao winlogon, e o RpcGetUserToken do LSM
-    o token da sessão ao DcomLaunch. Diferença do 19041: uma resposta com um
-    objeto que a captura não descreve (a chave do Cm, que ainda não tem
-    dono no `open_pointer`) sai sem os handles em vez de levar a chave
-    duplicada; uma recusa da captura com NTSTATUS recusa o envio;
+    devolve assim o token do logon ao winlogon, o RpcGetUserToken do LSM
+    o token da sessão ao DcomLaunch, e o services.exe a chave de estado do
+    serviço ao GetServiceRegistryStateKey do sechost (o wevtsvc do
+    EventLog pede a dele ao subir). A captura da resposta segue a do
+    pedido: uma recusa com NTSTATUS recusa o envio;
   - todo pedido sem RELEASE_MESSAGE chega com LPC_CONTINUATION_REQUIRED
     (os assíncronos também), e a desconexão ou o fechamento da porta de
     comunicação pelo servidor termina com STATUS_PORT_DISCONNECTED os

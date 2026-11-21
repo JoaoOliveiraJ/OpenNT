@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ntos::alpc::message::buffer as message_buffer;
+use crate::ntos::cm::key::{objects as key_objects, services as key_services};
 use crate::ntos::alpc::message::identity::Retained;
 use crate::ntos::ke::critical_region;
 use crate::ntos::ob::callbacks::{self, Outcome, PerformOptions};
@@ -23,7 +24,8 @@ use crate::ntos::alpc::message::buffer::read_field;
 use crate::ntos::inc::types::{AlpcHandleAttr, AlpcHandleAttr32, AlpcMessageAttributes, NtStruct};
 use core::mem::offset_of;
 
-/// O código ALPC do tipo Token (`type_code`).
+/// Os códigos ALPC dos tipos Key e Token (`type_code`).
+const KEY_TYPE: u32 = 0x100;
 const TOKEN_TYPE: u32 = 0x200;
 
 /// Códigos ALPC são máscaras por espécie, não índices dinâmicos de OBJECT_TYPE.
@@ -83,9 +85,11 @@ pub struct Entry {
     pub attributes: u32,
 }
 
+/// A recusa de uma operação do Ob: o NTSTATUS dela, ou o erro de kernel sem
+/// NTSTATUS (que não vira um STATUS_UNSUCCESSFUL inventado).
 fn failure(outcome: Outcome) -> Result<u32, KernelError> {
     match outcome.error {
-        Some(error) if outcome.status == 0 => Err(error),
+        Some(error) if error.status == 0 => Err(error),
         _ => Ok(outcome.status),
     }
 }
@@ -131,7 +135,8 @@ fn capture_entry(descriptor: &Descriptor, mode: u8) -> Result<Result<Entry, u32>
                 if !matches && kernel_handle {
                     return Ok(None);
                 }
-                let item = open_pointer::describe(row.pointer).or_else(|| if row.native_body != 0 { open_pointer::describe(row.native_body) } else { None });
+                // A chave do Cm (o CM_KEY_BODY da linha) tem o dono dela.
+                let item = open_pointer::describe(row.pointer).or_else(|| if row.native_body != 0 { open_pointer::describe(row.native_body).or_else(|| key_objects::describe(row.native_body)) } else { None });
                 let Some(item) = item else { return Err(KernelError::new("ALPC captured handle has no object owner")) };
                 item.reference();
                 Ok(Some((item, row.access, row.attributes)))
@@ -202,23 +207,6 @@ pub fn capture(address: u64, mode: u8) -> Result<Result<Arc<HandleData>, u32>, K
     match capture_descriptors(address, mode) {
         Ok(descriptors) => capture_entries(&descriptors, mode),
         Err(status) => Ok(Err(status)),
-    }
-}
-
-/// O atributo de handles de uma resposta (`alpc/server.rs`), capturado
-/// como o de um pedido: uma recusa da captura (um NTSTATUS) recusa o envio.
-/// Diferença do 19041: um objeto que a captura não descreve (a chave do Cm,
-/// sem dono no `open_pointer`) não recusa a resposta, que sai sem os
-/// handles, como antes de as respostas levarem handles; o 19041 duplicaria
-/// a chave no cliente.
-pub fn capture_reply(address: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
-    match capture(address, mode) {
-        Ok(Ok(handles)) => Ok(Some(handles)),
-        Ok(Err(status)) => Err(status),
-        Err(error) => {
-            crate::debug_print!("[alpc] resposta do pid {} sem o atributo de handles: {}", process::get_current_process_id(), error);
-            Ok(None)
-        }
     }
 }
 
@@ -405,15 +393,23 @@ pub fn duplicate(entry: &Entry, port: &Arc<Port>, mode: u8) -> Result<Result<Dup
     let mut published: Option<Duplicated> = None;
     let outcome = callbacks::perform(&item, entry.access, &options, &mut |granted| {
         let granted = implied_access(&item.object_type, granted);
-        // O token entra como os handles de token do destino (a tabela de
-        // usuário, onde o NtQueryInformationToken os procura); os outros
-        // tipos, como linha do Object Manager.
-        let inserted = if entry.object_type == TOKEN_TYPE { token_handles::insert_for(item.pointer, granted, attributes, target).map(|handle| handle as u32) } else { open_pointer::insert(&item, granted, attributes, target) };
+        // O token e a chave entram como os handles desse tipo no destino (a
+        // tabela de usuário, onde o NtQueryInformationToken e os serviços de
+        // chave os procuram); os outros tipos, como linha do Object Manager.
+        // O handle de kernel de uma chave é o valor do handle interno da
+        // hive, sem o bit de kernel (o do ZwOpenKey com OBJ_KERNEL_HANDLE).
+        let inserted = match entry.object_type {
+            TOKEN_TYPE => token_handles::insert_for(item.pointer, granted, attributes, target).map(|handle| handle as u32 | if kernel_handle { 0x8000_0000 } else { 0 }),
+            KEY_TYPE => key_services::insert_for(item.pointer, granted, attributes, target),
+            _ => open_pointer::insert(&item, granted, attributes, target).map(|handle| handle | if kernel_handle { 0x8000_0000 } else { 0 }),
+        };
         match inserted {
             Ok(handle) => {
-                published = Some(Duplicated { granted, handle: handle | if kernel_handle { 0x8000_0000 } else { 0 }, object_type: entry.object_type });
+                published = Some(Duplicated { granted, handle, object_type: entry.object_type });
                 Outcome { status: 0, granted: Some(granted), value: handle, error: None }
             }
+            // Sem NTSTATUS, o erro sobe como erro de kernel (`failure`); o
+            // status só marca a recusa para os callbacks de objeto.
             Err(error) => Outcome { status: if error.status != 0 { error.status } else { 0xC000_0001 }, granted: None, value: 0, error: (error.status == 0).then_some(error) },
         }
     });

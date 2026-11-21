@@ -180,6 +180,15 @@ fn allocate_user_key(khandle: u32, access: u32, attributes: u32, body: u64) -> R
     Ok(state::alloc_user_handle(Arc::new(UserKey { khandle, body }), access, attributes & 2)? as u64)
 }
 
+/// [`allocate_user_key`] na tabela do processo `target`, anexado a ele
+/// quando não é o corrente (a chave que o ALPC duplica no receptor).
+fn allocate_user_key_in(target: u64, khandle: u32, access: u32, attributes: u32, body: u64) -> Result<u64, KernelError> {
+    let Some(table) = super::process_state::get(target) else { return Err(KernelError::with_status("process handle table is closing", 0xC000_010A)) };
+    let insert = || state::alloc_user_handle_in(&table, Arc::new(UserKey { khandle, body }), access, attributes & 2, None);
+    let inserted = if target == crate::ntos::ps::process::get_current_process() { insert() } else { crate::ntos::ps::process_context::with_process(target, insert).and_then(|inserted| inserted) };
+    inserted.map(u64::from)
+}
+
 fn close_user_key(handle: u64) {
     let _ = state::close_user_handle(handle, false, false);
 }
@@ -365,7 +374,7 @@ pub fn init() {
     state::register_handler("NtCompressKey", nt_compress_key);
     state::register_handler("NtQueryOpenSubKeys", nt_query_open_sub_keys);
     state::register_handler("NtQueryOpenSubKeysEx", nt_query_open_sub_keys_ex);
-    key_services::set_user_handles(Some(UserHandles { get: user_key, allocate: allocate_user_key, close: close_user_key }));
+    key_services::set_user_handles(Some(UserHandles { get: user_key, allocate: allocate_user_key, allocate_in: allocate_user_key_in, close: close_user_key }));
     state::register_handler("NtOpenKey", nt_open_key);
     state::register_handler("NtOpenKeyEx", nt_open_key_ex);
     state::register_handler("NtCreateKey", nt_create_key);

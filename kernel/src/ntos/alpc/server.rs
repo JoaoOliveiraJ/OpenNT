@@ -935,29 +935,30 @@ fn capture_reply_view(port: &Arc<Port>, attributes: u64, mode: u8) -> Result<(Op
 /// AlpcpReceiveSynchronousReply a deixa pendente nele, que a responde pelo
 /// MessageId (o lsm.dll responde assim aos pedidos do winsrvext do csrss na
 /// `\SmSsWinStationApiPort`).
-fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64, mode: u8, release: bool) -> u32 {
+fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64, mode: u8, release: bool) -> Result<u32, KernelError> {
     // A resposta de um servidor LPC pode trazer TotalLength maior (o buffer
     // da mensagem recebida, reaproveitado).
     let captured = match message_buffer::capture_message_with(input, server.listener.maximum().max(PortMessage::SIZE as u32), mode, server.legacy()) {
         Ok(captured) => captured,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     let id_offset = offset_of!(PortMessage, message_id);
     let id = u32::from_le_bytes([captured.header[id_offset], captured.header[id_offset + 1], captured.header[id_offset + 2], captured.header[id_offset + 3]]);
     if id == 0 {
         crate::debug_print!("[alpc] servidor de usuario: mensagem sem MessageId (envio do servidor) sem suporte");
-        return STATUS_NOT_SUPPORTED;
+        return Ok(STATUS_NOT_SUPPORTED);
     }
     let (view, unmap) = match capture_reply_view(port, attributes, mode) {
         Ok(captured) => captured,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     // O atributo de handles da resposta (o token do UMgrLogonUser do
-    // UserManager, um [system_handle] do RPC); uma captura recusada recusa o
-    // envio, sem concluir o pedido.
-    let handles = match capture_reply_handles(attributes, mode) {
+    // UserManager e a chave do GetServiceRegistryStateKey do services.exe,
+    // [system_handle] do RPC), capturado como o de um pedido: uma captura
+    // recusada recusa o envio, sem concluir o pedido.
+    let handles = match capture_reply_handles(attributes, mode)? {
         Ok(handles) => handles,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     let (slot, exposed, _received, origin) = {
         let mut state = server.state.lock();
@@ -978,7 +979,7 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
         if let Some(handles) = handles {
             handles.release();
         }
-        return STATUS_REPLY_MESSAGE_MISMATCH;
+        return Ok(STATUS_REPLY_MESSAGE_MISMATCH);
     };
     // A resposta com UNMAP_EXISTING apaga a vista que o pedido trouxe ao
     // servidor (o AlpcpCaptureViewAttributeInternal com a vista da mensagem).
@@ -987,21 +988,26 @@ fn send_reply(server: &UserServer, port: &Arc<Port>, input: u64, attributes: u64
     }
     slot.continuation.store(!release && !server.legacy(), core::sync::atomic::Ordering::Release);
     complete(server, &slot, id, captured.data, view, handles);
-    STATUS_SUCCESS
+    Ok(STATUS_SUCCESS)
 }
 
 /// Os handles de uma resposta (o ALPC_MESSAGE_HANDLE_ATTRIBUTE válido no
 /// ALPC_MESSAGE_ATTRIBUTES de envio), capturados do processo de quem
-/// responde como os de um pedido (`message_handles::capture_reply`).
-fn capture_reply_handles(attributes: u64, mode: u8) -> Result<Option<Arc<HandleData>>, u32> {
+/// responde como os de um pedido (`message_handles::capture`).
+fn capture_reply_handles(attributes: u64, mode: u8) -> Result<Result<Option<Arc<HandleData>>, u32>, KernelError> {
     if attributes == 0 {
-        return Ok(None);
+        return Ok(Ok(None));
     }
-    let header = state::user_struct::<AlpcMessageAttributes>(attributes).map_err(|error| error.status)?;
-    if header.valid_attributes.probe_get().map_err(|error| error.status)? & HANDLE_ATTRIBUTE == 0 {
-        return Ok(None);
+    let header = match state::user_struct::<AlpcMessageAttributes>(attributes) {
+        Ok(header) => header,
+        Err(error) => return Ok(Err(error.status)),
+    };
+    match header.valid_attributes.probe_get() {
+        Ok(valid) if valid & HANDLE_ATTRIBUTE == 0 => return Ok(Ok(None)),
+        Ok(_) => {}
+        Err(error) => return Ok(Err(error.status)),
     }
-    message_handles::capture_reply(crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE), mode)
+    Ok(message_handles::capture(crate::ntos::ps::user::alpc::attribute_address(attributes, HANDLE_ATTRIBUTE), mode)?.map(Some))
 }
 
 /// A linha do `--trace-rpc` da resposta do servidor ao pedido `id`: o Type
@@ -1400,7 +1406,7 @@ fn send_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u64, 
 /// NtAlpcSendWaitReceivePort e do NtReplyWaitReceivePort(Ex).
 fn reply_and_receive(server: Arc<UserServer>, port: &Arc<Port>, input: u64, send_attributes: u64, release: bool, receive: crate::ntos::ps::user::alpc::ReceiveArguments, options: ReceiveOptions) -> Result<u32, KernelError> {
     if input != 0 {
-        let status = send_reply(&server, port, input, send_attributes, 1, release);
+        let status = send_reply(&server, port, input, send_attributes, 1, release)?;
         if status != 0 {
             return Ok(status);
         }
@@ -1532,10 +1538,10 @@ pub fn post_datagram(port: &Arc<Port>, message_type: u16, data: &[u8], sender: S
 }
 
 /// O NtReplyPort no lado servidor: a resposta ao pedido do MessageId.
-pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> u32 {
+pub fn reply_legacy(port: &Arc<Port>, reply: u64) -> Result<u32, KernelError> {
     match server_of(port) {
         Some(server) => send_reply(&server, port, reply, 0, 1, true),
-        None => STATUS_INVALID_PORT_HANDLE,
+        None => Ok(STATUS_INVALID_PORT_HANDLE),
     }
 }
 
@@ -2141,7 +2147,7 @@ pub fn begin_kernel_legacy_receive(port: &Arc<Port>, reply: u64, receive: u64, p
     use crate::ntos::alpc::kernel_wait;
     let Some(server) = server_of(port) else { return Ok(Box::new(Completed(STATUS_INVALID_PORT_HANDLE))) };
     if reply != 0 {
-        let status = send_reply(&server, port, reply, 0, 0, true);
+        let status = send_reply(&server, port, reply, 0, 0, true)?;
         if status != 0 {
             return Ok(Box::new(Completed(status)));
         }
@@ -2192,7 +2198,7 @@ fn kernel_send(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, input: u6
             return completed(STATUS_NOT_SUPPORTED);
         }
         Ok(SendKind::Reply) => {
-            let status = send_reply(server, port, input, send_attributes, 0, flags & RELEASE_MESSAGE != 0);
+            let status = send_reply(server, port, input, send_attributes, 0, flags & RELEASE_MESSAGE != 0)?;
             return if status != 0 { completed(status) } else { Ok(None) };
         }
         Ok(SendKind::New(message_type)) => message_type,
