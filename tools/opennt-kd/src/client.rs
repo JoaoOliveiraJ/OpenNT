@@ -66,9 +66,12 @@ fn module_matches(wanted: &str, file: &str) -> bool {
     file == wanted || file.rsplit_once('.').is_some_and(|(stem, _)| stem == wanted)
 }
 
-/// O módulo de uma expressão `módulo!símbolo` (o nome logo antes do `!`).
+/// O módulo de uma expressão `módulo!símbolo` (o nome logo antes do `!`) ou
+/// `módulo+0xRVA` (o nome solto do começo, `breakpoints::expression_module`):
+/// sem ele o filtro de carga do alvo vira `*`, e toda carga de imagem de
+/// qualquer processo para a máquina.
 fn pending_module(expression: &str) -> Option<String> {
-    let (head, _) = expression.split_once('!')?;
+    let Some((head, _)) = expression.split_once('!') else { return super::breakpoints::expression_module(expression) };
     let mut module: Vec<char> = head.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')).collect();
     module.reverse();
     (!module.is_empty()).then(|| module.into_iter().collect())
@@ -2542,7 +2545,16 @@ pub fn range_chunks(start: u64, length: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::range_chunks;
+    use super::{pending_module, range_chunks};
+
+    /// O módulo de um breakpoint adiado, por símbolo ou por RVA: o filtro de
+    /// carga do alvo só para nas imagens dele.
+    #[test]
+    fn pending_module_reads_symbols_and_offsets() {
+        assert_eq!(pending_module("twinui.pcshell!wil::details::in1diag3::Return_Hr").as_deref(), Some("twinui.pcshell"));
+        assert_eq!(pending_module("AppXDeploymentServer+0x83c0").as_deref(), Some("AppXDeploymentServer"));
+        assert_eq!(pending_module("0x1234"), None);
+    }
 
     #[test]
     fn splits_ranges_for_the_comparators() {
