@@ -551,11 +551,30 @@ fn nt_query_system_environment_value_ex(_name: u64, _guid: u64, _value: u64, _le
     crate::hal::firmware_environment::query_user()
 }
 
+/// As classes já vistas por serviço: a linha `classe` de cada uma sai nas
+/// quatro primeiras vezes e depois uma a cada 256, com a contagem, como as
+/// linhas `FALHOU` (`index::failure_printed`); com TRACEFAILURES, todas.
+static CLASS_LINES: SpinLock<alloc::collections::BTreeMap<(&'static str, u32), u32>> = SpinLock::new(alloc::collections::BTreeMap::new());
+
+fn note_class(service: &'static str, class: u32) {
+    let count = {
+        let mut lines = CLASS_LINES.lock();
+        let count = lines.entry((service, class)).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    };
+    if crate::ntos::init::boot_config::trace_failures() || count <= 4 {
+        crate::debug_print!("[usermode] {} classe {}", service, class);
+    } else if super::win32k_status::printed(count) {
+        crate::debug_print!("[usermode] {} classe {} ({} vezes)", service, class, count);
+    }
+}
+
 fn nt_query_system_information_ex(class: u64, input: u64, input_length: u64, buffer: u64, rsp: u64) -> Result<u32, KernelError> {
     let length = state::stack_arg32(rsp, 5) as u64;
     let returned = stack_arg(rsp, 6);
     let class = class as u32;
-    crate::debug_print!("[usermode] NtQuerySystemInformationEx classe {}", class);
+    note_class("NtQuerySystemInformationEx", class);
     use crate::ntos::ex::system_information as information;
     let input_length = input_length as u32;
     if input == 0 || input_length == 0 {
@@ -1062,7 +1081,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             Ok(STATUS_SUCCESS)
         }
         _ => {
-            crate::debug_print!("[usermode] NtQueryInformationProcess classe {}", class);
+            note_class("NtQueryInformationProcess", class);
             Ok(STATUS_INVALID_INFO_CLASS)
         }
     })

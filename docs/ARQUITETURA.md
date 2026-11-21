@@ -4940,8 +4940,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   a `[win32k] FALHOU`: a mesma falha do mesmo chamador é o padrão comum do
   Windows (o NtOpenThreadToken sem personificação, a sondagem de valores
   do Registro) e era metade dos 2,4 MB da serial do boot até a barra de
-  tarefas, a uns 5 us por byte. Com `--trace-failures` (TRACEFAILURES) sai
-  toda falha; com `--trace-files` (TRACEFILES), cada abertura de arquivo
+  tarefas, a uns 5 us por byte. A linha `classe N` das classes que o
+  NtQueryInformationProcess não trata e a do NtQuerySystemInformationEx
+  seguem a mesma regra por (serviço, classe). Com `--trace-failures`
+  (TRACEFAILURES) sai toda falha e toda classe; com `--trace-files` (TRACEFILES), cada abertura de arquivo
   (`[usermode] arquivo aberto:`; a criação sai sempre) e cada consulta de
   atributos de um caminho ausente (`[file-io] attributes absent:`). O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
