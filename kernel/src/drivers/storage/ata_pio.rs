@@ -30,7 +30,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::hal::{cpu, port, volatile};
+use crate::hal::{cpu, port};
 use crate::hal::pci_config;
 use crate::ntos::ke::clock;
 use crate::rtl::{KernelError, SpinLock};
@@ -582,7 +582,9 @@ pub fn read_sectors(lba: u64, count: u32, drive: u8) -> Result<Vec<u8>, KernelEr
         let mut channel = CHANNEL.lock();
         let bounce = channel.bounce()?;
         channel.transfer_dma(lba + done as u64, chunk, drive, bounce.physical, false)?;
-        out.extend_from_slice(&volatile::read_bytes(bounce.address, chunk as usize * 512));
+        // SAFETY: o buffer de passagem é RAM do canal, mapeada, com o DMA já
+        // concluído (o status lido no fim do comando) e o lock tomado.
+        out.extend_from_slice(unsafe { core::slice::from_raw_parts(bounce.address as *const u8, chunk as usize * 512) });
         drop(channel);
         done += chunk;
     }
@@ -648,7 +650,11 @@ fn write_sectors_dma(lba: u64, bytes: &[u8], count: u32, drive: u8) -> Result<()
         let chunk = READ_BOUNCE_SECTORS.min(count - done);
         let mut channel = CHANNEL.lock();
         let bounce = channel.bounce()?;
-        volatile::write_bytes(bounce.address, &bytes[done as usize * 512..(done + chunk) as usize * 512]);
+        let source = &bytes[done as usize * 512..(done + chunk) as usize * 512];
+        // SAFETY: o buffer de passagem é RAM do canal, mapeada, do tamanho de
+        // READ_BOUNCE_SECTORS setores, com o lock tomado; o DMA só começa
+        // depois da cópia.
+        unsafe { core::ptr::copy_nonoverlapping(source.as_ptr(), bounce.address as *mut u8, source.len()) };
         channel.transfer_dma(lba + done as u64, chunk, drive, bounce.physical, true)?;
         drop(channel);
         done += chunk;

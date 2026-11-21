@@ -99,14 +99,37 @@ pub fn write64(address: u64, value: u64) {
     volatile::write64(to_virtual(address), value)
 }
 
+/// Bytes de uma faixa física: RAM admitida sai numa cópia em bloco (como
+/// em `guest_memory::try_read_bytes`); MMIO e reservas, byte a byte, cada
+/// acesso volátil na ordem.
 #[track_caller]
 pub fn read_bytes(address: u64, length: usize) -> alloc::vec::Vec<u8> {
-    volatile::read_bytes(range_to_virtual(address, length as u64), length)
+    let virtual_address = range_to_virtual(address, length as u64);
+    if crate::ntos::mm::physical_layout::contains_ram_range(address, length as u64) {
+        let mut bytes = alloc::vec::Vec::with_capacity(length);
+        // SAFETY: a faixa é RAM no mapa direto (conferido acima) e cabe na
+        // capacidade reservada.
+        unsafe {
+            core::ptr::copy(virtual_address as *const u8, bytes.as_mut_ptr(), length);
+            bytes.set_len(length);
+        }
+        return bytes;
+    }
+    volatile::read_bytes(virtual_address, length)
 }
 
+/// Grava bytes numa faixa física: RAM admitida recebe uma cópia em bloco;
+/// MMIO e reservas, byte a byte, cada acesso volátil na ordem.
 #[track_caller]
 pub fn write_bytes(address: u64, bytes: &[u8]) {
-    volatile::write_bytes(range_to_virtual(address, bytes.len() as u64), bytes)
+    let virtual_address = range_to_virtual(address, bytes.len() as u64);
+    if crate::ntos::mm::physical_layout::contains_ram_range(address, bytes.len() as u64) {
+        // SAFETY: a faixa é RAM no mapa direto (conferido acima); a origem
+        // pode ser um alias dela.
+        unsafe { core::ptr::copy(bytes.as_ptr(), virtual_address as *mut u8, bytes.len()) };
+        return;
+    }
+    volatile::write_bytes(virtual_address, bytes)
 }
 
 #[track_caller]
