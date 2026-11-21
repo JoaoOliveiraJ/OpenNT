@@ -165,6 +165,10 @@ pub fn kmain() -> ! {
         start_boot_driver(name);
     }
 
+    // Com o depurador do kernel ligado, o work item do `monitor kill`
+    // (`kd/terminate.rs`), antes do primeiro processo de usuário.
+    crate::ntos::kd::terminate::initialize();
+
     // Com o depurador do kernel (`--kd`), o contrato que os drivers veem.
     if !boot_config::kernel_debugger().is_empty() {
         crate::ntos::test::kernel_debugger::run();

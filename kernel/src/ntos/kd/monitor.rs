@@ -16,7 +16,7 @@ use core::fmt::Write;
 use core::mem::offset_of;
 
 use super::packet::Payload;
-use super::{api_monitor, breakpoints, debugger, events, exception_filter, explore, handles, inspect, irp_trace, memory, page_breakpoints, print_log, process_context, regions, self_test, stop, stream, trace, user_debug, user_hardware};
+use super::{api_monitor, breakpoints, debugger, events, exception_filter, explore, handles, inspect, irp_trace, memory, page_breakpoints, print_log, process_context, regions, self_test, stop, stream, terminate, trace, user_debug, user_hardware};
 use crate::ntos::inc::types::{ClientId, Eprocess, Ethread, EthreadView1, KapcState, Kpcr, Kprcb, Kprocess, Kthread, KthreadView1};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::mm::memory_map::MAX_CPUS;
@@ -53,6 +53,7 @@ const HELP: &str = "comandos do OpenNT:
   exr                a ultima excecao do anel 3 relatada (registro, fast fail, excecoes guardadas)
   nmi                parada por NMI e congelamento de cada processador (KPRCB.IpiFrozen)
   kdtest nmi|cli <ms> | excecao <codigo> <1|2> | hlt | passo-falta | falta | bugcheck   autotestes do depurador
+  kill <pid|end> <codigo>   encerra um processo de usuario com o codigo (hexadecimal) quando a maquina seguir
   membp [set <inicio> <tamanho> <a|w|x> | clear <inicio>]  breakpoints de memoria por pagina no processo escolhido
   uhw                comparadores de hardware de usuario (por processo)
   api on all|mod=INI-FIM... | off | spec ID:ARGC[:ARG:TIPO].. | names [i] | clear   monitor de APIs
@@ -474,6 +475,7 @@ pub fn run(owner: usize, line: &str, out: &mut Payload) {
         "exr" => user_debug::exr_command(owner, out),
         "nmi" => stop::describe_nmi(out),
         "kdtest" => self_test::command(rest, out),
+        "kill" => terminate::command(owner, rest, out),
         "membp" => page_breakpoints::command(owner, rest, out),
         "uhw" => user_hardware::command(out),
         "api" => api_monitor::command(rest, out),

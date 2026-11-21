@@ -22,8 +22,10 @@
 //! Robustez da parada: o filtro das exceções do anel 3 por código em
 //! `exception_filter`, o ponto de recuperação da sessão (falta, bugcheck ou
 //! pânico dentro de um comando do host) em `recovery` e os autotestes que o
-//! host pede (`monitor kdtest`) em `self_test`. Medição: o perfil por
-//! amostragem do processador de boot (`--perfil`) em `sampler`.
+//! host pede (`monitor kdtest`) em `self_test`. Para os roteiros: o fim de
+//! um processo de usuário pedido pelo host (`monitor kill`) em `terminate`.
+//! Medição: o perfil por amostragem do processador de boot (`--perfil`) em
+//! `sampler`.
 pub mod api_monitor;
 pub mod breakpoints;
 pub mod debug_filter;
@@ -53,6 +55,7 @@ pub mod self_test;
 pub mod session;
 pub mod stop;
 pub mod stream;
+pub mod terminate;
 pub mod trace;
 pub mod transport;
 pub mod user_debug;
