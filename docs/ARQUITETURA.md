@@ -4631,7 +4631,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     imprime `ATA_RETRY_OK`. O autoteste da fase 4 confere o reset do canal e
     os prazos lidos do Registro; o teste `ata-falha` (`--ata-fault=read`)
     põe o volume de dados atrás do filtro blkdebug do QEMU, que devolve um
-    erro de E/S a uma leitura do kernel.
+    erro de E/S a uma leitura do kernel. Só o driver interno programa o
+    canal, sob o lock dele: um comando de DMA não reescreve o que o
+    anterior, terminado bem, deixou nos registradores (o drive selecionado
+    sem BSY, o endereço da tabela PRD, a direção do bus master, o status do
+    bus master limpo); a espera lê o status do bus master e só no bit de
+    interrupção lê o do dispositivo. Uma falha, um reset, um comando de PIO
+    ou o atapi.sys assumindo a controladora esquecem esse estado.
   - O NTFS interno lê os registros do MFT e os blocos INDX dos diretórios
     pelo cache de setores (`drivers/storage/sector_cache.rs`), como o NTFS
     do Windows os lê pelo Cache Manager: unidades alinhadas de 4 KB em

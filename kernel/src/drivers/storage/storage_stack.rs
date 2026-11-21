@@ -152,8 +152,10 @@ pub fn before_tree() -> Option<Vec<u8>> {
         }
     };
     // Daqui em diante o atapi.sys programa a controladora: as escritas dele
-    // não passam pelo driver interno, e o cache de metadados se esvazia.
+    // não passam pelo driver interno, o cache de metadados se esvazia e o
+    // driver interno esquece o que os registradores do canal guardavam.
     crate::drivers::storage::sector_cache::disable();
+    crate::drivers::storage::ata_pio::release_controller();
     if let Err(error) = seed_registry() {
         debug_print!("[storage] Registro: {}", error);
         return None;

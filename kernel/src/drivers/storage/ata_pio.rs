@@ -28,7 +28,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::hal::{cpu, port};
 use crate::hal::pci_config;
@@ -103,6 +103,48 @@ static TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_SECONDS);
 static RETRIES: AtomicU32 = AtomicU32::new(DEFAULT_RETRIES);
 /// Pedidos que só concluíram numa nova tentativa.
 static RECOVERED: AtomicU32 = AtomicU32::new(0);
+
+/// O que os registradores do canal guardam desde o último comando que
+/// terminou bem, para o comando seguinte não os escrever de novo: sob um
+/// hipervisor cada acesso a porta é uma saída da máquina virtual. Só o
+/// driver interno programa o canal, sob o lock dele, então o valor do
+/// Device/Head com o drive parado (sem BSY), o endereço da tabela PRD no
+/// BMIDE e o comando de bus master parado (a direção) continuam lá. Uma
+/// falha, um reset ou a pilha real assumindo a controladora
+/// ([`release_controller`]) esquecem tudo (0 = desconhecido).
+static KNOWN_SELECT: AtomicU32 = AtomicU32::new(0);
+static KNOWN_PRD: AtomicU64 = AtomicU64::new(0);
+static KNOWN_BM_COMMAND: AtomicU32 = AtomicU32::new(0);
+/// Os bits de interrupção e de erro do status do bus master foram limpos no
+/// fim do último comando, um DMA que terminou bem. Qualquer outro comando
+/// liga o bit de interrupção quando o dispositivo levanta o INTRQ.
+static BM_CLEAN: AtomicBool = AtomicBool::new(false);
+/// O atapi.sys programa a controladora (`--storage=real`): nada fica
+/// lembrado.
+static FOREIGN_OWNER: AtomicBool = AtomicBool::new(false);
+/// Marca de valor conhecido nos registradores lembrados de 8 bits.
+const KNOWN: u32 = 0x100;
+
+fn forget_registers() {
+    BM_CLEAN.store(false, Ordering::Relaxed);
+    KNOWN_SELECT.store(0, Ordering::Relaxed);
+    KNOWN_PRD.store(0, Ordering::Relaxed);
+    KNOWN_BM_COMMAND.store(0, Ordering::Relaxed);
+}
+
+fn remember(cell: &AtomicU32, value: u8) {
+    if !FOREIGN_OWNER.load(Ordering::Relaxed) {
+        cell.store(KNOWN | value as u32, Ordering::Relaxed);
+    }
+}
+
+/// A pilha real (atapi.sys) assume a controladora: daqui em diante o driver
+/// interno não supõe nada sobre os registradores.
+pub fn release_controller() {
+    let _channel = CHANNEL.lock();
+    FOREIGN_OWNER.store(true, Ordering::Relaxed);
+    forget_registers();
+}
 
 /// 8086:7010 (PIIX3) em 00:01.1 no QEMU pc.
 const IDE_BUS: u32 = 0;
@@ -284,6 +326,10 @@ impl Channel {
     /// [`retries`] vezes (o NumRetries do classpnp) antes de falhar.
     fn run<T>(&mut self, command: Command, lba: u64, count: u32, drive: u8, mut attempt: impl FnMut(u64) -> Result<T, Failure>) -> Result<T, KernelError> {
         let timeout = timeout_ms(command);
+        // Um comando sem DMA liga o bit de interrupção do bus master.
+        if !matches!(command, Command::ReadDma | Command::WriteDma) {
+            BM_CLEAN.store(false, Ordering::Relaxed);
+        }
         let attempts = retries() + 1;
         let mut tries = 0;
         loop {
@@ -291,6 +337,11 @@ impl Channel {
             let start = clock::uptime_ms();
             let failure = match attempt(timeout) {
                 Ok(value) => {
+                    // Os comandos de PIO terminam sem conferir o BSY do fim: a
+                    // seleção é feita de novo depois deles.
+                    if matches!(command, Command::ReadSectors | Command::WriteSectors | Command::Identify) {
+                        KNOWN_SELECT.store(0, Ordering::Relaxed);
+                    }
                     if tries > 1 {
                         debug_print!("[ata] {} ({:#04x}) drive={} lba={} setores={} concluido na tentativa {} de {}", command.name(), command.opcode(), drive, lba, count, tries, attempts);
                         if RECOVERED.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -301,6 +352,7 @@ impl Channel {
                 }
                 Err(failure) => failure,
             };
+            forget_registers();
             let elapsed = clock::uptime_ms().saturating_sub(start);
             let last = tries >= attempts;
             let action = match (failure.timed_out, last) {
@@ -354,6 +406,7 @@ impl Channel {
     /// BSY depois de a E/S em andamento no host terminar. Devolve se o BSY
     /// caiu.
     fn reset(&mut self) -> bool {
+        forget_registers();
         if self.bmide_base != 0 {
             let status = port::read8(self.bmide_base + BM_STATUS);
             port::write8(self.bmide_base + BM_COMMAND, 0);
@@ -482,41 +535,63 @@ fn write_prd_table(table: DmaBuffer, target: u64, count: u32) {
     }
 }
 
-/// Uma tentativa de READ/WRITE DMA de um bloco já descrito na tabela PRD.
-/// Concluído = dispositivo fora de BSY e interrupção sinalizada no status do
-/// bus master; o bus master sai parado e com o status limpo.
+/// Uma tentativa de READ/WRITE DMA de um bloco já descrito na tabela PRD,
+/// como o atapi.sys a programa: a tabela PRD no BMIDE, a direção, o status
+/// do bus master limpo, o task file, o comando e o início do bus master.
+/// Concluído = interrupção sinalizada no status do bus master (o INTRQ do
+/// dispositivo) e, lido só então, o status do dispositivo fora de BSY (a
+/// leitura do status reconhece a interrupção); o bus master sai parado e
+/// com o status limpo. O que o canal já guarda do comando anterior
+/// ([`KNOWN_SELECT`]) não é escrito de novo.
 fn dma_attempt(bmide: u16, table: DmaBuffer, lba: u64, count: u32, drive: u8, write: bool, timeout_ms: u64) -> Result<(), Failure> {
+    let clean = BM_CLEAN.swap(false, Ordering::Relaxed);
     select_drive(lba, drive, timeout_ms)?;
-    port::write32(bmide + BM_PRD, table.physical as u32);
+    if KNOWN_PRD.load(Ordering::Relaxed) != table.physical | 1 {
+        port::write32(bmide + BM_PRD, table.physical as u32);
+        if !FOREIGN_OWNER.load(Ordering::Relaxed) {
+            KNOWN_PRD.store(table.physical | 1, Ordering::Relaxed);
+        }
+    }
     let direction = if write { 0 } else { BM_TO_MEMORY };
-    port::write8(bmide + BM_COMMAND, direction);
-    port::write8(bmide + BM_STATUS, port::read8(bmide + BM_STATUS) | BM_STATUS_ERROR | BM_STATUS_INTERRUPT);
+    if KNOWN_BM_COMMAND.load(Ordering::Relaxed) != KNOWN | direction as u32 {
+        port::write8(bmide + BM_COMMAND, direction);
+        remember(&KNOWN_BM_COMMAND, direction);
+    }
+    if !clean {
+        port::write8(bmide + BM_STATUS, port::read8(bmide + BM_STATUS) | BM_STATUS_ERROR | BM_STATUS_INTERRUPT);
+    }
     task_file(lba, count);
     port::write8(ATA_CMD, if write { ATA_CMD_WRITE_DMA } else { ATA_CMD_READ_DMA });
     port::write8(bmide + BM_COMMAND, direction | BM_START);
     settle();
     let deadline = clock::uptime_ms() + timeout_ms;
+    let mut bus_master;
     let outcome = loop {
         let expired = clock::uptime_ms() >= deadline;
-        let bus_master = port::read8(bmide + BM_STATUS);
-        let status = port::read8(ATA_ALT_STATUS);
-        if status & SR_BSY == 0 && status & (SR_ERR | SR_DF) != 0 {
-            break Err(Failure::device(if write { "erro de escrita" } else { "erro de leitura" }, status, Some(bus_master)));
-        }
+        bus_master = port::read8(bmide + BM_STATUS);
         if bus_master & BM_STATUS_ERROR != 0 {
-            break Err(Failure::device("erro do bus master", status, Some(bus_master)));
+            break Err(Failure::device("erro do bus master", port::read8(ATA_STATUS), Some(bus_master)));
         }
-        if status & SR_BSY == 0 && bus_master & BM_STATUS_INTERRUPT != 0 {
-            break Ok(());
+        if bus_master & BM_STATUS_INTERRUPT != 0 {
+            // O status (não o alternativo) reconhece a interrupção.
+            let status = port::read8(ATA_STATUS);
+            if status & SR_BSY == 0 {
+                if status & (SR_ERR | SR_DF) != 0 {
+                    break Err(Failure::device(if write { "erro de escrita" } else { "erro de leitura" }, status, Some(bus_master)));
+                }
+                break Ok(());
+            }
         }
         if expired {
-            break Err(Failure::timeout("timeout do DMA", status, Some(bus_master)));
+            break Err(Failure::timeout("timeout do DMA", port::read8(ATA_STATUS), Some(bus_master)));
         }
         poll_gap();
     };
     port::write8(bmide + BM_COMMAND, direction);
-    port::read8(ATA_STATUS); // reconhece a interrupção do dispositivo
-    port::write8(bmide + BM_STATUS, port::read8(bmide + BM_STATUS) | BM_STATUS_ERROR | BM_STATUS_INTERRUPT);
+    port::write8(bmide + BM_STATUS, bus_master | BM_STATUS_ERROR | BM_STATUS_INTERRUPT);
+    if outcome.is_ok() && !FOREIGN_OWNER.load(Ordering::Relaxed) {
+        BM_CLEAN.store(true, Ordering::Relaxed);
+    }
     outcome
 }
 
@@ -619,12 +694,22 @@ fn wait_complete(timeout_ms: u64) -> Result<(), Failure> {
     outcome
 }
 
-/// Seleciona o drive e espera o atraso de seleção do ATA.
+/// Seleciona o drive (Device/Head com o modo LBA e os bits 24-27 do LBA)
+/// com o BSY baixo antes e depois. O drive que o último comando bem
+/// terminado deixou selecionado, com os mesmos bits, já está pronto
+/// ([`KNOWN_SELECT`]).
 fn select_drive(lba: u64, drive: u8, timeout_ms: u64) -> Result<(), Failure> {
+    let value = 0xE0 | drive << 4 | ((lba >> 24) & 15) as u8;
+    if KNOWN_SELECT.load(Ordering::Relaxed) == KNOWN | value as u32 {
+        return Ok(());
+    }
+    KNOWN_SELECT.store(0, Ordering::Relaxed);
     wait_ready(timeout_ms)?;
-    port::write8(ATA_DRIVE, 0xE0 | drive << 4 | ((lba >> 24) & 15) as u8);
+    port::write8(ATA_DRIVE, value);
     settle();
-    wait_ready(timeout_ms)
+    wait_ready(timeout_ms)?;
+    remember(&KNOWN_SELECT, value);
+    Ok(())
 }
 
 fn task_file(lba: u64, count: u32) {
@@ -824,6 +909,7 @@ pub fn reset_channel() -> bool {
 /// ausência; um drive presente sai de BSY dentro do prazo de seleção.
 pub fn present(drive: u8) -> Result<bool, KernelError> {
     let _channel = CHANNEL.lock();
+    forget_registers();
     port::write8(ATA_DRIVE, 0xE0 | (drive & 1) << 4);
     settle();
     let status = port::read8(ATA_ALT_STATUS);
