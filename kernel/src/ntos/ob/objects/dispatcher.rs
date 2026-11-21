@@ -147,9 +147,18 @@ fn caller_read<T: guest::GuestScalar>(address: u64, from_user_mode: bool) -> Res
 /// entre corpos iguais.
 pub fn create(pointer: u64, kind: &'static str, dispose: fn(u64), busy: Option<fn(u64) -> bool>, attributes: u64, from_user_mode: bool, hooks: DispatcherHooks) -> Result<u64, KernelError> {
     let object_type = if kind == "event" { Some(object_types::event_type()) } else { object_types::user_type(kind) };
-    let Some(object_type) = object_type.filter(|_| !BODIES.lock().contains_key(&pointer)) else {
+    let Some(object_type) = object_type else {
         return Err(KernelError::new("invalid dispatcher object registration"));
     };
+    // O bloco já tem um corpo registrado. Fora do registro duplicado do
+    // autoteste, é um bloco que o alocador devolveu com o objeto antigo
+    // ainda registrado (uma liberação velha de outro dono): o registro que
+    // ficou diz de quem era.
+    let stale = BODIES.lock().get(&pointer).map(|body| (body.kind, body.refs, body.handles));
+    if let Some((previous, refs, handles)) = stale {
+        crate::debug_print!("[ob] registro de {} em {:#x} recusado: o bloco ja tem um corpo {} (refs {}, handles {})", kind, pointer, previous, refs, handles);
+        return Err(KernelError::new("invalid dispatcher object registration"));
+    }
     let subject = object_access::subject();
     let (descriptor, named) = if attributes != 0 {
         let descriptor = caller_read::<u64>(attributes + core::mem::offset_of!(ObjectAttributes, security_descriptor) as u64, from_user_mode)?;

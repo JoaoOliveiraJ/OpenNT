@@ -513,7 +513,10 @@ pub fn bind_native(pointer: u64, type_name: &str) -> Result<(), KernelError> {
     {
         let mut types = TYPES.lock();
         match types.by_body.get(&pointer) {
-            Some(previous) if previous != type_name => return Err(KernelError::new("native object type changed")),
+            Some(previous) if previous != type_name => {
+                crate::debug_print!("[ob] tipo {} em {:#x} recusado: o bloco ainda esta ligado ao tipo {}", type_name, pointer, previous);
+                return Err(KernelError::new("native object type changed"));
+            }
             Some(_) => return Ok(()),
             None => {
                 types.by_body.insert(pointer, String::from(type_name));
