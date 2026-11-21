@@ -322,6 +322,8 @@ pub struct Origin {
     /// O servidor já recebeu a mensagem (o estado de mensagem recebida que
     /// o AlpcpImpersonateMessage exige).
     pub received: bool,
+    /// O TID da thread que recebeu (diagnóstico de parada).
+    pub received_by: u64,
 }
 
 /// A resposta que volta à fila do servidor como LPC_REPLY (a mensagem nova
@@ -429,11 +431,11 @@ pub fn report_stalled_servers() {
             continue;
         }
         let queued: alloc::vec::Vec<u32> = state.queue.iter().map(|delivery| delivery.id).take(8).collect();
-        let waiting: alloc::vec::Vec<(u32, u64, u64, bool)> = state.requests.keys().take(8).map(|id| {
+        let waiting: alloc::vec::Vec<(u32, u64, u64, u64)> = state.requests.keys().take(8).map(|id| {
             let origin = state.senders.get(id);
-            (*id, origin.map_or(0, |origin| origin.sender.process), origin.map_or(0, |origin| origin.sender.thread), origin.is_some_and(|origin| origin.received))
+            (*id, origin.map_or(0, |origin| origin.sender.process), origin.map_or(0, |origin| origin.sender.thread), origin.map_or(0, |origin| if origin.received { origin.received_by.max(1) } else { 0 }))
         }).collect();
-        crate::debug_print!("[parada] servidor da porta {:#x} (pid {}): na fila {:?}; sem resposta (id, pid, tid, recebida) {:?}", server.listener.pointer, server.listener.process_id(), queued, waiting);
+        crate::debug_print!("[parada] servidor da porta {:#x} (pid {}): na fila {:?}; sem resposta (id, pid, tid, recebida pelo tid) {:?}", server.listener.pointer, server.listener.process_id(), queued, waiting);
     }
 }
 
@@ -571,7 +573,7 @@ impl UserServer {
             let id = UserServer::next_id(&mut state);
             let pending = Arc::new(PendingConnection { id, client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None), deferred: SpinLock::new(deferred) });
             state.connections.insert(id, pending.clone());
-            state.senders.insert(id, Origin { sender, client: port.pointer, waiting, message_type, received: false });
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting, message_type, received: false, received_by: 0 });
             (pending, next_sequence(&self.listener))
         };
         let id = pending.id;
@@ -768,7 +770,7 @@ impl Service for UserServer {
             if !datagram {
                 state.requests.insert(id, slot.clone());
             }
-            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: synchronous, message_type, received: false });
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: synchronous, message_type, received: false, received_by: 0 });
             (id, context, sequence, link_port)
         };
         if rpc_trace::enabled() {
@@ -1016,6 +1018,7 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
             state.senders.remove(&delivery.id);
         } else if let Some(origin) = state.senders.get_mut(&delivery.id) {
             origin.received = true;
+            origin.received_by = crate::ntos::ps::process::get_current_thread_id();
         }
         drop(state);
         // Quem recebeu a mensagem (a sondagem da espera roda no contexto da
@@ -1309,7 +1312,7 @@ fn post_new(server: &Arc<UserServer>, port: &Arc<Port>, flags: u32, captured: me
         let id = UserServer::next_id(&mut state);
         if !datagram {
             state.requests.insert(id, slot.clone());
-            state.senders.insert(id, Origin { sender, client: 0, waiting: synchronous, message_type, received: false });
+            state.senders.insert(id, Origin { sender, client: 0, waiting: synchronous, message_type, received: false, received_by: 0 });
         }
         (id, next_sequence(port))
     };

@@ -801,6 +801,39 @@ pub fn report_stalled_threads() {
         }
         let kthread = kernel_thread(pointer);
         line.push_str(&alloc::format!(" servico {:#x}", kthread.system_call_number.get()));
+        // Bloqueada no kernel: a pilha do serviço pelo quadro de troca salvo
+        // em KTHREAD.KernelStack (o RBP em +0xF0, o retorno em +0xF8) e a
+        // cadeia de RBP a partir dele.
+        if matches!(kernel, KernelState::Blocked { .. }) {
+            let present = |address: u64| address >= 0xFFFF_8000_0000_0000 && address & 7 == 0 && crate::ntos::mm::paging::translate(address & !0xFFF) != 0 && crate::ntos::mm::paging::translate((address + 8) & !0xFFF) != 0;
+            let saved = kthread.kernel_stack.get();
+            if present(saved + 0xF0) {
+                line.push_str(" | pilha:");
+                // Os retornos fora do kernel do OpenNT (os drivers e o win32k)
+                // saem como módulo+deslocamento.
+                let push_return = |line: &mut String, ret: u64| {
+                    if (0xFFFF_F800_4000_0000..0xFFFF_F800_4200_0000).contains(&ret) {
+                        line.push_str(&alloc::format!(" {:#x}", ret));
+                    } else {
+                        line.push(' ');
+                        crate::ntos::ke::bugcheck_trace::describe(line, ret, 0x4000);
+                    }
+                };
+                let mut frame = guest::read64(saved + 0xF0);
+                push_return(&mut line, guest::read64(saved + 0xF8));
+                for _ in 0..14 {
+                    if !present(frame) {
+                        break;
+                    }
+                    let (next, ret) = (guest::read64(frame), guest::read64(frame + 8));
+                    push_return(&mut line, ret);
+                    if next <= frame {
+                        break;
+                    }
+                    frame = next;
+                }
+            }
+        }
         if let Some((objects, shape, kernel_wait, reason, deadline)) = wait {
             line.push_str(&alloc::format!(" | {} motivo {} kernel {} prazo {:?}:", shape, reason, kernel_wait, deadline));
             for object in objects {
@@ -809,10 +842,25 @@ pub fn report_stalled_threads() {
                 line.push_str(&alloc::format!(" {:#x} (tipo {} sinal {})", object, header.type_.get() & 0x7F, header.signal_state.get()));
             }
         }
+        // A espera ligada no despachante (`ke::wait`): os objetos dela.
+        if let Some((objects, explicit)) = crate::ntos::ke::wait::describe_waiting(pointer) {
+            line.push_str(&alloc::format!(" | ke::wait{}:", if explicit { " explicita" } else { "" }));
+            for (object, kind, signal) in objects {
+                line.push_str(&alloc::format!(" {:#x} (tipo {} sinal {})", object, kind, signal));
+            }
+        }
         // Os KWAIT_BLOCKs ligados da KTHREAD (a espera de kernel dentro de um
         // serviço não guarda os objetos no registro).
         let list = kthread.wait_block_list.get();
         let count = kthread.wait_block_count.get().min(8) as u64;
+        if list != 0 && count != 0 && kthread.wait_reason.get() == crate::ntos::ke::wait::reason::WR_RESOURCE {
+            // SAFETY: o primeiro bloco ligado da espera WrResource.
+            let event = unsafe { KwaitBlock::at(list) }.object.get();
+            if let Some((resource, owner, active)) = crate::ntos::ex::resource::describe_wait_event(event) {
+                let owner_tid = if owner != 0 { crate::ntos::ps::thread_accessors::id(owner) } else { 0 };
+                line.push_str(&alloc::format!(" | ERESOURCE {:#x} dono exclusivo tid {} ({:#x}), {} entradas ativas", resource, owner_tid, owner, active));
+            }
+        }
         if list != 0 && count != 0 {
             line.push_str(&alloc::format!(" | KTHREAD motivo {} blocos:", kthread.wait_reason.get()));
             for index in 0..count {
@@ -1396,7 +1444,11 @@ fn serve_exit_requests(caller: u64) {
     }
     for &(process, status) in &requests {
         if let Some(status) = status {
-            crate::ntos::ps::create::exit_process(process, status);
+            // O fim já começou no AP (`execute`): só a conclusão, quando as
+            // threads permitem.
+            if !crate::ntos::ps::create::exit_process(process, status) && exit_ready(process) {
+                crate::ntos::ps::create::finish_exit(process);
+            }
         }
     }
     finish_pending_exits(false);
@@ -1559,6 +1611,21 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
     } else {
         0
     };
+    // O fim do processo pedido no intervalo de um AP (o NtTerminateProcess
+    // da própria thread, ou a exceção fatal) é feito pelo BSP
+    // (EXIT_REQUESTS), mas o pedido vale já, antes de a thread deixar a CPU:
+    // senão ela voltava à fila, outra CPU a escolhia e ela seguia no anel 3
+    // depois de um NtTerminateProcess que não volta no 19041 (o int3 do smss
+    // depois do fim dele). As threads do processo recebem o término aqui; o
+    // BSP só conclui o fim.
+    if cpu != 0 {
+        let fatal = if exit_kind == 0 { Some(status) } else { (failed != 0).then_some(failed) };
+        if let Some(fatal) = fatal {
+            let process = thread.with(|thread| thread.process_pointer);
+            crate::ntos::ps::create::begin_termination(process, fatal);
+            begin_exit(process, fatal);
+        }
+    }
     // Um término pedido por outra CPU durante o intervalo: a espera que ele
     // concluiria conclui agora, pela dona.
     apply_deferred_termination(thread);

@@ -887,6 +887,20 @@ pub fn publish_user_wait(thread: u64, reason: u8, alertable: bool) {
     target.wait_time.set(thread_dispatch::tick_count());
 }
 
+/// Diagnóstico de parada: os objetos da espera registrada de `thread`
+/// (endereço, tipo e sinal de cada um) e se ela é explícita.
+pub fn describe_waiting(thread: u64) -> Option<(alloc::vec::Vec<(u64, u8, i32)>, bool)> {
+    let mut lock = lock();
+    let wait = lock.table().waits.get(&thread)?;
+    let (blocks, count, explicit) = (wait.blocks, wait.count, wait.explicit);
+    let objects = (0..count.min(8) as u64).map(|index| {
+        let object = block_at(blocks + index * core::mem::size_of::<KwaitBlock>() as u64).object.get();
+        let header = header(object);
+        (object, header.type_.get() & 0x7F, header.signal_state.get())
+    }).collect();
+    Some((objects, explicit))
+}
+
 /// `thread` tem uma espera registrada (diagnóstico e autotestes).
 pub fn is_waiting(thread: u64) -> bool {
     lock().waiting(thread)
