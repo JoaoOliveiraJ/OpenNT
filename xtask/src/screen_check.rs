@@ -1119,6 +1119,9 @@ fn top_rows(image: &Image, rows: usize) -> Image {
 /// longe da mediana por 0x60) e é liso (metade ou mais dos vizinhos suaves);
 /// fora dele a tela muda em até 1/32. Uma notificação embaixo à direita, uma
 /// dica pequena, um painel vazio, lixo e a tela inteira trocada não passam.
+/// O xtask mede a barra antes e usa [`start_menu_open_over`]; esta forma é a
+/// dos testes.
+#[cfg(test)]
 pub fn start_menu_open(before: &Image, after: &Image) -> Result<String, String> {
     start_menu_open_over(taskbar_layout(before)?.rows, before, after)
 }
