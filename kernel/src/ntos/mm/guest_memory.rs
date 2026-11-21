@@ -755,6 +755,13 @@ impl GuestHeap {
     }
 
     fn remove_free(&mut self, block: u64) {
+        // Um bloco livre com tamanho 0 teve o cabeçalho sobrescrito depois de
+        // liberado: quem o liberou por último costuma ser o dono que ainda
+        // escreve pelo ponteiro velho.
+        if self.size(block) == 0 {
+            let freed = last_free(block + BLOCK_HEADER_SIZE).map_or_else(|| alloc::string::String::from("?"), |location| alloc::format!("{location}"));
+            panic!("Guest pool free block {block:#x} with an overwritten header (size 0); the block was last freed from {freed}");
+        }
         let next = self.free_next(block);
         let previous = self.free_previous(block);
         if previous != 0 {
