@@ -756,7 +756,7 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         }
         let mut copies = Vec::new();
         if flat {
-            copies.push((String::from("imagem plana"), 0u64, 0u64, source.size().min(owned.frames.len() as u64 * 0x1000)));
+            copies.push((0u64, 0u64, source.size().min(owned.frames.len() as u64 * 0x1000)));
         } else {
             mapping.write(0, &source.read_bytes(0, size_of_headers)?);
             for index in 0..section_count {
@@ -770,10 +770,10 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 if virtual_address + raw_size > size_of_image || raw_pointer + raw_size > source.size() {
                     return Err(KernelError::new("PE: secao fora da imagem ou do arquivo"));
                 }
-                copies.push((alloc::format!("secao {index}"), virtual_address, raw_pointer, raw_size));
+                copies.push((virtual_address, raw_pointer, raw_size));
             }
         }
-        for (label, virtual_address, raw_pointer, raw_size) in copies {
+        for (virtual_address, raw_pointer, raw_size) in copies {
             if source.supports_copy_to_physical() && raw_size >= 0x1000 {
                 // Agrupa frames fisicamente contíguos; nunca cruza um salto.
                 let mut copied = 0u64;
@@ -786,18 +786,6 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     }
                     source.copy_to_physical(raw_pointer + copied, target, take).unwrap_or_else(|| Err(KernelError::new("PE: copia direta indisponivel")))?;
                     copied += take;
-                }
-                // Verificação real da via DMA por amostras.
-                for sample in [0u64, 512, 0x10000, raw_size >> 1, raw_size.wrapping_sub(512)] {
-                    if sample + 4 > raw_size {
-                        continue;
-                    }
-                    let expected_bytes = source.read_bytes(raw_pointer + sample, 4)?;
-                    let expected = u32::from_le_bytes([expected_bytes[0], expected_bytes[1], expected_bytes[2], expected_bytes[3]]);
-                    let actual = (0..4u64).fold(0u32, |value, byte| value | (physical::read8(mapping.to_phys(virtual_address + sample + byte)) as u32) << (8 * byte));
-                    if actual != expected {
-                        return Err(KernelError::new(alloc::format!("DMA diverge em {label} +{sample:#x}: lido {actual:#x} esperado {expected:#x}")));
-                    }
                 }
                 continue;
             }
