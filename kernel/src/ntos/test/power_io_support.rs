@@ -4,7 +4,11 @@
 //! DRIPS do PoFx, PoSetHiberRange, ZwInitiatePowerAction, o grafo de
 //! dependências, IoRequestDeviceRemovalForReset, IoAssignResources,
 //! IoReportResourceUsage e
-//! IoWMIExecuteMethod, cada um chamado pelo nome.
+//! IoWMIExecuteMethod, cada um chamado pelo nome; e o registro do Power
+//! Dependency Coordinator pelo ZwPowerInformation 67 (as validações, o
+//! PopPdcRegister com um PDC sintético quando o pdc.sys não está
+//! carregado, o cliente de kernel pelo PoPdcCallbacks+0x20 e as rotinas da
+//! tabela devolvida, os perfis do PPM inclusive).
 //!
 //! Os valores esperados vêm das instruções de cada rotina no ntoskrnl
 //! 19041 (status, campos e a ordem das chamadas à interface do driver).
@@ -287,9 +291,89 @@ fn io_support_exports(assert: Assert) {
     release(target);
 }
 
+/// Os argumentos que o PdcRegisterKernelClient sintético recebeu.
+static PDC_CLIENT_CALL: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+
+/// O PoPdcCallbacks+0x20 do PDC sintético.
+extern "win64" fn pdc_register_kernel_client(first: u64, second: u64) -> u64 {
+    *PDC_CLIENT_CALL.lock() = (first, second);
+    0x1234
+}
+
+fn pdc_registration(assert: Assert) {
+    use crate::hal::amd64::{native_call, routine_stubs};
+    use crate::ntos::po::{pdc, processor_power};
+    let block = guest::alloc_bytes(0x2000);
+    guest::write_bytes(block, &[0u8; 0x2000]);
+    let (input, output) = (block, block + 0x100);
+    let invoke = |input: u64, input_length: u64, output: u64, output_length: u64| status("ZwPowerInformation", &[67, input, input_length, output, output_length]);
+    // As validações do NtPowerInformation 67 e do PopPdcInvocation.
+    guest::write32(input, 2);
+    let checks = [invoke(0, 0, output, 0xA0), invoke(input, 0xB0, output, 0xA0), invoke(input, 0xB8, output, 0x98), invoke(input, 0xB8, output, 0xA0)];
+    guest::write32(input, 0);
+    let without_output = invoke(input, 0xB8, 0, 0);
+    assert(checks == [STATUS_INVALID_PARAMETER; 4] && without_output == STATUS_INVALID_PARAMETER, "pdc: nivel 67 com entrada, comprimentos ou tipo invalidos e registro sem saida devolvem STATUS_INVALID_PARAMETER");
+    if pdc::registered() {
+        // O pdc.sys real já registrou: o registro sintético o apagaria.
+        guest::free_bytes(block);
+        return;
+    }
+    guest::write32(input, 1);
+    let before = invoke(input, 0xB8, 0, 0);
+    // O registro: 22 ponteiros, o de +0x20 o cliente de kernel sintético.
+    guest::write32(input, 0);
+    for index in 0..22u64 {
+        guest::write64(input + 8 + index * 8, 0xF000 + index);
+    }
+    guest::write64(input + 8 + 4 * 8, pdc_register_kernel_client as *const () as u64);
+    let registered = invoke(input, 0xB8, output, 0xA0);
+    let table: Vec<u64> = (0..20u64).map(|slot| guest::read64(output + slot * 8)).collect();
+    let in_order = pdc::ROUTINES.iter().zip(table.iter()).all(|(routine, address)| routine_stubs::address(routine.name).ok() == Some(*address));
+    let stored = (pdc::callback(0), pdc::callback(21));
+    // O tipo 1 chama o PdcRegisterKernelClient com {entrada+0x10, entrada+8}.
+    guest::write32(input, 1);
+    guest::write64(input + 8, 0xAAAA);
+    guest::write64(input + 0x10, 0xBBBB);
+    let client = invoke(input, 0xB8, 0, 0);
+    let client_call = *PDC_CLIENT_CALL.lock();
+    assert(
+        before == 0xC000_0002 && registered == 0 && table.len() == 20 && in_order && stored == (0xF000, 0xF015) && client == 0x1234 && client_call == (0xBBBB, 0xAAAA),
+        "pdc: o PopPdcRegister guarda os 22 ponteiros no PoPdcCallbacks e devolve as 20 rotinas na ordem do 19041; o tipo 1 chama o PoPdcCallbacks+0x20 (antes do registro, STATUS_NOT_IMPLEMENTED)",
+    );
+    // Rotinas da tabela: a fase corrente, a varredura ociosa e a residência
+    // em DRIPS.
+    let phase = native_call::call(table[11], &[0, 1, 0]) as u32;
+    let refused_phase = native_call::call(table[11], &[6, 1, 0]) as u32;
+    let idle_scan = native_call::call(table[12], &[]) as u32;
+    let drips = native_call::call(table[17], &[]);
+    assert(phase == 0 && refused_phase == 0xC000_000D && idle_scan == 0 && drips == u64::MAX, "pdc: PdcPoCurrentPdcPhase, PdcPoIdleScanEnabled e PpmQueryDripsResidency como o 19041 sem o agregador nem estados de plataforma");
+    // Os perfis do PPM: o registro recusa mais de 0x1F e preenche cada um.
+    let (entries, guid, name) = (block + 0x400, block + 0x480, block + 0x4A0);
+    guest::write_bytes(guid, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01]);
+    for (index, unit) in "Teste".encode_utf16().chain(core::iter::once(0)).enumerate() {
+        guest::write16(name + index as u64 * 2, unit);
+    }
+    guest::write64(entries, guid);
+    guest::write64(entries + 8, name);
+    guest::write8(entries + 0x10, 1);
+    let too_many = native_call::call(table[13], &[0x20, entries]) as u32;
+    let profiles = native_call::call(table[13], &[1, entries]) as u32;
+    let profile = guest::read64(entries + 0x18);
+    let filled = profile != 0 && guest::read8(profile + 8) == 1 && guest::read_bytes(profile + 0xC, 16) == guest::read_bytes(guid, 16) && guest::read8(profile + 0x20) == 1 && guest::read64(profile + 0x15A0) == u64::MAX && guest::read16(guest::read64(profile)) == u16::from(b'T');
+    let _ = native_call::call(table[14], &[profile]);
+    let applied = guest::read32(profile + 0x1C) & 2;
+    let _ = native_call::call(table[14], &[0]);
+    let unapplied = guest::read32(profile + 0x1C) & 2;
+    let (_, count, current) = processor_power::profiles_state();
+    assert(too_many == 0xC000_000D && profiles == 0 && filled && applied == 2 && unapplied == 0 && count == 1 && current == 0, "pdc: PdcPoPpmRegisterProfiles recusa mais de 0x1F perfis e preenche o PPM_PROFILE; PdcPoPpmApplyProfile marca e desmarca o perfil aplicado");
+    pdc::clear_registration();
+    guest::free_bytes(block);
+}
+
 pub fn run(assert: Assert) {
     thermal_exports(assert);
     power_exports(assert);
+    pdc_registration(assert);
     dependency_exports(assert);
     io_support_exports(assert);
 }

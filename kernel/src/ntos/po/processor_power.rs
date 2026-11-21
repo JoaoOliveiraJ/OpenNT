@@ -16,12 +16,29 @@
 //!   sem KPRCB (KiProcessorBlock[Processor] nulo), TRUE; senão troca
 //!   *LastIdleTime pelo PowerState.IdleTimeTotal da CPU e devolve TRUE se ela
 //!   está ociosa agora (IdleTimeEntry != 0) ou se o total cresceu.
+//! - Os perfis de desempenho que o pdc.sys registra (`po/pdc.rs`):
+//!   PpmRegisterProfiles(Count, Profiles) 0x7c5e48 recusa mais de 0x1F
+//!   perfis (STATUS_INVALID_PARAMETER); aloca um bloco com um PPM_PROFILE
+//!   de 0x15B0 bytes por perfil seguido dos nomes (sem memória,
+//!   STATUS_INSUFFICIENT_RESOURCES) e preenche cada um: o nome copiado (+0),
+//!   o índice a partir de 1 (+8), o GUID (+0xC), o BOOLEAN da entrada (+0x20)
+//!   e +0x15A0 = -1; grava o perfil no elemento da entrada (+0x18). Sob as
+//!   travas de política o bloco vira o PpmProfiles e o PpmProfileCount, cada
+//!   perfil recebe o PpmResetProfileSettings (as duas metades de 0xAB0 bytes
+//!   do PpmDefaultProfile, que o OpenNT não tem: ficam zeradas) e o
+//!   PpmProfileStatus liga o bit 0. PpmApplyProfile(Profile) 0x8f5a6c troca o
+//!   PpmCurrentProfile (nulo = o padrão), marca o bit 1 do +0x1C do novo e o
+//!   apaga do antigo e grava o InterruptTime em +0x1588; a reavaliação da
+//!   política de desempenho não existe no OpenNT. O PdcPoPpmResetProfile só
+//!   age com o bit 1 do PpmProfileStatus apagado (habilitar ou desabilitar o
+//!   perfil, sem efeito sem a política).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::WorkQueueItem;
 use crate::ntos::ke::pcr;
+use crate::ntos::mm::guest_memory as guest;
 use crate::rtl::SpinLock;
 
 /// O estado do PpmMediaBufferingWork.
@@ -87,3 +104,101 @@ pub fn cpu_idled_since_last_call(processor: u32, last_idle_time: &Field<u64>) ->
     power.idle_time_entry.get() != 0 || total > previous
 }
 
+
+/// O tamanho de um PPM_PROFILE e os campos que o registro preenche.
+const PROFILE_SIZE: u64 = 0x15B0;
+const PROFILE_INDEX: u64 = 8;
+const PROFILE_GUID: u64 = 0xC;
+const PROFILE_FLAGS: u64 = 0x1C;
+const PROFILE_SELECTED: u64 = 0x20;
+const PROFILE_ACCUMULATION_START: u64 = 0x1588;
+const PROFILE_SENTINEL: u64 = 0x15A0;
+/// O elemento da entrada do registro: {GUID*, PWSTR, BOOLEAN, PPM_PROFILE*}.
+const ENTRY_SIZE: u64 = 0x20;
+const MAXIMUM_PROFILES: u32 = 0x1F;
+/// O bit 1 do +0x1C: o perfil aplicado.
+const PROFILE_APPLIED: u32 = 2;
+
+/// PpmProfiles, PpmProfileCount, PpmProfileStatus e PpmCurrentProfile
+/// (zero = o PpmDefaultProfile).
+struct Profiles {
+    block: u64,
+    count: u32,
+    status: u32,
+    current: u64,
+}
+
+static PROFILES: SpinLock<Profiles> = SpinLock::new(Profiles { block: 0, count: 0, status: 0, current: 0 });
+
+/// O comprimento em WCHARs de uma cadeia terminada em NUL do chamador.
+fn wide_length(text: u64) -> u64 {
+    let mut length = 0;
+    while guest::read16(text + length * 2) != 0 {
+        length += 1;
+    }
+    length
+}
+
+/// PpmRegisterProfiles(Count, Profiles): o NTSTATUS.
+pub fn register_profiles(count: u32, entries: u64) -> u32 {
+    if count > MAXIMUM_PROFILES {
+        return 0xC000_000D;
+    }
+    let headers = count as u64 * PROFILE_SIZE;
+    let names: u64 = (0..count as u64).map(|index| (wide_length(guest::read64(entries + index * ENTRY_SIZE + 8)) + 1) * 2).sum();
+    let size = ((headers + 1) & !1) + names;
+    let block = guest::alloc_bytes(size.max(1));
+    if block == 0 {
+        return 0xC000_009A;
+    }
+    guest::write_bytes(block, &alloc::vec![0u8; size.max(1) as usize]);
+    let mut name_cursor = block + ((headers + 1) & !1);
+    for index in 0..count as u64 {
+        let entry = entries + index * ENTRY_SIZE;
+        let profile = block + index * PROFILE_SIZE;
+        let length = wide_length(guest::read64(entry + 8));
+        let name = guest::read_bytes(guest::read64(entry + 8), (length * 2) as usize);
+        guest::write_bytes(name_cursor, &name);
+        guest::write64(profile, name_cursor);
+        guest::write8(profile + PROFILE_INDEX, (index + 1) as u8);
+        guest::write_bytes(profile + PROFILE_GUID, &guest::read_bytes(guest::read64(entry), 16));
+        guest::write8(profile + PROFILE_SELECTED, guest::read8(entry + 0x10));
+        guest::write64(profile + PROFILE_SENTINEL, u64::MAX);
+        guest::write64(entry + 0x18, profile);
+        name_cursor += (length + 1) * 2;
+    }
+    let mut profiles = PROFILES.lock();
+    profiles.block = block;
+    profiles.count = count;
+    profiles.status |= 1;
+    0
+}
+
+/// PpmApplyProfile(Profile).
+pub fn apply_profile(profile: u64) {
+    let mut profiles = PROFILES.lock();
+    if profiles.current == profile {
+        return;
+    }
+    if profiles.current != 0 {
+        let old = guest::read32(profiles.current + PROFILE_FLAGS);
+        guest::write32(profiles.current + PROFILE_FLAGS, old & !PROFILE_APPLIED);
+    }
+    if profile != 0 {
+        let flags = guest::read32(profile + PROFILE_FLAGS);
+        guest::write32(profile + PROFILE_FLAGS, flags | PROFILE_APPLIED);
+        guest::write64(profile + PROFILE_ACCUMULATION_START, crate::ntos::ke::clock::unbiased_interrupt_time());
+    }
+    profiles.current = profile;
+}
+
+/// O PpmProfileStatus (o PdcPoPpmResetProfile só age com o bit 1 apagado).
+pub fn profile_status() -> u32 {
+    PROFILES.lock().status
+}
+
+/// (PpmProfiles, PpmProfileCount, PpmCurrentProfile).
+pub fn profiles_state() -> (u64, u32, u64) {
+    let profiles = PROFILES.lock();
+    (profiles.block, profiles.count, profiles.current)
+}

@@ -195,3 +195,64 @@ pub fn power_off_monitor() -> u32 {
     guest::free_bytes(block);
     status
 }
+
+/// O WIN32_POWERSTATE_PARAMETERS zerado com MinSystemState =
+/// PowerSystemWorking e o intervalo do PoBlockConsoleSwitch depois dele.
+fn working_state_block() -> Option<u64> {
+    let size = Win32PowerStateParameters::SIZE + 8;
+    let block = guest::alloc_bytes(size);
+    if block == 0 {
+        return None;
+    }
+    guest::write_bytes(block, &alloc::vec![0u8; size as usize]);
+    guest::write64(block + Win32PowerStateParameters::SIZE, CONSOLE_SWITCH_RETRY as u64);
+    // SAFETY: o bloco zerado de 0x18 bytes acima.
+    unsafe { Win32PowerStateParameters::at(block) }.min_system_state.set(POWER_SYSTEM_WORKING);
+    Some(block)
+}
+
+/// PopBlockSessionSwitch(Bloquear, SessãoId*) 0x779b80, a rotina 8 que o
+/// PopPdcRegister entrega ao pdc.sys (`po/pdc.rs`): bloquear é o
+/// PoBlockConsoleSwitch, com a sessão bloqueada gravada em *SessãoId;
+/// desbloquear é o callout de estado com a tarefa 7 à sessão de *SessãoId.
+/// Devolve o valor que fica em EAX: a sessão bloqueada ou o status do
+/// callout.
+pub fn block_session_switch(block: bool, session: u64) -> u32 {
+    let Some(parameters_block) = working_state_block() else { return STATUS_INSUFFICIENT_RESOURCES };
+    // SAFETY: o bloco de `working_state_block`.
+    let parameters = unsafe { Win32PowerStateParameters::at(parameters_block) };
+    let result = if block {
+        let blocked = block_console_switch(parameters, parameters_block + Win32PowerStateParameters::SIZE);
+        guest::write32(session, blocked);
+        blocked
+    } else {
+        parameters.power_state_task.set(TASK_UNBLOCK_CONSOLE_SWITCH);
+        state_callout(parameters_block, Some(guest::read32(session)))
+    };
+    guest::free_bytes(parameters_block);
+    result
+}
+
+/// A informação 3 do callout de informação de energia (o pedido de tela do
+/// PopControlMonitor).
+const CONTROL_MONITOR: u32 = 3;
+
+/// PopControlMonitor(Entrada, SessãoId) 0x779dc0, a rotina 9 do PDC: o
+/// callout de informação (tipo 5) com a informação 3 e a entrada de 8 bytes
+/// do PDC à sessão dada; com o TTM ligado o 19041 vai ao TTM (o OpenNT é um
+/// desktop sem TTM). Devolve o status do callout.
+pub fn control_monitor(input: u64, session: u32) -> u32 {
+    let block = guest::alloc_bytes(Win32PowerInfoParameters::SIZE);
+    if block == 0 {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    guest::write_bytes(block, &[0u8; Win32PowerInfoParameters::SIZE as usize]);
+    // SAFETY: o bloco zerado de 0x28 bytes acima.
+    let parameters = unsafe { Win32PowerInfoParameters::at(block) };
+    parameters.information_type.set(CONTROL_MONITOR);
+    parameters.input_length.set(8);
+    parameters.input.set(input);
+    let status = invoke(POWER_INFO_CALLOUT, block, SCOPE_SESSION, Some(session));
+    guest::free_bytes(block);
+    status
+}

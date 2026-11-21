@@ -15,8 +15,9 @@
 //! NtPowerInformation de modo kernel passa pelo mesmo
 //! PopPowerInformationInternal (0x6f1b04), sem captura, e os tipos internos
 //! só de kernel (o SessionPowerState, o SetWatchdog e o InputControllerState
-//! do win32kbase) recusam o modo usuário. Os demais níveis de modo kernel
-//! devolvem STATUS_INVALID_PARAMETER.
+//! do win32kbase) recusam o modo usuário. O 67 (PdcInvocation), só de modo
+//! kernel, é o registro do pdc.sys e dos clientes dele (`po/pdc.rs`). Os
+//! demais níveis de modo kernel devolvem STATUS_INVALID_PARAMETER.
 //!
 //! Só de modo usuário: LastWakeTime e LastSleepTime (14 e 15, o
 //! PopAction.WakeTime/SleepTime, zero num sistema que nunca dormiu),
@@ -83,9 +84,34 @@ const SESSION_POWER_CLEANUP: u32 = 63;
 /// endereços o SessionPowerInit entrega ao win32k (que os lê e grava).
 static NO_MORE_INPUT: AtomicU8 = AtomicU8::new(0);
 static HIBER_BOOT_FORCE_MONITOR_OFF: AtomicU8 = AtomicU8::new(0);
-/// PopLidOpened: começa TRUE (o valor da imagem do ntoskrnl) e só muda com
-/// uma tampa, que um desktop não tem.
-const LID_OPENED: u8 = 1;
+/// PopLidOpened: começa TRUE (o valor da imagem do ntoskrnl) e só muda pelo
+/// PdcPoReportLidState do pdc.sys (`po/pdc.rs`), com uma tampa, que um
+/// desktop não tem.
+static LID_OPENED: AtomicU8 = AtomicU8::new(1);
+/// POWER_INFORMATION_LEVEL PdcInvocation (só de modo kernel, `po/pdc.rs`).
+const PDC_INVOCATION: u32 = 67;
+/// Os botões do PopCapabilities (PowerButtonPresent, SleepButtonPresent e
+/// LidPresent): o botão de energia fixo do FADT e o que o PdcPoReportButton
+/// relatar.
+static BUTTONS_PRESENT: [AtomicU8; 3] = [AtomicU8::new(1), AtomicU8::new(0), AtomicU8::new(0)];
+
+/// O PdcPoReportLidState: o PopLidOpened passa ao estado relatado.
+pub(crate) fn set_lid_opened(open: u8) {
+    LID_OPENED.store(open, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// O byte `button` (0 energia, 1 sono, 2 tampa) do PopCapabilities passa a
+/// `present`; devolve se mudou (o PdcPoReportButton refaz as políticas só
+/// então).
+pub(crate) fn set_button_present(button: usize, present: bool) -> bool {
+    BUTTONS_PRESENT.get(button).is_some_and(|cell| cell.swap(present as u8, core::sync::atomic::Ordering::SeqCst) != present as u8)
+}
+
+/// O PopFilterCapabilities sobre o PopCapabilities: o SYSTEM_POWER_CAPABILITIES
+/// do nível 4, em bytes.
+pub(crate) fn filtered_capabilities() -> Vec<u8> {
+    capabilities()
+}
 
 /// SessionPowerInit (NtPowerInformation 19041, 0x6f123a): sem entrada, a
 /// saída de exatamente 0x40 bytes (senão STATUS_INVALID_PARAMETER) com os
@@ -107,7 +133,7 @@ fn session_power_init(input: u64, output: u64, output_length: u32) -> u32 {
     let information = unsafe { PowerSessionInit::at(output) };
     information.no_more_input.set(NO_MORE_INPUT.as_ptr() as u64);
     information.hiber_boot_force_monitor_off.set(HIBER_BOOT_FORCE_MONITOR_OFF.as_ptr() as u64);
-    information.lid_opened.set(LID_OPENED);
+    information.lid_opened.set(LID_OPENED.load(core::sync::atomic::Ordering::SeqCst));
     information.ttm_enabled.set(crate::ntos::ttm::device::enabled() as u8);
     0
 }
@@ -143,6 +169,13 @@ pub fn query(level: u32, input: u64, input_length: u32, output: u64, output_leng
     }
     if level == SESSION_POWER_CLEANUP {
         return Ok(session_power_cleanup(input, output));
+    }
+    if level == PDC_INVOCATION {
+        let input_length = if input == 0 { 0 } else { input_length };
+        let input = if input_length == 0 { 0 } else { input };
+        let output_length = if output == 0 { 0 } else { output_length };
+        let output = if output_length == 0 { 0 } else { output };
+        return Ok(super::pdc::invocation(input, input_length, output, output_length));
     }
     if !matches!(level, SYSTEM_POWER_CAPABILITIES | SYSTEM_BATTERY_STATE | SYSTEM_VIDEO_STATE | SESSION_DISPLAY_STATE | POWER_SETTING_NOTIFICATION_NAME | GET_POWER_SETTING_VALUE | PLATFORM_INFORMATION | PLATFORM_ROLE | SESSION_RIT_STATE | SESSION_CONNECT_NOTIFICATION | POWER_INFORMATION_INTERNAL) {
         return Ok(STATUS_INVALID_PARAMETER);
@@ -256,7 +289,9 @@ fn capabilities() -> Vec<u8> {
     build(SystemPowerCapabilities::SIZE, |block| {
         // SAFETY: o bloco zerado de 0x4c bytes acima.
         let capabilities = unsafe { SystemPowerCapabilities::at(block) };
-        capabilities.power_button_present.set(1);
+        capabilities.power_button_present.set(BUTTONS_PRESENT[0].load(core::sync::atomic::Ordering::SeqCst));
+        capabilities.sleep_button_present.set(BUTTONS_PRESENT[1].load(core::sync::atomic::Ordering::SeqCst));
+        capabilities.lid_present.set(BUTTONS_PRESENT[2].load(core::sync::atomic::Ordering::SeqCst));
         capabilities.system_s5.set(1);
         capabilities.full_wake.set((crate::ntos::po::system_state::full_wake() & 1) as u8);
         capabilities.ao_ac.set(platform_aoac());
