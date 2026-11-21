@@ -19,9 +19,10 @@
 //!   KeQueryPerformanceCounter, 10 MHz) e os dois contadores coerentes com o
 //!   tempo medido;
 //! - o shootdown real, com todos os APs respondendo, conclui;
-//! - a espera sem prazo de um alvo que responde 60 ms depois, com o
-//!   diagnóstico em 20 ms, conclui com o alvo dado como lento (sem parada do
-//!   sistema), e a de um que responde antes do diagnóstico, sem;
+//! - a espera sem prazo de um alvo que responde 60 ms depois (e só depois
+//!   de ser sondado passado o diagnóstico), com o diagnóstico em 20 ms,
+//!   conclui com o alvo dado como lento (sem parada do sistema), e a de um
+//!   que responde na segunda sondagem, antes do diagnóstico, sem;
 //! - o prazo do ICR na partida é 100 ms e o diagnóstico de um IPI lento 5 s,
 //!   em hardware e sob hipervisor, e maiores num emulador, em que uma CPU
 //!   virtual fica segundos sem rodar com o hospedeiro carregado;
@@ -80,15 +81,38 @@ pub fn run(assert: Assert) {
 
     // A espera sem prazo: o alvo que responde depois do diagnóstico ainda
     // conclui (o flush de TLB do 19041 gira no PacketBarrier sem limite).
-    // A chegada pelo mesmo contador de desempenho que a espera lê.
+    // A chegada pelo mesmo contador de desempenho que a espera lê. O alvo
+    // não responde só pelo relógio: com o vCPU descalonado pelo host mais de
+    // 60 ms entre duas sondagens, a espera já o acharia respondido sem
+    // nunca o ter visto pendente depois do diagnóstico. Ele fica pendente
+    // até ser sondado uma vez depois dos 20 ms do diagnóstico, contados da
+    // primeira sondagem (que vem depois do começo da espera): a espera lê o
+    // contador depois dessa sondagem e o dá como lento.
     let counter = clock::query_performance_counter_value;
+    let report_ticks = 21 * clock::QPC_FREQUENCY / 1000;
     let start = counter();
     let arrival = start + 60 * clock::QPC_FREQUENCY / 1000;
-    let slow = smp::wait_on_targets(20, "autoteste de IPI lento", || if counter() < arrival { 0b100 } else { 0 });
+    let mut first = None;
+    let mut seen_after_report = false;
+    let slow = smp::wait_on_targets(20, "autoteste de IPI lento", || {
+        let now = counter();
+        let first = *first.get_or_insert(now);
+        if now.wrapping_sub(first) >= report_ticks && !seen_after_report {
+            seen_after_report = true;
+            return 0b100;
+        }
+        if now < arrival || !seen_after_report { 0b100 } else { 0 }
+    });
     let waited = (counter() - start) * 1000 / clock::QPC_FREQUENCY;
     assert(slow.slow == 0b100 && waited >= 60 && slow.elapsed_ms <= waited, "ipi: o alvo que responde depois do diagnostico conclui a espera sem prazo, dado como lento, sem parar o sistema");
-    let arrival = clock::uptime_ms() + 5;
-    let prompt = smp::wait_on_targets(2_000, "autoteste de IPI", || if clock::uptime_ms() < arrival { 0b10 } else { 0 });
+    // O alvo pronto responde na segunda sondagem, sem relógio: uma espera
+    // de 5 ms pelo relógio daria o alvo como lento com o vCPU descalonado
+    // mais de 2 s no meio dela.
+    let mut polls = 0;
+    let prompt = smp::wait_on_targets(2_000, "autoteste de IPI", || {
+        polls += 1;
+        if polls < 2 { 0b10 } else { 0 }
+    });
     assert(prompt.slow == 0 && prompt.elapsed_ms < 2_000, "ipi: o alvo que responde antes do diagnostico conclui a espera sem ser dado como lento");
 
     let scale = if crate::hal::hypervisor::is_emulator() { 12 } else { 1 };

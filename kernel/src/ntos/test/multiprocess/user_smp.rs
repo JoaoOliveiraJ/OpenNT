@@ -357,12 +357,16 @@ fn phase_shootdown(outcome: &mut Outcome) {
                 // processo. Com a tradução velha viva na TLB do AP, ela
                 // seguiria lendo o frame liberado para sempre.
                 let ended = dispatch_until(PHASE_MS, || reader.dead());
+                // O ExitStatus vale com o processo terminado: o fim que a
+                // thread do AP pediu é feito pelo BSP (EXIT_REQUESTS), que
+                // pode ainda não ter chegado a ele quando a thread já morreu.
+                let exited = ended && threads::wait_for_process(test.process).is_ok();
                 // SAFETY: o EPROCESS do processo de teste, retido até o fim.
                 let status = unsafe { Eprocess::at(test.process) }.exit_status.get() as u32;
                 // O processo de teste não tem ntdll: a falta de acesso não
                 // tem KiUserExceptionDispatcher e encerra o processo com
                 // STATUS_ENTRYPOINT_NOT_FOUND (a entrega recusada).
-                outcome.faulted = ended && threads::wait_for_process(test.process).is_ok() && status == 0xC000_0139;
+                outcome.faulted = exited && status == 0xC000_0139;
                 if !outcome.faulted {
                     crate::debug_print!("[smp-usuario] shootdown: fim={} status={:#x}", ended, status);
                 }
