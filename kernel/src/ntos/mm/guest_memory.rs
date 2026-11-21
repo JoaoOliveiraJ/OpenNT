@@ -845,11 +845,13 @@ impl GuestHeap {
         block + BLOCK_HEADER_SIZE
     }
 
-    fn free_bytes(&mut self, pointer: u64, caller: &core::panic::Location<'_>) {
+    fn free_bytes(&mut self, pointer: u64, caller: &'static core::panic::Location<'static>) {
         if pointer == 0 {
             return;
         }
-        assert!(self.allocations.remove(&pointer), "Invalid guest pool free at {pointer:#x} (liberado de {caller})");
+        let previous = last_free(pointer);
+        assert!(self.allocations.remove(&pointer), "Invalid guest pool free at {pointer:#x} (liberado de {caller}; a liberacao anterior do bloco veio de {})", previous.map_or_else(|| alloc::string::String::from("?"), |location| alloc::format!("{location}")));
+        record_free(pointer, caller);
         let mut block = pointer - BLOCK_HEADER_SIZE;
         volatile::write32(block + 12, 1);
         let previous = self.previous(block);
@@ -908,6 +910,28 @@ pub fn alloc_bytes(size: u64) -> u64 {
 
 pub fn alloc_raw(size: u64) -> u64 {
     alloc_aligned(size, 16, false)
+}
+
+/// Quem liberou cada bloco por último, numa tabela de endereço direto pelo
+/// hash do ponteiro (uma colisão troca a entrada). Uma liberação velha (de
+/// quem guardou o ponteiro de um bloco que já foi liberado e realocado) tira
+/// o bloco do dono novo sem erro; a liberação do dono novo cai depois na
+/// conferência do `free_bytes`, que diz então de onde veio a anterior.
+const FREE_LOG_SLOTS: usize = 16 * 1024;
+static FREE_LOG: SpinLock<[(u64, usize); FREE_LOG_SLOTS]> = SpinLock::new([(0, 0); FREE_LOG_SLOTS]);
+
+fn free_log_slot(pointer: u64) -> usize {
+    ((pointer >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 50) as usize % FREE_LOG_SLOTS
+}
+
+fn record_free(pointer: u64, caller: &'static core::panic::Location<'static>) {
+    FREE_LOG.lock()[free_log_slot(pointer)] = (pointer, caller as *const core::panic::Location<'static> as usize);
+}
+
+fn last_free(pointer: u64) -> Option<&'static core::panic::Location<'static>> {
+    let (recorded, location) = FREE_LOG.lock()[free_log_slot(pointer)];
+    // SAFETY: a entrada guarda um &'static Location gravado por `record_free`.
+    (recorded == pointer && location != 0).then(|| unsafe { &*(location as *const core::panic::Location<'static>) })
 }
 
 #[track_caller]
