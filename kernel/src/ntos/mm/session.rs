@@ -345,7 +345,7 @@ impl Built {
 /// MM_SESSION_SPACE em SessionCore e a VA global da primeira delas.
 fn build(built: &mut Built) -> Result<(), KernelError> {
     let no_memory = || KernelError::with_status("no memory for a new session space", STATUS_NO_MEMORY);
-    built.top_level = pfn::alloc_page();
+    built.top_level = pfn::alloc_page_for(pfn::FrameUse::PageTable);
     if built.top_level == 0 {
         return Err(no_memory());
     }

@@ -125,7 +125,7 @@ fn reclaim(count: u64) -> Result<u64, KernelError> {
 
 /// Guarda os 4 KB lidos da unidade, se nenhuma escrita cruzou a leitura.
 fn insert(key: (u8, u64), bytes: &[u8], writes: u64) {
-    let frame = pfn::alloc_page();
+    let frame = pfn::alloc_page_for(pfn::FrameUse::FileCache);
     if frame == 0 {
         return;
     }

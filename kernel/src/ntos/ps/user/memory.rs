@@ -606,7 +606,7 @@ pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&Priv
             offset += PAGE;
             continue;
         }
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(if region.is_some_and(|region| region.pageable) { pfn::FrameUse::PrivatePageable } else { pfn::FrameUse::PrivateResident });
         if frame == 0 {
             debug_print!("[mm] PFN exhausted: request={}, mapped={}, total={}", size, added.len() as u64 * PAGE, pfn::total_count());
             return rollback(&added);
@@ -970,7 +970,7 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
     drop(creation);
     let mut offset = 0;
     while offset < size {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::SystemDll);
         if frame == 0 {
             return Err(KernelError::new("PFN esgotado nas regioes compartilhadas"));
         }
@@ -1005,7 +1005,7 @@ pub fn snapshot_system_range(base: u64, size: u64) -> Result<Vec<TemplatePage>, 
     let mut va = base & !(PAGE - 1);
     while va < base + size {
         if let Some(page) = paging::query_page_in(SYSTEM_ROOT, va, false).filter(|page| page.page_size == PAGE) {
-            let frame = pfn::alloc_page();
+            let frame = pfn::alloc_page_for(pfn::FrameUse::SystemDll);
             if frame == 0 {
                 release_template(pages);
                 return Err(KernelError::new("PFN esgotado na fotografia de uma faixa de sistema"));
@@ -1032,7 +1032,7 @@ pub fn release_template(pages: Vec<TemplatePage>) {
 /// de uma falha no meio.
 pub fn map_private_copies(root: u64, pages: &[TemplatePage], mapped: &mut Vec<(u64, u64)>) -> Result<(), KernelError> {
     for page in pages {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::SystemDllCopy);
         if frame == 0 {
             return Err(KernelError::with_status("PFN esgotado na copia de sistema do processo", 0xC000_0017));
         }

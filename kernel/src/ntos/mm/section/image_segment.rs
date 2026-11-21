@@ -347,7 +347,7 @@ impl ViewPages {
 }
 
 fn private_copy(source: u64) -> Option<u64> {
-    let frame = pfn::alloc_page();
+    let frame = pfn::alloc_page_for(pfn::FrameUse::ImageCopy);
     if frame == 0 {
         return None;
     }

@@ -99,7 +99,7 @@ fn map_view(pointer: u64, base: u64, masters: &[u64], kinds: &[PageKind]) -> Res
     let mut result = Ok(());
     for (index, (&master, kind)) in masters.iter().zip(kinds).enumerate() {
         let frame = if kind.writable {
-            let copy = pfn::alloc_page();
+            let copy = pfn::alloc_page_for(pfn::FrameUse::DriverImage);
             if copy == 0 {
                 result = Err(KernelError::with_status("no frame for a session image page", 0xC000_009A));
                 break;

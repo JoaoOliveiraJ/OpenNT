@@ -293,7 +293,7 @@ fn page_in(root: u64, owner: &PrivateRegion, index: u64) -> Result<bool, u32> {
         if !can_do_io() {
             return Err(STATUS_IN_PAGE_ERROR);
         }
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::PrivatePageable);
         if frame == 0 {
             let (modified, standby) = modified_writer::list_sizes();
             crate::debug_print!("[mm] falta de arquivo de paginacao em {:#x} sem frame livre (modificadas {}, reserva {})", va, modified, standby);

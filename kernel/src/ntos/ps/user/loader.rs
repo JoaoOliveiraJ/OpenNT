@@ -172,6 +172,14 @@ fn in_system<T>(body: impl FnOnce() -> Result<T, KernelError>) -> Result<T, Kern
     process_context::with_process(process::get_system_process(), body).and_then(|result| result)
 }
 
+/// Os frames de uma imagem de sistema (a ntdll, o apiset) entram na conta
+/// das cópias de sistema (`pfn::FrameUse::SystemDll`).
+fn system_frames(image: &PeImage) {
+    for &frame in &image.pages {
+        crate::ntos::mm::pfn::set_use(frame, crate::ntos::mm::pfn::FrameUse::SystemDll);
+    }
+}
+
 /// Fotografa `[base, base + size)` da raiz do System como a cópia `name`;
 /// uma fotografia anterior do mesmo nome (a ntdll mapeada de novo) volta ao
 /// PFN.
@@ -295,6 +303,7 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
 fn map_system_ntdll(source: Arc<dyn ImageSource>, notification: Arc<dyn FileSource>, origin: &str) -> Result<(), KernelError> {
     let source_name = String::from(notification.name());
     let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, notify_image: false, ..LoadOptions::default() })?;
+    system_frames(&image);
     record_template("ntdll", image.image_base, image.size_of_image)?;
     let exports = image.exports.exports.clone();
     state::with(|state| {
@@ -350,6 +359,7 @@ fn map_system_api_set_schema() -> Result<(), KernelError> {
     let bytes = volume.read_bytes("/APISETSCHEMA.DLL")?.ok_or_else(|| KernelError::new("APISETSCHEMA.DLL ausente no volume"))?;
     let image = pe_loader::load_user(bytes, &LoadOptions { skip_imports: true, no_execute: true, notify_image: false, ..LoadOptions::default() })?;
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
+    system_frames(&image);
     record_template("apiset", image.image_base, image.size_of_image)?;
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);

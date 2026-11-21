@@ -119,6 +119,27 @@ fn physical_memory_block(assert: fn(bool, &str)) {
     high_memory(assert, &block);
 }
 
+/// A conta de frames por dono (`pfn::FrameUse`): um frame pedido para um
+/// dono entra na conta dele, a troca de dono o leva de uma conta à outra e a
+/// devolução o tira; um frame contíguo entra como `Other`. Os donos daqui
+/// (cópias de seção e cache de arquivo) não têm outra alocação no
+/// autoteste.
+fn frame_owners(assert: fn(bool, &str)) {
+    use pfn::FrameUse;
+    let count = |owner: FrameUse| pfn::usage()[owner as usize];
+    let (copies, cache) = (count(FrameUse::SectionCopy), count(FrameUse::FileCache));
+    let frame = pfn::alloc_page_for(FrameUse::SectionCopy);
+    assert(frame != 0 && count(FrameUse::SectionCopy) == copies + 1, "frames por dono: a alocacao entra na conta do dono");
+    pfn::set_use(frame, FrameUse::FileCache);
+    assert(count(FrameUse::SectionCopy) == copies && count(FrameUse::FileCache) == cache + 1, "frames por dono: a troca de dono muda a conta");
+    pfn::free_page(frame);
+    assert(count(FrameUse::FileCache) == cache, "frames por dono: a devolucao tira da conta");
+    pfn::set_use(frame, FrameUse::FileCache);
+    assert(count(FrameUse::FileCache) == cache, "frames por dono: frame livre nao entra na conta");
+    let (usage, allocated) = pfn::usage_and_allocated();
+    assert(usage.iter().sum::<u64>() == allocated, "frames por dono: a soma das contas e o que o alocador entregou");
+}
+
 /// RAM acima de 4 GB: o mapa direto vai até o topo do bloco e um frame de
 /// lá sai do PFN, guarda dados pelo endereço físico, tem o descritor em uso
 /// e volta à lista livre.
@@ -199,6 +220,7 @@ pub fn run() {
     let frame2 = pfn::alloc_page();
     assert(frame2 == frame1, "pfn reusa frame livre");
     pfn::free_page(frame2);
+    frame_owners(assert);
     physical_memory_block(assert);
 
     // a imagem do kernel na ImageBase traduz para os frames que o stage2

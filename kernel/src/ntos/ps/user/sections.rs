@@ -513,7 +513,7 @@ fn capture_original_file_page(area: &AreaRef, page_index: u64, source_frame: u64
     let previous = area.lock().original.get(&page_index).copied();
     let original = match previous {
         Some(frame) => frame,
-        None => pfn::alloc_page(),
+        None => pfn::alloc_page_for(pfn::FrameUse::DataSection),
     };
     if original == 0 {
         return Err(KernelError::with_status("section original page allocation failed", 0xC000_0017));
@@ -628,10 +628,22 @@ pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: b
             continue;
         }
         let span = if section.large { 512 } else { 1 };
-        let frame = if section.large { pfn::alloc_contiguous_default(512, 512) } else { pfn::alloc_page() };
+        let owner = if section.is_image {
+            pfn::FrameUse::DriverImage
+        } else if section.file.is_some() {
+            pfn::FrameUse::DataSection
+        } else {
+            pfn::FrameUse::PagefileSection
+        };
+        let frame = if section.large { pfn::alloc_contiguous_default(512, 512) } else { pfn::alloc_page_for(owner) };
         if frame == 0 {
             status = 0xC000_0017;
             break;
+        }
+        if section.large {
+            for offset in 0..span {
+                pfn::set_use(frame + offset * PAGE, owner);
+            }
         }
         physical::zero(frame, (span * PAGE) as usize);
         for offset in 0..span {
@@ -832,7 +844,7 @@ fn commit_paged_file(section: &Arc<Section>, area: &AreaRef, file: &Arc<dyn Sect
     };
     let mut fresh: Vec<u64> = Vec::with_capacity(missing.len());
     for _ in &missing {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::DataSection);
         if frame == 0 {
             release_frames(&fresh);
             return Ok(0xC000_0017);
@@ -1897,7 +1909,7 @@ pub fn fault(address: u64, error: u32) -> bool {
         if !copy_on_write(protect) || !committed || private {
             return false;
         }
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::SectionCopy);
         if frame == 0 {
             return false;
         }

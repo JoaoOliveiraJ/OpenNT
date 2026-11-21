@@ -144,7 +144,7 @@ impl Pool {
         let mut pages: Vec<Page> = Vec::new();
         let mut failed = false;
         for offset in (0..bytes).step_by(4096) {
-            let frame = pfn::alloc_page();
+            let frame = pfn::alloc_page_for(pfn::FrameUse::Pool);
             if frame == 0 {
                 failed = true;
                 break;
@@ -206,7 +206,7 @@ impl Pool {
             return Err(KernelError::new("pool page has no backing"));
         };
         let volume = paging_volume::current().ok_or_else(|| KernelError::new("NTFS unavailable for pool paging"))?;
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::Pool);
         if frame == 0 {
             return Err(KernelError::new("no frame for pool page-in"));
         }

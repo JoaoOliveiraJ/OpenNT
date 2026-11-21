@@ -25,7 +25,7 @@
 //!   bytes ([`memory_usage_information`]); é a primeira consulta do
 //!   GlobalMemoryStatusEx.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{commit, paging_file, pfn, working_set};
 use crate::ntos::mm::guest_memory as guest;
@@ -163,14 +163,73 @@ pub fn memory_topology_information(output: u64, length: u32, reported: &mut u32)
     Ok(0)
 }
 
+/// O intervalo mínimo entre duas tabelas de processos do diagnóstico, em
+/// unidades de 100 ns (5 s).
+const PROCESS_TABLE_INTERVAL: u64 = 50_000_000;
+/// O KeQueryInterruptTime da última tabela de processos (0: nenhuma).
+static LAST_PROCESS_TABLE: AtomicU64 = AtomicU64::new(0);
+
 /// Linha de diagnóstico da memória do sistema na serial (`[mm] memoria`):
 /// frames livres do banco, commit do sistema (cobrado, limite, limite
 /// máximo e pico), páginas privadas fora do working set e o heap do
 /// kernel (os bytes usados, o total e o ocupado com os cabeçalhos dos
 /// blocos) e a arena dos convidados (os bytes dos blocos vivos, o tamanho
 /// e os blocos). Sai a cada processo criado e terminado, para a pressão de
-/// memória aparecer no log da cadeia de boot sem depurador.
+/// memória aparecer no log da cadeia de boot sem depurador. Logo depois
+/// sai a divisão dos frames em uso por dono ([`print_frame_owners`]) e, no
+/// máximo a cada 5 s, a tabela dos processos ([`print_processes`]).
 pub fn print_status(event: &str, process_id: u64) {
+    print_memory_line(event, process_id);
+    print_frame_owners();
+    let now = crate::ntos::ke::clock::interrupt_time();
+    let last = LAST_PROCESS_TABLE.load(Ordering::Acquire);
+    if (last == 0 || now.wrapping_sub(last) >= PROCESS_TABLE_INTERVAL) && LAST_PROCESS_TABLE.compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        print_processes();
+    }
+}
+
+/// `[mm] frames por dono`: os frames em uso do alocador (o total da
+/// partição menos os disponíveis, com a memória do kernel) e quantos são de
+/// cada dono (`pfn::FrameUse`).
+pub fn print_frame_owners() {
+    let partition = pfn::partition();
+    let usage = pfn::usage();
+    let mut line = alloc::format!("[mm] frames por dono: em uso {} de {}", partition.total.saturating_sub(partition.available), partition.total);
+    for owner in pfn::FrameUse::ALL {
+        line.push_str(&alloc::format!(", {} {}", owner.label(), usage[owner as usize]));
+    }
+    crate::debug_print!("{}", line);
+}
+
+/// `[mm] processo`: uma linha por processo com raiz própria, com o working
+/// set (`process_usage`, em páginas, e a parte privada), o commit privado
+/// (EPROCESS.CommitCharge) e as cópias de sistema; depois a soma.
+pub fn print_processes() {
+    use crate::ntos::inc::field::NtStruct;
+    use crate::ntos::inc::types::Eprocess;
+    let (mut working_set, mut private, mut commit, mut copies, mut count) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for state in crate::ntos::ps::user::process_state::all() {
+        let root = state.directory_table_base.load(Ordering::Acquire);
+        if root == 0 || root == super::process_address_space::SYSTEM_ROOT {
+            continue;
+        }
+        let usage = super::process_usage::query_working_set(state.process);
+        // SAFETY: o EPROCESS do estado registrado, vivo enquanto o estado está
+        // na lista (o término tira o estado antes do último dereference).
+        let process = unsafe { Eprocess::at(state.process) };
+        let name: alloc::string::String = process.image_file_name.iter().map(|byte| byte.get()).take_while(|&byte| byte != 0).map(char::from).collect();
+        let (pages, private_pages, charge, system) = (usage.current / 0x1000, usage.private / 0x1000, process.commit_charge.get(), state.system_page_count() as u64);
+        crate::debug_print!("[mm] processo {} {}: working set {} paginas (privado {}), commit {}, copias de sistema {}", state.process_id, name, pages, private_pages, charge, system);
+        working_set += pages;
+        private += private_pages;
+        commit += charge;
+        copies += system;
+        count += 1;
+    }
+    crate::debug_print!("[mm] processos: {} com raiz propria, working set {} paginas (privado {}), commit {}, copias de sistema {}", count, working_set, private, commit, copies);
+}
+
+fn print_memory_line(event: &str, process_id: u64) {
     let partition = pfn::partition();
     let commitment = commit::snapshot();
     let (heap_total, heap_used) = crate::hal::kmalloc::info();

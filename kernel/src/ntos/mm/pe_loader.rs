@@ -756,8 +756,15 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             relocation_delta = image_base.wrapping_sub(preferred_base) as i64;
         }
         owned.frames.reserve_exact(size_of_image.div_ceil(0x1000) as usize);
+        let frame_use = if prototype {
+            pfn::FrameUse::ImagePrototype
+        } else if user_space {
+            pfn::FrameUse::UserImage
+        } else {
+            pfn::FrameUse::DriverImage
+        };
         for _ in 0..size_of_image.div_ceil(0x1000) {
-            let frame = pfn::alloc_page();
+            let frame = pfn::alloc_page_for(frame_use);
             if frame == 0 {
                 return Err(KernelError::with_status("PFN esgotado carregando imagem", STATUS_INSUFFICIENT_RESOURCES));
             }

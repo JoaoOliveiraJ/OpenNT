@@ -119,7 +119,7 @@ pub fn freeze_kernel_half() -> Result<u64, KernelError> {
             state.permanent.insert(table_of(entry));
             continue;
         }
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::PageTable);
         if frame == 0 {
             return Err(KernelError::new("no frame for a kernel directory pointer table"));
         }
@@ -350,7 +350,7 @@ fn with_tables<R>(body: impl FnOnce() -> R) -> R {
         if missing == 0 {
             break;
         }
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::PageTable);
         if frame == 0 {
             break;
         }

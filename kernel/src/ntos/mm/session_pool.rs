@@ -208,7 +208,7 @@ fn new_region(pointer: u64, size: u64, large: bool) -> Result<(u64, Region), Ker
     let mut frames = Vec::new();
     let mut failure = None;
     for page in 0..size / PAGE {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::Pool);
         if frame == 0 {
             failure = Some(KernelError::with_status("no frame for the session pool", 0xC000_009A));
             break;

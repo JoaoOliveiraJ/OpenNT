@@ -58,7 +58,7 @@ pub fn alloc(bytes: u64) -> u64 {
     let mut mapped = 0;
     let mut failed = false;
     while mapped < size {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::Pool);
         if frame == 0 {
             failed = true;
             break;

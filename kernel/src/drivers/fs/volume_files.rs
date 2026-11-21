@@ -41,7 +41,7 @@ impl CacheBlock {
     fn read(volume: &Ntfs, path: &str, offset: u64, length: u64) -> Result<CacheBlock, KernelError> {
         let mut block = CacheBlock { frames: Vec::with_capacity(length.div_ceil(PAGE) as usize), length };
         for _ in 0..length.div_ceil(PAGE) {
-            let frame = pfn::alloc_page();
+            let frame = pfn::alloc_page_for(pfn::FrameUse::FileCache);
             if frame == 0 {
                 return Err(KernelError::with_status("volume read cache: PFN esgotado", 0xC000_009A));
             }

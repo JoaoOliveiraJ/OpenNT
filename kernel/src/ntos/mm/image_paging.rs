@@ -149,7 +149,7 @@ fn migrate(base: u64) -> Result<(), KernelError> {
     let mut mapped = 0;
     let result = (|| -> Result<(), KernelError> {
         for &(_, original) in &originals {
-            let frame = pfn::alloc_page();
+            let frame = pfn::alloc_page_for(pfn::FrameUse::DriverImage);
             if frame == 0 {
                 return Err(KernelError::new("no frames for driver residency"));
             }
@@ -240,7 +240,7 @@ fn page_in(base: u64, index: usize) -> Result<(), KernelError> {
     if !saved {
         return Err(KernelError::new("page has no backing data"));
     }
-    let frame = pfn::alloc_page();
+    let frame = pfn::alloc_page_for(pfn::FrameUse::DriverImage);
     if frame == 0 {
         return Err(KernelError::new("no frame for driver page fault"));
     }

@@ -10,6 +10,13 @@
 //! daqui. Cada faixa guarda um bit por frame. Depois do bootstrap, o banco
 //! nativo de descritores (`native_frame_descriptors`) acompanha as mesmas
 //! transições do bitmap.
+//!
+//! Medição: cada frame em uso leva o dono que o pediu ([`FrameUse`], um byte
+//! por frame ao lado do bitmap), e a partição soma os frames de cada dono
+//! ([`usage`]). O NT não tem essa conta (o mais próximo é o
+//! MMPFN.u3.e1.PageLocation e o UsedPageTableEntries); ela serve à linha
+//! `[mm] frames por dono` do diagnóstico de memória, a base de medida do
+//! consumo por tipo de página.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,6 +27,93 @@ use crate::rtl::{KernelError, SpinLock};
 
 const FRAME_SIZE: u64 = map::PAGE_SIZE;
 
+/// Quem usa um frame do alocador: a conta da linha `[mm] frames por dono`.
+/// Um frame pedido por [`alloc_page`] é de `Other` até um [`set_use`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameUse {
+    Other = 0,
+    /// Páginas privadas que o corte do working set pode levar
+    /// (NtAllocateVirtualMemory, pilhas das threads seguintes).
+    PrivatePageable,
+    /// Páginas privadas residentes que o kernel monta para o processo (pilha
+    /// da 1ª thread, PEB, TEB, parâmetros, entradas do Ldr).
+    PrivateResident,
+    /// A ntdll, o apiset e o NLS na raiz do System e as fotografias deles.
+    SystemDll,
+    /// As cópias de sistema de cada processo com raiz própria.
+    SystemDllCopy,
+    /// Imagens de usuário carregadas pelo kernel (o exe, as DLLs do loader).
+    UserImage,
+    /// Páginas protótipo das control areas de imagem.
+    ImagePrototype,
+    /// Cópias privadas de páginas graváveis das vistas de imagem.
+    ImageCopy,
+    /// Seções de arquivo de dados (as páginas lidas e as cópias originais).
+    DataSection,
+    /// Seções do arquivo de paginação.
+    PagefileSection,
+    /// Cópias na escrita das vistas de dados.
+    SectionCopy,
+    /// Imagens de drivers e de sessão.
+    DriverImage,
+    /// Pool do kernel e de sessão.
+    Pool,
+    /// Pilhas de kernel.
+    KernelStack,
+    /// Tabelas de páginas e raízes.
+    PageTable,
+    /// Caches de arquivo e de setores do kernel.
+    FileCache,
+}
+
+/// Donos de [`FrameUse`].
+pub const FRAME_USES: usize = 16;
+
+impl FrameUse {
+    /// Todos, na ordem da linha de diagnóstico.
+    pub const ALL: [FrameUse; FRAME_USES] = [
+        FrameUse::PrivatePageable,
+        FrameUse::PrivateResident,
+        FrameUse::SystemDll,
+        FrameUse::SystemDllCopy,
+        FrameUse::UserImage,
+        FrameUse::ImagePrototype,
+        FrameUse::ImageCopy,
+        FrameUse::DataSection,
+        FrameUse::PagefileSection,
+        FrameUse::SectionCopy,
+        FrameUse::DriverImage,
+        FrameUse::Pool,
+        FrameUse::KernelStack,
+        FrameUse::PageTable,
+        FrameUse::FileCache,
+        FrameUse::Other,
+    ];
+
+    /// O nome curto da linha de diagnóstico.
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameUse::Other => "outros",
+            FrameUse::PrivatePageable => "privadas-paginaveis",
+            FrameUse::PrivateResident => "privadas-residentes",
+            FrameUse::SystemDll => "sistema-ntdll-nls",
+            FrameUse::SystemDllCopy => "copias-de-sistema",
+            FrameUse::UserImage => "imagens-do-loader",
+            FrameUse::ImagePrototype => "prototipos-de-imagem",
+            FrameUse::ImageCopy => "copias-de-imagem",
+            FrameUse::DataSection => "secoes-de-arquivo",
+            FrameUse::PagefileSection => "secoes-de-pagefile",
+            FrameUse::SectionCopy => "copias-de-secao",
+            FrameUse::DriverImage => "imagens-de-driver",
+            FrameUse::Pool => "pool",
+            FrameUse::KernelStack => "pilhas-de-kernel",
+            FrameUse::PageTable => "tabelas-de-paginas",
+            FrameUse::FileCache => "cache-de-arquivo",
+        }
+    }
+}
+
 /// Uma faixa contígua de frames do alocador: um bit por frame (1 = em uso).
 struct Range {
     base: u64,
@@ -27,6 +121,8 @@ struct Range {
     /// Primeira palavra do bitmap que pode ter um frame livre.
     next: usize,
     words: Vec<u64>,
+    /// O [`FrameUse`] de cada frame em uso.
+    uses: Vec<u8>,
 }
 
 impl Range {
@@ -37,7 +133,7 @@ impl Range {
         if frames % 64 != 0 {
             *words.last_mut().unwrap() = !0u64 << (frames % 64);
         }
-        Self { base, top, next: 0, words }
+        Self { base, top, next: 0, words, uses: vec![0u8; frames] }
     }
 
     fn frames(&self) -> usize {
@@ -78,6 +174,32 @@ struct FrameDatabase {
     /// Corpo publicado da partição (`mm/partition`), espelho de total e
     /// disponível (+16/+24); 0 antes do init.
     partition_body: u64,
+    /// Frames em uso de cada [`FrameUse`].
+    uses: [u64; FRAME_USES],
+}
+
+impl FrameDatabase {
+    /// A faixa e o índice do frame `address`.
+    fn locate(&mut self, address: u64) -> Option<(usize, usize)> {
+        let range_index = self.ranges.iter().position(|range| address >= range.base && address < range.top)?;
+        Some((range_index, ((address - self.ranges[range_index].base) / FRAME_SIZE) as usize))
+    }
+
+    /// O frame passa a ser de `owner`: um recém-alocado (`fresh`) entra na
+    /// conta, um em uso sai da conta do dono anterior.
+    fn tag(&mut self, range_index: usize, index: usize, owner: FrameUse, fresh: bool) {
+        let previous = core::mem::replace(&mut self.ranges[range_index].uses[index], owner as u8);
+        if !fresh {
+            self.uses[previous as usize] = self.uses[previous as usize].saturating_sub(1);
+        }
+        self.uses[owner as usize] += 1;
+    }
+
+    /// O frame volta ao alocador: sai da conta do dono.
+    fn untag(&mut self, range_index: usize, index: usize) {
+        let previous = core::mem::replace(&mut self.ranges[range_index].uses[index], 0);
+        self.uses[previous as usize] = self.uses[previous as usize].saturating_sub(1);
+    }
 }
 
 static DATABASE: SpinLock<FrameDatabase> = SpinLock::new(FrameDatabase {
@@ -86,6 +208,7 @@ static DATABASE: SpinLock<FrameDatabase> = SpinLock::new(FrameDatabase {
     partition: Partition { available: 0, total: 0 },
     frames: 0,
     partition_body: 0,
+    uses: [0; FRAME_USES],
 });
 
 /// Espelha o disponível no corpo da partição, quando publicado.
@@ -163,6 +286,7 @@ pub fn init() -> Result<(), KernelError> {
     let mut database = DATABASE.lock();
     database.ranges = merged.into_iter().map(|(base, top)| Range::new(base, top)).collect();
     database.next_range = 0;
+    database.uses = [0; FRAME_USES];
     let frames: u64 = database.ranges.iter().map(|range| range.frames() as u64).sum();
     if frames == 0 {
         return Err(KernelError::new("No usable E820 RAM for the PFN"));
@@ -183,11 +307,12 @@ pub fn init() -> Result<(), KernelError> {
     Ok(())
 }
 
-fn try_allocate_page() -> u64 {
+fn try_allocate_page(owner: FrameUse) -> u64 {
     let mut database = DATABASE.lock();
     let database = &mut *database;
     while database.next_range < database.ranges.len() {
-        let range = &mut database.ranges[database.next_range];
+        let range_index = database.next_range;
+        let range = &mut database.ranges[range_index];
         for word in range.next..range.words.len() {
             if range.words[word] == u64::MAX {
                 continue;
@@ -196,6 +321,7 @@ fn try_allocate_page() -> u64 {
             range.set(index, true);
             range.next = word;
             let physical_address = range.base + index as u64 * FRAME_SIZE;
+            database.tag(range_index, index, owner, true);
             database.partition.available -= 1;
             mirror(database.partition_body, database.partition.available);
             if OBSERVED.load(Ordering::Acquire) {
@@ -223,11 +349,40 @@ fn reclaim(count: u64) -> bool {
 
 /// Um frame de 4KB, ou 0 sem memória.
 pub fn alloc_page() -> u64 {
-    let address = try_allocate_page();
+    alloc_page_for(FrameUse::Other)
+}
+
+/// Um frame de 4KB de `owner` (a conta de [`usage`]), ou 0 sem memória.
+pub fn alloc_page_for(owner: FrameUse) -> u64 {
+    let address = try_allocate_page(owner);
     if address == 0 && reclaim(16) {
-        return alloc_page();
+        return alloc_page_for(owner);
     }
     address
+}
+
+/// O frame em uso `address` passa a ser de `owner` (um frame contíguo, ou
+/// um que muda de dono). Um frame fora do alocador, ou livre, fica como
+/// está.
+pub fn set_use(address: u64, owner: FrameUse) {
+    let mut database = DATABASE.lock();
+    if let Some((range_index, index)) = database.locate(address & !(FRAME_SIZE - 1)) {
+        if database.ranges[range_index].used(index) {
+            database.tag(range_index, index, owner, false);
+        }
+    }
+}
+
+/// Os frames em uso de cada [`FrameUse`] (pelo valor do dono).
+pub fn usage() -> [u64; FRAME_USES] {
+    DATABASE.lock().uses
+}
+
+/// [`usage`] e os frames que o alocador entregou (os geridos menos os
+/// disponíveis), lidos juntos.
+pub fn usage_and_allocated() -> ([u64; FRAME_USES], u64) {
+    let database = DATABASE.lock();
+    (database.uses, database.frames - database.partition.available)
 }
 
 pub fn free_page(address: u64) -> bool {
@@ -252,6 +407,7 @@ pub fn free_page(address: u64) -> bool {
         }
         range.set(index, false);
         range.next = range.next.min(index / 64);
+        database.untag(range_index, index);
         database.next_range = database.next_range.min(range_index);
         database.partition.available += 1;
         mirror(database.partition_body, database.partition.available);
@@ -282,7 +438,9 @@ fn find_contiguous(count: u64, alignment: u64, highest_pfn: u64, lowest_pfn: u64
             if range.run_free(start, count as usize) {
                 for index in start..start + count as usize {
                     range.set(index, true);
+                    range.uses[index] = FrameUse::Other as u8;
                 }
+                database.uses[FrameUse::Other as usize] += count;
                 database.partition.available -= count;
                 mirror(database.partition_body, database.partition.available);
                 if OBSERVED.load(Ordering::Acquire) {

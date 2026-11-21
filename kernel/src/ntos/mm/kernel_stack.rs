@@ -161,7 +161,7 @@ fn create_sized(size: u64) -> Result<KernelStack, KernelError> {
     let limit = base - size;
     let mut frames: Vec<u64> = Vec::with_capacity((size / PAGE) as usize);
     for page in (limit..base).step_by(PAGE as usize) {
-        let frame = pfn::alloc_page();
+        let frame = pfn::alloc_page_for(pfn::FrameUse::KernelStack);
         if frame == 0 {
             unmap_and_free(limit, frames);
             STATE.lock().free_slots.push(slot);

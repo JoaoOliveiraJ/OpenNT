@@ -62,7 +62,7 @@ pub fn create_root() -> Result<u64, KernelError> {
     if !paging::kernel_half_frozen() {
         return Err(KernelError::new("address-space roots need the frozen kernel half"));
     }
-    let root = pfn::alloc_page();
+    let root = pfn::alloc_page_for(pfn::FrameUse::PageTable);
     if root == 0 {
         return Err(KernelError::new("no frame for a page-table root"));
     }
