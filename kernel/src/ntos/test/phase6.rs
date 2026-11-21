@@ -15555,6 +15555,7 @@ fn pcw_instances_exports(assert: Assert) {
         guest::write64(info + 8, unicode_string_for("OpenNTInstancias"));
         guest::write32(info + 0x10, 1);
         guest::write64(info + 0x18, descriptor);
+        guest::write64(info + 0x20, native_stub(&[0x31, 0xC0, 0xC3]));
         let registration_out = guest::alloc_bytes(8);
         let registration = at::<nt::Field<u64>>(registration_out);
         registration.set(0);
