@@ -363,7 +363,12 @@ pub fn write_user_bytes(va: u64, bytes: &[u8]) -> Result<(), KernelError> {
     let mut done = 0usize;
     while done < bytes.len() {
         let offset = va + done as u64;
-        let physical_address = paging::translate(offset);
+        let mut physical_address = paging::translate(offset);
+        // A página de zero sob demanda (ou fora do working set) ganha o frame
+        // antes, pela falta que o acesso daria.
+        if physical_address == 0 && guest::fault_in(offset, false) {
+            physical_address = paging::translate(offset);
+        }
         if physical_address == 0 {
             return Err(KernelError::new(format!("writeUserBytes: VA nao mapeada 0x{offset:x}")));
         }

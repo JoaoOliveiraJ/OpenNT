@@ -181,6 +181,19 @@ pub fn get(process: u64) -> Option<Arc<ProcessState>> {
     PROCESSES.lock().get(&process).cloned()
 }
 
+/// [`get`] sem esperar a trava da lista: tentada até `attempts` vezes (outra
+/// CPU pode estar com ela por um instante); `Err` se continua tomada (a
+/// falta de zero sob demanda com spin locks retidos, `mm/page_fault`).
+pub fn try_get(process: u64, attempts: u32) -> Result<Option<Arc<ProcessState>>, ()> {
+    for _ in 0..attempts {
+        if let Some(processes) = PROCESSES.try_lock() {
+            return Ok(processes.get(&process).cloned());
+        }
+        core::hint::spin_loop();
+    }
+    Err(())
+}
+
 /// O estado do processo vivo com o PID `process_id` (os PIDs são únicos na
 /// tabela de ids de cliente).
 pub fn by_id(process_id: u64) -> Option<Arc<ProcessState>> {

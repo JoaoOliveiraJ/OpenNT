@@ -1001,14 +1001,19 @@ fn user_virtual_memory(assert: Assert) {
         guest::write32(rsp + 0x30, protect);
         memory::nt_allocate_virtual_memory(u64::MAX, base_pointer, 0, size_pointer, rsp).unwrap_or(1)
     };
-    // MEM_COMMIT|MEM_RESERVE com páginas reais de usuário.
+    // MEM_COMMIT|MEM_RESERVE com páginas reais de usuário: de zero sob
+    // demanda, sem página até o primeiro toque, que dá a página de usuário
+    // gravável.
     let committed = allocate(0, 0x2800, 0x3000, 4);
     let data = guest::read64(base_pointer);
-    assert(committed == 0 && data >= crate::ntos::mm::memory_map::LOWEST_USER_ADDRESS && data % 0x10000 == 0 && guest::read64(size_pointer) == 0x3000 && paging::translate(data + 0x2000) != 0 && paging::access_flags(data) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW, "usermemory: NtAllocateVirtualMemory confirma paginas de usuario");
+    let untouched = paging::translate(data + 0x2000) == 0;
+    let touched = guest::try_write::<u8>(data + 0x2000, 0).is_ok() && guest::try_write::<u8>(data, 0).is_ok();
+    assert(committed == 0 && data >= crate::ntos::mm::memory_map::LOWEST_USER_ADDRESS && data % 0x10000 == 0 && guest::read64(size_pointer) == 0x3000 && untouched && touched && paging::translate(data + 0x2000) != 0 && paging::access_flags(data) & (paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_USER | paging::PAGE_RW, "usermemory: NtAllocateVirtualMemory confirma paginas de usuario");
     // Reserva e commit da subfaixa.
     let reserved_status = allocate(0, 0x4000, 0x2000, 4);
     let reserved = guest::read64(base_pointer);
-    assert(reserved_status == 0 && paging::translate(reserved) == 0 && allocate(reserved + 0x1000, 0x1000, 0x1000, 4) == 0 && paging::translate(reserved + 0x1000) != 0 && paging::translate(reserved) == 0, "usermemory: commit sobre a reserva confirma so a subfaixa");
+    let subrange = allocate(reserved + 0x1000, 0x1000, 0x1000, 4) == 0 && guest::try_write::<u8>(reserved + 0x1000, 0).is_ok();
+    assert(reserved_status == 0 && paging::translate(reserved) == 0 && subrange && paging::translate(reserved + 0x1000) != 0 && paging::translate(reserved) == 0 && guest::try_read::<u8>(reserved).is_err(), "usermemory: commit sobre a reserva confirma so a subfaixa");
     // MEM_COMMIT sem MEM_RESERVE fora de uma reserva (o resto do grânulo de
     // 64 KB da reserva de 16 KB é livre) e além do fim dela:
     // STATUS_CONFLICTING_ADDRESSES, sem região nem página nova.
@@ -3528,7 +3533,9 @@ fn user_address_floor(assert: Assert) {
     // (a) Base fixa abaixo de 4 GB, lida e escrita do anel 3.
     let target = (0x5000_0000u64..0x7FF0_0000).step_by(0x10000).find(|&base| free(base, 0x1_0000)).unwrap_or(0);
     let fixed_status = allocate(target, 0x1_0000, 0x3000, 4);
-    let mapped = fixed_status == 0 && target != 0 && guest::read64(base_pointer) == target && paging::access_flags(target) & (paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW;
+    // A página comitada é de zero sob demanda: o primeiro toque a mapeia.
+    let touched = fixed_status == 0 && target != 0 && guest::read64(base_pointer) == target && guest::try_write::<u8>(target, 0).is_ok();
+    let mapped = touched && paging::access_flags(target) & (paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW) == paging::PAGE_PRESENT | paging::PAGE_USER | paging::PAGE_RW;
     assert(mapped, "userfloor: base fixa abaixo de 4 GB mapeada com paginas de usuario");
     let code_status = allocate(0, 0x1000, 0x3000, 0x40);
     let code = guest::read64(base_pointer);
@@ -7724,6 +7731,7 @@ pub fn run(assert: Assert) {
     crate::ntos::test::multiprocess::alpc_token_handle::run(assert);
     crate::ntos::test::multiprocess::jobs::run(assert);
     crate::ntos::test::object_header::run_user(assert);
+    crate::ntos::test::demand_zero::run(assert);
     // Deixa um arquivo de paginação na lista: por último.
     crate::ntos::test::paging_file::run(assert);
     crate::ntos::test::user_half::run(assert);

@@ -43,6 +43,7 @@ mod performance {
     pub const PEAK_COMMITMENT: u64 = 0x38;
     pub const PAGE_FAULT_COUNT: u64 = 0x3C;
     pub const TRANSITION_COUNT: u64 = 0x44;
+    pub const DEMAND_ZERO_COUNT: u64 = 0x4C;
     pub const PAGE_READ_COUNT: u64 = 0x50;
     pub const PAGE_READ_IO_COUNT: u64 = 0x54;
     pub const DIRTY_PAGES_WRITE_COUNT: u64 = 0x60;
@@ -71,6 +72,7 @@ pub fn performance_information(buffer: u64, length: u32) -> Result<(u32, u32), K
     let counters = &working_set::COUNTERS;
     put(performance::PAGE_FAULT_COUNT, clamp32(counters.page_faults.load(Ordering::Relaxed)));
     put(performance::TRANSITION_COUNT, clamp32(counters.transition_faults.load(Ordering::Relaxed)));
+    put(performance::DEMAND_ZERO_COUNT, clamp32(super::page_fault::demand_zero_faults()));
     put(performance::PAGE_READ_COUNT, clamp32(counters.page_reads.load(Ordering::Relaxed)));
     put(performance::PAGE_READ_IO_COUNT, clamp32(counters.page_read_ios.load(Ordering::Relaxed)));
     put(performance::DIRTY_PAGES_WRITE_COUNT, clamp32(counters.dirty_pages_written.load(Ordering::Relaxed)));
@@ -198,6 +200,7 @@ pub fn print_frame_owners() {
     for owner in pfn::FrameUse::ALL {
         line.push_str(&alloc::format!(", {} {}", owner.label(), usage[owner as usize]));
     }
+    line.push_str(&alloc::format!("; faltas de zero sob demanda {} (recusadas {})", super::page_fault::demand_zero_faults(), super::page_fault::refused_faults()));
     crate::debug_print!("{}", line);
 }
 

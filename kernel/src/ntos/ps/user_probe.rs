@@ -32,6 +32,12 @@ pub fn probe_user_access(va: u64, size: u64, write: bool) -> bool {
     let required = paging::PAGE_PRESENT | paging::PAGE_USER | if write { paging::PAGE_RW } else { 0 };
     let mut page = first;
     while page <= last {
+        // A página de zero sob demanda, ou que o working set levou, fica
+        // acessível como pela falta que o acesso do NT daria.
+        if paging::access_flags(page) & required != required && crate::ntos::mm::guest_memory::fault_in(page, false) && paging::access_flags(page) & required == required {
+            page += 0x1000;
+            continue;
+        }
         if paging::access_flags(page) & required != required {
             // Escritas de convidado usam o alias físico e não geram #PF.
             let fault = *SECTION_FAULT.lock();

@@ -21,7 +21,7 @@ use super::query_object_format::{self, ObjectInformation};
 use crate::ntos::cm::registry;
 use crate::ntos::ex::callbacks;
 use crate::ntos::ke::irql;
-use crate::ntos::mm::{kernel_pool, paging};
+use crate::ntos::mm::kernel_pool;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandle};
 use crate::ntos::rtl::guest_strings;
@@ -252,7 +252,9 @@ fn writable_range(pointer: u64, length: u64) -> bool {
     }
     let mut page = pointer;
     while page < end {
-        if paging::access_flags(page) & 3 != 3 {
+        // Uma página de zero sob demanda ganha o frame, como a falta da
+        // escrita no NT.
+        if !crate::ntos::mm::guest_memory::fault_in(page, true) {
             return false;
         }
         page = (page & !0xFFF) + 0x1000;

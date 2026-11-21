@@ -153,6 +153,22 @@ pub fn resolve_pageable(address: u64) -> bool {
     resolver.is_none_or(|resolver| resolver(address).is_ok())
 }
 
+/// A página de `address` fica acessível (presente e, com `write`, gravável)
+/// como o acesso a deixaria: a falta de página que ele daria passa pelos
+/// provedores de residência (o zero sob demanda, o working set, a cópia na
+/// escrita de uma vista). É o toque do `__try` do NT para quem confere a
+/// faixa pelas PTEs antes de escrever nela por outro caminho. `false` se a
+/// página continua inacessível.
+pub fn fault_in(address: u64, write: bool) -> bool {
+    let required = paging::PAGE_PRESENT | if write { paging::PAGE_RW } else { 0 };
+    let flags = paging::access_flags(address);
+    if flags & required == required {
+        return true;
+    }
+    let error = (flags & paging::PAGE_PRESENT) as u32 | if write { 2 } else { 0 };
+    page_residency::fault(address & !(PAGE_SIZE - 1), error) && paging::access_flags(address) & required == required
+}
+
 pub fn set_pool_lock(lock: Option<(fn() -> u64, fn(u64))>) {
     *POOL_LOCK.lock() = lock;
 }

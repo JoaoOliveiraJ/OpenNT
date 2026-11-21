@@ -464,7 +464,9 @@ fn parent(assert: Assert, parent_process: u64, terminate: u32) {
 fn memory_in_child(assert: Assert, caller: &Parent, child: u64, child_root: u64, full: u64) -> Option<u64> {
     // NtAllocateVirtualMemory(filho) na base fixa: no VAD e na raiz do filho.
     let (status, base, size) = caller.allocate(full, CHILD_BASE, CHILD_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    let in_child = Space::of(child).find(CHILD_BASE).is_some_and(|region| region.base() == CHILD_BASE && region.size() == CHILD_SIZE) && paging::translate_in(child_root, CHILD_BASE) != 0 && paging::translate_in(child_root, CHILD_BASE + 0x1000) != 0;
+    // As páginas comitadas são de zero sob demanda: no VAD do filho, sem
+    // página até o primeiro toque (a gravação abaixo as põe na raiz dele).
+    let in_child = Space::of(child).find(CHILD_BASE).is_some_and(|region| region.base() == CHILD_BASE && region.size() == CHILD_SIZE && region.committed_pages().is_some_and(|pages| pages.contains(&0) && pages.contains(&1)));
     crate::debug_print!("[memoria-entre-processos] alocacao no filho: {:#x} base={:#x} tamanho={:#x} no filho={}", status, base, size, in_child);
     assert(status == 0 && base == CHILD_BASE && size == CHILD_SIZE && in_child, "memoria entre processos: NtAllocateVirtualMemory(filho) poe a regiao no VAD e na raiz do filho");
     let seen_by_parent = caller.query(u64::MAX, CHILD_BASE);
@@ -479,7 +481,8 @@ fn memory_in_child(assert: Assert, caller: &Parent, child: u64, child_root: u64,
     caller.fill(target, CHILD_SIZE, |_| UNTOUCHED);
     let read = caller.read(full, CHILD_BASE, target, CHILD_SIZE);
     crate::debug_print!("[memoria-entre-processos] 8 KB: gravacao {:x?} leitura {:x?}", written, read);
-    assert(written == (0, CHILD_SIZE) && child_value(child, 0) == MAGIC_A && child_value(child, 0x1000) == MAGIC_B, "memoria entre processos: NtWriteVirtualMemory(filho) grava 8 KB na memoria do filho");
+    let materialized = paging::translate_in(child_root, CHILD_BASE) != 0 && paging::translate_in(child_root, CHILD_BASE + 0x1000) != 0 && paging::translate(CHILD_BASE) == 0;
+    assert(written == (0, CHILD_SIZE) && child_value(child, 0) == MAGIC_A && child_value(child, 0x1000) == MAGIC_B && materialized, "memoria entre processos: NtWriteVirtualMemory(filho) grava 8 KB na memoria do filho, com as paginas na raiz dele");
     assert(read == (0, CHILD_SIZE) && caller.bytes(target, CHILD_SIZE) == caller.bytes(source, CHILD_SIZE), "memoria entre processos: NtReadVirtualMemory(filho) le de volta os 8 KB");
 
     // Uma leitura que cruza para a página não mapeada depois da região.

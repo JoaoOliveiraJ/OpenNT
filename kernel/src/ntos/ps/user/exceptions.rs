@@ -302,6 +302,9 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
         if page_residency::fault(block.fault_cr2.get(), error) {
             return 0;
         }
+        // A linha da falha que nenhum provedor de residência resolveu (o CR2 e
+        // a pilha que o stub publicou), como as das outras exceções.
+        crate::debug_print!(" C2={:016X} SP={:016X}", block.fault_cr2.get(), block.fault_rsp.get());
         // Página de guarda ausente (o MiUserFault): a pilha que cresceu
         // repete a instrução; senão a exceção leva o status da guarda.
         if error & 1 == 0 {

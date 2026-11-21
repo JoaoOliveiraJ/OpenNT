@@ -14,9 +14,11 @@
 //!
 //! A trava: cada página precisa estar comitada numa alocação privada
 //! (reservada ou fora dos VADs: STATUS_ACCESS_VIOLATION, o ERROR_NOACCESS do
-//! VirtualLock); as que estão fora do working set voltam a ele, e o corte do
-//! working set (`mm/working_set`) não leva mais as travadas ao arquivo de
-//! paginação. Com todas as páginas já travadas no mesmo tipo, a resposta é
+//! VirtualLock); as que estão fora do working set voltam a ele, as de zero
+//! sob demanda ganham o frame (`mm/page_fault`, a falta de cada página do
+//! MiLockPages), e o corte do working set (`mm/working_set`) não leva mais
+//! as travadas ao arquivo de paginação. Com todas as páginas já travadas no
+//! mesmo tipo, a resposta é
 //! STATUS_WAS_LOCKED. A destrava pede cada página travado no tipo
 //! (STATUS_NOT_LOCKED senão, sem mudar nada). O decommit e a liberação da
 //! região levam as travas junto. As vistas de seção não passam pelo corte
@@ -24,7 +26,7 @@
 //! (STATUS_NOT_SUPPORTED, com registro).
 
 use crate::ntos::mm::memory_map;
-use crate::ntos::mm::working_set;
+use crate::ntos::mm::page_fault;
 use crate::ntos::ps::user::memory::{PrivateRegion, Space};
 use crate::ntos::ps::user::state::Region;
 
@@ -95,7 +97,7 @@ pub fn lock(space: Space, first: u64, end: u64, map_type: u32) -> u32 {
     for (region, first_index, end_index) in &runs {
         let Some(owner) = private(region) else { continue };
         let _hold = owner.hold();
-        let status = working_set::make_resident(space.root(), owner, *first_index, *end_index);
+        let status = page_fault::make_present(space.root(), owner, *first_index, *end_index);
         if status != 0 {
             return status;
         }

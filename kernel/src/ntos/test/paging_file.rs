@@ -206,8 +206,9 @@ fn information_without_files(assert: Assert) {
     }
 }
 
-/// O exe parado do processo de teste: só NtTerminateProcess.
-fn parked_image() -> Option<Vec<u8>> {
+/// O exe parado do processo de teste: só NtTerminateProcess (também o do
+/// teste de zero sob demanda).
+pub fn parked_image() -> Option<Vec<u8>> {
     let live = state::with(|state| state.name_by_number.iter().find(|(_, name)| name.as_str() == "NtTerminateProcess").map(|(&number, _)| number));
     let terminate = live.or_else(|| crate::ntos::ex::service_abi::NATIVE.entries.iter().find(|entry| entry.1 == "NtTerminateProcess").map(|entry| entry.0))?;
     let mut code = alloc::vec![0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x31, 0xD2, 0x49, 0x89, 0xCA, 0xB8];
@@ -259,8 +260,11 @@ fn paging(assert: Assert) {
     };
     let write_all = || process_context::with_process(process, || (0..PAGES).all(|page| (0..PAGE / 8).all(|word| guest::try_write::<u64>(base + page * PAGE + word * 8, (base + page * PAGE + word * 8) ^ MAGIC).is_ok()))).unwrap_or(false);
     let read_all = || process_context::with_process(process, || (0..PAGES).all(|page| (0..PAGE / 8).all(|word| guest::try_read::<u64>(base + page * PAGE + word * 8).is_ok_and(|value| value == (base + page * PAGE + word * 8) ^ MAGIC)))).unwrap_or(false);
+    // As páginas comitadas são de zero sob demanda: os frames vêm com a
+    // escrita.
+    let written = write_all();
     let frames: Vec<u64> = (0..PAGES).map(|page| owner.state.lock().frames.get(&page).copied().unwrap_or(0)).collect();
-    assert(write_all() && frames.iter().all(|&frame| frame != 0), "pagefile: as 16 paginas gravadas no processo de teste");
+    assert(written && frames.iter().all(|&frame| frame != 0), "pagefile: as 16 paginas gravadas no processo de teste");
     // O working set do processo esvaziado (MiEmptyWorkingSet).
     let nonresident = working_set::nonresident_pages();
     working_set::empty_working_set(process);

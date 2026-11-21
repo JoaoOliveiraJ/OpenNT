@@ -26,6 +26,7 @@ pub mod module_queries;
 pub mod direct_map;
 pub mod native_frame_descriptors;
 pub mod native_pfn_database;
+pub mod page_fault;
 pub mod page_residency;
 pub mod paging;
 pub mod paging_volume;

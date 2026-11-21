@@ -165,6 +165,14 @@ pub struct PrivateMut {
     pub written: BTreeSet<u64>,
 }
 
+impl PrivateMut {
+    /// A página está comitada e ainda sem frame (nem residente, nem fora do
+    /// working set): a de zero sob demanda (`mm/page_fault`).
+    pub fn demand_zero(&self, index: u64) -> bool {
+        self.committed_pages.contains(&index) && !self.frames.contains_key(&index) && !self.paging.contains_key(&index)
+    }
+}
+
 /// Uma página fora do working set (o estado que a PTE de transição ou de
 /// arquivo de paginação descreve no NT).
 #[derive(Clone, Copy, Debug)]
@@ -444,6 +452,20 @@ impl Space {
         self.with_vad(|vad| vad.find(va)).flatten()
     }
 
+    /// [`Space::find`] sem esperar as travas da lista de processos e do VAD:
+    /// cada uma tentada até `attempts` vezes; `Err` se uma continua tomada
+    /// (a falta de zero sob demanda com spin locks retidos, `mm/page_fault`).
+    pub fn try_find(self, va: u64, attempts: u32) -> Result<Option<Region>, ()> {
+        let Some(state) = process_state::try_get(self.process(), attempts)? else { return Ok(None) };
+        for _ in 0..attempts {
+            if let Some(vad) = state.vad.try_lock() {
+                return Ok(vad.find(va));
+            }
+            core::hint::spin_loop();
+        }
+        Err(())
+    }
+
     /// Alocações privadas e vistas de dados do processo.
     pub fn regions(self) -> Vec<Region> {
         self.with_vad(|vad| vad.regions.as_slice().to_vec()).unwrap_or_default()
@@ -578,10 +600,24 @@ pub fn private_pte(protect: u32) -> u64 {
     paging::PAGE_USER | if present { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 }
 }
 
-/// Mapeia uma faixa com frames do PFN na raiz `root` (commit inicial e
-/// commit sobre reserva); qualquer falha desfaz as páginas desta chamada.
+/// O commit de uma faixa (commit inicial e commit sobre reserva). Numa
+/// região paginável, as páginas novas só ficam comitadas com a proteção,
+/// sem frame e com a PTE zero: a primeira falta dá o frame zerado
+/// (`mm/page_fault`, o zero sob demanda do 19041). Numa residente (e sem
+/// região), cada página recebe um frame zerado do PFN mapeado na raiz
+/// `root`; qualquer falha desfaz as páginas desta chamada.
 pub fn map_user_page_range(root: u64, base: u64, size: u64, region: Option<&PrivateRegion>, protect: u32) -> bool {
     let protect = if protect != 0 { protect } else { region.map_or(4, |region| if region.protect != 0 { region.protect } else { 4 }) };
+    if let Some(region) = region.filter(|region| region.pageable) {
+        let mut state = region.state.lock();
+        let (first, end) = ((base - region.base) / PAGE, (base + size - region.base).div_ceil(PAGE));
+        for index in first..end {
+            if state.committed_pages.insert(index) {
+                state.page_protects.insert(index, protect);
+            }
+        }
+        return true;
+    }
     let mut added: Vec<(u64, u64, u64)> = Vec::new();
     let rollback = |added: &[(u64, u64, u64)]| {
         for &(va, frame, index) in added {
@@ -1670,9 +1706,18 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
     }
     let committed = region.committed_pages();
     let mut changes = Vec::new();
+    // As páginas de zero sob demanda (comitadas, sem frame) só trocam a
+    // proteção registrada, como o MiProtectVirtualMemory reescreve a PTE de
+    // zero sob demanda: a falta depois dá o frame com a proteção nova.
+    let mut demand_zero = Vec::new();
     let mut va = base;
     while va < end {
         let index = (va - region.base()) / PAGE;
+        if owner.is_some_and(|owner| owner.state.lock().demand_zero(index)) {
+            demand_zero.push((va, index));
+            va += PAGE;
+            continue;
+        }
         let physical = region.frame(index).unwrap_or_else(|| paging::translate_in(root, va));
         if committed.as_ref().is_some_and(|pages| !pages.contains(&index)) || physical == 0 {
             return Ok(0xC000_002D);
@@ -1681,6 +1726,18 @@ pub fn protect_in(space: Space, base_pointer: u64, size_pointer: u64, new_protec
         va += PAGE;
     }
     let old = memory_query::page_protection(&region, (base - region.base()) / PAGE, &context);
+    // Uma página que a falta de outra thread materializou desde a conferência
+    // troca a PTE como as outras.
+    if let Some(owner) = owner {
+        for (va, index) in demand_zero {
+            let mut state = owner.state.lock();
+            if state.demand_zero(index) {
+                state.page_protects.insert(index, protect);
+            } else if let Some(&frame) = state.frames.get(&index) {
+                changes.push((va, index, frame));
+            }
+        }
+    }
     let writable = protect & (4 | 8 | 0x40 | 0x80) != 0;
     // Uma página compartilhada de imagem que fica gravável ganha antes a
     // cópia privada do processo (o PAGE_WRITECOPY resolvido).

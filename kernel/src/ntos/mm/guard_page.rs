@@ -3,13 +3,15 @@
 //! MiCheckForUserStackOverflow que o MiUserFault chama).
 //!
 //! Uma página privada com PAGE_GUARD (NtAllocateVirtualMemory ou
-//! NtProtectVirtualMemory) fica comitada, com o frame, e a PTE ausente; a
-//! proteção completa fica na região (`PrivateMut::page_protects`), que o
+//! NtProtectVirtualMemory) fica comitada com a PTE ausente: com o frame, se
+//! já tinha um, ou de zero sob demanda (`mm/page_fault`); a proteção
+//! completa fica na região (`PrivateMut::page_protects`), que o
 //! NtQueryVirtualMemory devolve. O primeiro acesso que a proteção base
 //! admite tira a guarda (uma escrita numa página sem escrita, ou uma
 //! execução numa página NX, é STATUS_ACCESS_VIOLATION e a guarda fica, como
-//! no MiAccessCheck): a PTE volta válida com a proteção base, e o
-//! MiCheckForUserStackOverflow decide o resultado:
+//! no MiAccessCheck): a PTE volta válida com a proteção base, sobre o frame
+//! que a página tinha ou sobre um zerado, e o MiCheckForUserStackOverflow
+//! decide o resultado:
 //!
 //! - fora da pilha da thread (TEB DeallocationStack..StackBase), com a
 //!   thread anexada a outro processo ou sem TEB: STATUS_GUARD_PAGE_VIOLATION,
@@ -41,6 +43,7 @@ use crate::ntos::inc::types::{Kthread, Peb, Teb};
 use crate::ntos::ke::{irql, process_attachment};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::memory_map as map;
+use crate::ntos::mm::page_fault;
 use crate::ntos::mm::paging::{self, MapOptions};
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::memory::{self, PrivateRegion, Space, PAGE_GUARD};
@@ -87,28 +90,42 @@ pub fn touch(address: u64, access: Access) -> Option<u32> {
 
 /// MiAccessCheck da página `index`: com PAGE_GUARD e o acesso admitido pela
 /// proteção base, a PTE volta válida com ela e a guarda sai da proteção
-/// registrada.
+/// registrada. Uma guarda ainda sem frame (o commit de uma região
+/// paginável é de zero sob demanda) perde a guarda e ganha o frame zerado
+/// pela falta de zero sob demanda (`mm/page_fault`).
 fn clear_guard(root: u64, owner: &PrivateRegion, index: u64, access: Access) -> bool {
-    let mut state = owner.state.lock();
-    if !state.committed_pages.contains(&index) {
-        return false;
+    {
+        let mut state = owner.state.lock();
+        if !state.committed_pages.contains(&index) {
+            return false;
+        }
+        let protect = state.page_protects.get(&index).copied().filter(|&protect| protect != 0).unwrap_or(owner.protect);
+        if protect & PAGE_GUARD == 0 {
+            return false;
+        }
+        let writable = protect & (0x04 | 0x08 | 0x40 | 0x80) != 0;
+        let executable = protect & 0xF0 != 0;
+        if (access == Access::Write && !writable) || (access == Access::Execute && !executable) {
+            return false;
+        }
+        let base = protect & !PAGE_GUARD;
+        if let Some(&frame) = state.frames.get(&index) {
+            if !paging::map_page_in(root, owner.base + index * PAGE, frame, memory::private_pte(base), MapOptions { nx: base & 0xF0 == 0, ..MapOptions::default() }) {
+                return false;
+            }
+            state.page_protects.insert(index, base);
+            state.protected_frames.insert(index, frame);
+            return true;
+        }
+        if !state.demand_zero(index) {
+            return false;
+        }
+        state.page_protects.insert(index, base);
     }
-    let protect = state.page_protects.get(&index).copied().filter(|&protect| protect != 0).unwrap_or(owner.protect);
-    if protect & PAGE_GUARD == 0 {
-        return false;
-    }
-    let writable = protect & (0x04 | 0x08 | 0x40 | 0x80) != 0;
-    let executable = protect & 0xF0 != 0;
-    if (access == Access::Write && !writable) || (access == Access::Execute && !executable) {
-        return false;
-    }
-    let Some(&frame) = state.frames.get(&index) else { return false };
-    let base = protect & !PAGE_GUARD;
-    if !paging::map_page_in(root, owner.base + index * PAGE, frame, memory::private_pte(base), MapOptions { nx: base & 0xF0 == 0, ..MapOptions::default() }) {
-        return false;
-    }
-    state.page_protects.insert(index, base);
-    state.protected_frames.insert(index, frame);
+    // Sem frame: a guarda já saiu da proteção; o frame vem com a trava solta.
+    // Sem memória, a página fica de zero sob demanda e a repetição do acesso
+    // faz a falta comum.
+    page_fault::materialize(root, owner, index);
     true
 }
 

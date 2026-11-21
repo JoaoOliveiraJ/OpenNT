@@ -90,6 +90,13 @@ use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHead
 use core::mem::offset_of;
 
 pub const CONTEXT_SIZE: u64 = Context::SIZE;
+/// Os flags do CONTEXT que o PspInitializeThunkContext do 19041 lê da thread
+/// e copia na pilha de usuário: CONTEXT_AMD64 com CONTROL, INTEGER,
+/// FLOATING_POINT e DEBUG_REGISTERS (0x10001B). O CONTEXT_XSTATE só entra com
+/// a pilha de sombra do CET de usuário (KTHREAD.MiscFlags.CetUserShadowStack,
+/// bit 20), que o OpenNT não liga: o CONTEXT estendido é o CONTEXT e o
+/// CONTEXT_EX, sem área de XSAVE.
+const THUNK_CONTEXT_FLAGS: u32 = 0x10_001B;
 const PENDING: u32 = 0x103;
 const NOT_SUPPORTED: u32 = 0xC000_00BB;
 const THREAD_IS_TERMINATING: u32 = 0xC000_004B;
@@ -1613,10 +1620,12 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
     SLICE_THREAD[cpu].store(0, Ordering::Release);
     let exit_kind = crate::hal::amd64::usermode::block().exit_kind.get();
     // A linha da falha de modo usuário (o CR2 e a pilha que o stub publicou),
-    // menos no serviço de depuração, que é uma chamada.
+    // menos no serviço de depuração, que é uma chamada, e na falta de página,
+    // que sai em `exceptions` só quando nenhum provedor de residência a
+    // resolve (o zero sob demanda faz uma falta por página tocada).
     if exit_kind == 3 {
         let block = crate::hal::amd64::usermode::block();
-        if block.fault_vector.get() != 0x2D {
+        if block.fault_vector.get() != 0x2D && block.fault_vector.get() != 14 {
             crate::debug_print!(" C2={:016X} SP={:016X}", block.fault_cr2.get(), block.fault_rsp.get());
         }
     }
@@ -2936,8 +2945,17 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         regions.push(stack.region.clone());
         let (teb, region) = allocate_private(0x2000, 0)?;
         regions.push(region);
-        let (startup, region) = allocate_private(0x1000, 0)?;
-        regions.push(region);
+        // O CONTEXT de partida (RtlUserThreadStart) fica na pilha de usuário,
+        // logo abaixo do RSP inicial, como o PspInitializeThunkContext do
+        // 19041 (rva 0x6c07e0) o copia antes de a thread entrar na ntdll: um
+        // CONTEXT estendido do tamanho do RtlGetExtendedContextLength dos
+        // flags do contexto inicial, alinhado a 16, com o CONTEXT_EX
+        // (RtlInitializeExtendedContext) logo depois do CONTEXT. O
+        // LdrInitializeThunk recebe o endereço dele em RCX e começa com o RSP
+        // 0x28 abaixo. A escrita dá à página do topo da pilha o frame (zero
+        // sob demanda), como a sonda de escrita do 19041 sobre a mesma faixa.
+        let length = crate::ntos::rtl::extended_context::extended_context_length2(THUNK_CONTEXT_FLAGS, 0).map_err(|status| if status & 0x8000_0000 != 0 { status } else { 0xC000_000D })? as u64;
+        let startup = (stack.base - 8 - length) & !0xF;
         context = guest::alloc_bytes(CONTEXT_SIZE);
         if context == 0 {
             return Err(0xC000_0017);
@@ -2968,10 +2986,13 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.
         block.same_teb_flags.set((if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
         initialize_context(startup, exports.0, stack.base - 8, request.start, 0);
+        // Os flags do PspInitializeThunkContext e o CONTEXT_EX depois do
+        // CONTEXT (os pedaços All e Legacy, sem XSTATE).
+        crate::ntos::rtl::extended_context::initialize_extended_context2(startup, THUNK_CONTEXT_FLAGS, 0).map_err(|status| if status & 0x8000_0000 != 0 { status } else { 0xC000_000D })?;
         // O argumento é um ULONG_PTR opaco: preserva os 64 bits.
         // SAFETY: o CONTEXT de partida acabou de ser montado.
         unsafe { Context::at(startup) }.rdx.set(request.argument_words[0] as u64 | (request.argument_words[1] as u64) << 32);
-        initialize_context(context, exports.1, stack.base - 8, startup, ntdll_base);
+        initialize_context(context, exports.1, startup - 0x28, startup, ntdll_base);
         process::add_thread(process_pointer);
         process::describe_thread(thread_pointer, None, false);
         process::set_thread_start(thread_pointer, request.start);

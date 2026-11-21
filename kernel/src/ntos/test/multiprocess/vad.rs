@@ -100,6 +100,11 @@ pub fn run(assert: Assert) {
     let a_second = within(first, &|| scratch.allocate(0x1000));
     let bases = [a_out, b_out, a_region, b_region, a_second];
     assert(bases.iter().all(|&base| base != 0 && base % 0x1_0000 == 0) && bases.iter().enumerate().all(|(index, base)| !bases[..index].contains(base)), "vad: alocacoes de baixo para cima em A e em B");
+    // As páginas comitadas são de zero sob demanda: o primeiro toque de
+    // cada processo dá à região dele a página que as conferências abaixo
+    // procuram pela tradução.
+    let touched = within(first, &|| guest::try_write::<u64>(a_region, 0xA).is_ok() as u64) != 0 && within(second, &|| guest::try_write::<u64>(b_region, 0xB).is_ok() as u64) != 0;
+    assert(touched && paging::translate(a_region) != 0 && paging::translate(b_region) != 0, "vad: o primeiro toque de A e de B da a pagina da propria regiao");
     assert(seen(first, a_out) && seen(first, a_region) && seen(first, a_second) && !seen(first, b_out) && !seen(first, b_region), "vad: A rastreia so as proprias alocacoes");
     assert(seen(second, b_out) && seen(second, b_region) && !seen(second, a_out) && !seen(second, a_region) && !seen(second, a_second), "vad: B rastreia so as proprias alocacoes");
     assert(Space::of(first).regions().len() == 3 && Space::of(second).regions().len() == 2 && Space::system().regions().len() == system_regions, "vad: cada VAD com as suas regioes e o do System intacto");

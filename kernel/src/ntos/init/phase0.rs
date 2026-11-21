@@ -61,6 +61,7 @@ pub fn init() {
     crate::drivers::storage::sector_cache::initialize().unwrap_or_else(|error| panic!("cache de metadados: {error}"));
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)
+    crate::ntos::mm::page_fault::init(); // zero sob demanda das alocações privadas
     dump_mdl::init().unwrap_or_else(|error| panic!("dump MDL: {error}"));
     critical_region::init(); // entrega de APCs respeita KernelApcDisable/SpecialApcDisable
     scheduler::init().unwrap_or_else(|error| panic!("Process Manager: {error}")); // EPROCESS System + thread do boot

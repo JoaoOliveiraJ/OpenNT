@@ -68,6 +68,7 @@ pub mod executive_misc_exports;
 pub mod rtl_decompression;
 pub mod time_keeping;
 pub mod memory_pressure;
+pub mod demand_zero;
 pub mod paging_file;
 pub mod rtl_strings_sids_exports;
 pub mod security_session_exports;

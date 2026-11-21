@@ -361,6 +361,12 @@ pub fn alloc_page_for(owner: FrameUse) -> u64 {
     address
 }
 
+/// [`alloc_page_for`] sem a recuperação de memória: só um frame que já está
+/// livre (a falta de zero sob demanda com spin locks retidos), ou 0.
+pub fn try_alloc_page_for(owner: FrameUse) -> u64 {
+    try_allocate_page(owner)
+}
+
 /// O frame em uso `address` passa a ser de `owner` (um frame contíguo, ou
 /// um que muda de dono). Um frame fora do alocador, ou livre, fica como
 /// está.
