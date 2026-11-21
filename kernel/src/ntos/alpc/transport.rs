@@ -128,6 +128,11 @@ impl ConnectWait {
     }
 }
 
+/// Quem recebe a decisão do servidor sobre uma conexão que ninguém espera
+/// ([`Service::connect_deferred`]): o status, a carga da resposta de conexão
+/// e o remetente dela.
+pub type ConnectDecided = Box<dyn FnOnce(JobResult) + Send>;
+
 /// Serviço hospedado no kernel por trás de um nome de porta. `connect`
 /// recebe a carga da conexão (e, nas entradas Ex/Zw, o PORT_MESSAGE
 /// montado); `exchange` cada pedido; `request` o contrato LPC legado.
@@ -142,6 +147,18 @@ pub trait Service: Send + Sync {
     /// servidor; um serviço que decide sem esperar ignora os dois.
     fn connect_waiting(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>, _wait: ConnectWait) -> Reply {
         self.connect(port, data, request)
+    }
+    /// A conexão sem ALPC_MSGFLG_SYNC_REQUEST. O AlpcpProcessConnectionRequest
+    /// do 19041 só espera a resposta com esse bit (`bt r15d, 11h` em
+    /// 0x5dee92, antes do AlpcpReceiveSynchronousReply); sem ele, volta com o
+    /// status do AlpcpDispatchConnectionRequest, e o accept do servidor
+    /// enfileira depois o LPC_CONNECTION_REPLY na porta do cliente. Aqui o
+    /// pedido entra na fila do servidor e a chamada volta com o status do
+    /// envio; `decided` roda com a decisão, quando o servidor a der (no
+    /// accept ou na recusa). `None`: o serviço decide na hora (os hospedados
+    /// no kernel), e quem chama usa o `connect_waiting`.
+    fn connect_deferred(&self, _port: &Arc<Port>, _data: &[u8], _request: Option<&[u8]>, _decided: ConnectDecided) -> Option<u32> {
+        None
     }
     fn exchange(&self, _port: &Arc<Port>, _data: &[u8], _request: &Arc<Request>) -> Reply {
         Reply::Now(JobResult { status: 0xC000_00BB, ..JobResult::default() })

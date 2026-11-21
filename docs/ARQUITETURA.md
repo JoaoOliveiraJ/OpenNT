@@ -5674,6 +5674,28 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     responde sem RELEASE_MESSAGE ao pedido do winsrvext do csrss com o
     próximo comando, e o csrss devolve o resultado respondendo a essa
     resposta com outro pedido síncrono;
+  - a conexão sem ALPC_MSGFLG_SYNC_REQUEST não espera o servidor: o
+    AlpcpProcessConnectionRequest do 19041 só chama o
+    AlpcpReceiveSynchronousReply com esse bit (`bt r15d, 11h` em 0x5dee92) e
+    volta com o status do AlpcpDispatchConnectionRequest, e o
+    AlpcpConnectPort entrega o handle. Aqui o NtAlpcConnectPort(Ex) e o
+    ZwAlpcConnectPort(Ex) põem a LPC_CONNECTION_REQUEST na fila
+    (`Service::connect_deferred`, `UserServer::request_connection_deferred`)
+    e voltam, sem tocar a mensagem de conexão nem os atributos de recepção;
+    o NtAlpcAcceptConnectPort entrega a decisão dentro do accept
+    (`server::decide`), e o LPC_CONNECTION_REPLY entra na porta do cliente
+    com sequência 1 antes de qualquer mensagem que o servidor mande depois,
+    avisando a IOCP ou o semáforo da porta esperável (no ZwAlpcConnectPort,
+    pelo job da conexão e o pump). A recusa só libera a conexão, como o
+    AlpcpAcceptConnectPort (ConnectionRefused na porta do cliente, nada na
+    fila); o cliente que fecha a porta antes leva o pedido ainda não
+    recebido, e o accept do que já foi recebido volta
+    STATUS_PORT_DISCONNECTED. O CoreMessaging conecta assim e espera a
+    resposta na porta: o MIT do dwm.exe (CGlobalMit::Run) e o servidor de
+    navegação do sihost.exe conectam um ao outro ao mesmo tempo, e com a
+    espera síncrona nenhum dos dois aceitava; o MIT parado deixava sem
+    entrega os botões do mouse, que o win32kbase passa a ele
+    (glDitMouseHandling, WakeDIT);
   - o RequiredServerSid do NtAlpcConnectPort e do NtSecureConnectPort é
     comparado com o usuário do token primário do dono da porta de conexão,
     que não pode ser AppContainer, e o descritor do NtAlpcConnectPortEx com

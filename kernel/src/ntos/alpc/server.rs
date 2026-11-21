@@ -15,6 +15,9 @@
 //!   LPC_CONNECTION_REQUEST entra na fila do servidor, a IOCP associada à
 //!   porta de conexão recebe o aviso e a thread do cliente bloqueia
 //!   (`ke::context_switch::wait_until`) até o servidor aceitar ou recusar;
+//!   sem ALPC_MSGFLG_SYNC_REQUEST (`Service::connect_deferred`) a chamada
+//!   volta depois do envio, e o accept enfileira o LPC_CONNECTION_REPLY na
+//!   porta do cliente;
 //! - NtAlpcAcceptConnectPort ([`accept_connect_port`]): a porta de
 //!   comunicação do servidor, com o PortContext dado, e a resposta de
 //!   conexão (os dados da mensagem que o servidor devolve) para o cliente;
@@ -89,7 +92,7 @@ use crate::ntos::alpc::message::view as message_view;
 use crate::ntos::alpc::port_reference;
 use crate::ntos::alpc::rpc_trace::{self, Direction, Record};
 use crate::ntos::alpc::small::context_attribute;
-use crate::ntos::alpc::transport::{self, ConnectWait, Job, JobResult, Listener, Reply, Request, Sender, Service};
+use crate::ntos::alpc::transport::{self, ConnectDecided, ConnectWait, Job, JobResult, Listener, Reply, Request, Sender, Service};
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::alpc::message::handles::{self as message_handles, HandleData};
 use crate::ntos::alpc::message::identity::Retained;
@@ -293,10 +296,15 @@ pub struct Decision {
 
 /// Uma conexão à espera da decisão do servidor.
 struct PendingConnection {
+    /// O MessageId da LPC_CONNECTION_REQUEST na fila do servidor.
+    id: u32,
     client: Arc<Port>,
     sender: Sender,
     view: Option<Arc<ClientView>>,
     decision: SpinLock<Option<Decision>>,
+    /// A conexão sem ALPC_MSGFLG_SYNC_REQUEST: nenhuma thread espera a
+    /// decisão, que vai a quem a pediu ([`decide`]).
+    deferred: SpinLock<Option<ConnectDecided>>,
 }
 
 /// Quem enviou uma mensagem ainda pendente: o CLIENT_ID e a ETHREAD da
@@ -458,7 +466,7 @@ impl UserServer {
             (core::mem::take(&mut state.connections), core::mem::take(&mut state.requests), core::mem::take(&mut state.queue), core::mem::take(&mut state.exposed_views), core::mem::take(&mut state.received), core::mem::take(&mut state.callbacks))
         };
         for connection in connections.values() {
-            refuse(connection, None);
+            refuse(self, connection, None);
         }
         for slot in requests.values().chain(callbacks.values()) {
             *slot.result.lock() = Some(JobResult { status: STATUS_PORT_DISCONNECTED, ..JobResult::default() });
@@ -493,23 +501,8 @@ impl UserServer {
     /// `request_connection` com o modo e a alertabilidade da espera pela
     /// decisão; uma espera interrompida devolve o status dela.
     pub fn request_connection_waiting(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>, kernel_mode: bool, wait: ConnectWait) -> Decision {
-        let message_type = LPC_CONTINUATION_REQUIRED | LPC_CONNECTION_REQUEST | if kernel_mode { LPC_KERNELMODE_MESSAGE } else { 0 };
-        let sender = current_sender();
-        let pending = Arc::new(PendingConnection { client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None) });
-        let (id, sequence) = {
-            let mut state = self.state.lock();
-            if state.closed {
-                return Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() };
-            }
-            let id = UserServer::next_id(&mut state);
-            state.connections.insert(id, pending.clone());
-            state.senders.insert(id, Origin { sender, client: port.pointer, waiting: true, message_type, received: false });
-            (id, next_sequence(&self.listener))
-        };
-        if rpc_trace::enabled() {
-            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type, id, data, ..Record::default() });
-        }
-        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
+        let Some(pending) = self.dispatch_connection(port, data, view, kernel_mode, None) else { return Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() } };
+        let (id, sender) = (pending.id, pending.sender);
         let decision = pending.clone();
         let status = kernel_entry::wait_transport(&mut || decision.decision.lock().as_ref().map(|decision| decision.status), crate::ntos::ke::wait::Deadline::Infinite, wait.mode, wait.alertable);
         let decision = pending.decision.lock().take().unwrap_or(Decision { status, ..Decision::default() });
@@ -531,6 +524,107 @@ impl UserServer {
         }
         decision
     }
+
+    /// A conexão sem ALPC_MSGFLG_SYNC_REQUEST (o AlpcpProcessConnectionRequest
+    /// do 19041 volta depois do AlpcpDispatchConnectionRequest, em 0x5dee92):
+    /// a LPC_CONNECTION_REQUEST entra na fila e a chamada volta com o status
+    /// do envio; `decided` recebe a decisão no accept ou na recusa
+    /// ([`decide`]), sem thread nenhuma esperando por ela.
+    pub fn request_connection_deferred(&self, port: &Arc<Port>, data: &[u8], kernel_mode: bool, decided: ConnectDecided) -> u32 {
+        match self.dispatch_connection(port, data, None, kernel_mode, Some(decided)) {
+            Some(_) => STATUS_SUCCESS,
+            None => STATUS_PORT_CONNECTION_REFUSED,
+        }
+    }
+
+    /// O AlpcpDispatchConnectionRequest: a conexão pendente registrada com o
+    /// MessageId e a LPC_CONNECTION_REQUEST na fila da porta de conexão.
+    /// `None` com a porta de conexão já fechada.
+    fn dispatch_connection(&self, port: &Arc<Port>, data: &[u8], view: Option<Arc<ClientView>>, kernel_mode: bool, deferred: Option<ConnectDecided>) -> Option<Arc<PendingConnection>> {
+        let message_type = LPC_CONTINUATION_REQUIRED | LPC_CONNECTION_REQUEST | if kernel_mode { LPC_KERNELMODE_MESSAGE } else { 0 };
+        let sender = current_sender();
+        let waiting = deferred.is_none();
+        let (pending, sequence) = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return None;
+            }
+            let id = UserServer::next_id(&mut state);
+            let pending = Arc::new(PendingConnection { id, client: port.clone(), sender, view: view.clone(), decision: SpinLock::new(None), deferred: SpinLock::new(deferred) });
+            state.connections.insert(id, pending.clone());
+            state.senders.insert(id, Origin { sender, client: port.pointer, waiting, message_type, received: false });
+            (pending, next_sequence(&self.listener))
+        };
+        let id = pending.id;
+        if rpc_trace::enabled() {
+            rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type, id, data, ..Record::default() });
+        }
+        self.enqueue(Delivery { id, message_type, data: Vec::from(data), sender, port_context: 0, view, sequence, ..Delivery::default() });
+        Some(pending)
+    }
+
+    /// O cliente de uma conexão ainda sem decisão fechou a porta: o pedido
+    /// que o servidor ainda não recebeu sai da fila com a conexão, como no
+    /// cancelamento das mensagens do cliente que fecha (AlpcpFlushMessagesPort);
+    /// o que ele já recebeu fica, e o accept dele volta
+    /// STATUS_PORT_DISCONNECTED (o Disconnected da porta do cliente, conferido
+    /// pelo AlpcpAcceptConnectPort em 0x5e15b2).
+    fn abandon_connections(&self, client: &Arc<Port>) {
+        let abandoned: Vec<Arc<PendingConnection>> = {
+            let mut state = self.state.lock();
+            // Só as adiadas: a thread de uma conexão síncrona continua
+            // esperando a decisão do servidor.
+            let ids: Vec<u32> = state.connections.iter().filter(|(_, pending)| Arc::ptr_eq(&pending.client, client) && pending.deferred.lock().is_some()).map(|(&id, _)| id).collect();
+            let mut abandoned = Vec::new();
+            for id in ids {
+                if state.senders.get(&id).is_some_and(|origin| origin.received) {
+                    continue;
+                }
+                state.queue.retain(|delivery| delivery.id != id || delivery.message_type & 0xFF != LPC_CONNECTION_REQUEST);
+                state.senders.remove(&id);
+                if let Some(pending) = state.connections.remove(&id) {
+                    abandoned.push(pending);
+                }
+            }
+            abandoned
+        };
+        for pending in abandoned {
+            drop(pending.deferred.lock().take());
+            if let Some(view) = &pending.view {
+                view.withdraw();
+            }
+        }
+    }
+}
+
+/// A decisão do servidor sobre uma conexão. A thread de uma conexão síncrona
+/// a acha na conexão pendente; a de uma conexão sem ALPC_MSGFLG_SYNC_REQUEST
+/// sai do servidor agora e vai a quem a pediu, ainda dentro do accept (o
+/// AlpcpAcceptConnectPort despacha o LPC_CONNECTION_REPLY, Type 0xb em
+/// 0x5e17d0, pelo AlpcpDispatchMessage em 0x5e1a62, antes de voltar ao
+/// servidor), com o CLIENT_ID da thread que decide.
+fn decide(server: &UserServer, pending: &Arc<PendingConnection>, decision: Decision) {
+    let Some(decided) = pending.deferred.lock().take() else {
+        *pending.decision.lock() = Some(decision);
+        kernel_entry::notify_waiters();
+        return;
+    };
+    {
+        let mut state = server.state.lock();
+        state.connections.remove(&pending.id);
+        state.senders.remove(&pending.id);
+        state.queue.retain(|delivery| delivery.id != pending.id || delivery.message_type & 0xFF != LPC_CONNECTION_REQUEST);
+    }
+    if rpc_trace::enabled() {
+        rpc_trace::connection_decided(server.listener.pointer, pending.sender.process, server.listener.process_id(), pending.id, decision.status);
+    }
+    if decision.status != STATUS_SUCCESS {
+        if let Some(view) = &pending.view {
+            view.withdraw();
+        }
+    }
+    decided(JobResult { status: decision.status, data: decision.data, sender: Some(current_sender()) });
+    kernel_entry::notify_waiters();
 }
 
 /// A recusa de uma conexão: STATUS_PORT_CONNECTION_REFUSED para o cliente e
@@ -538,7 +632,7 @@ impl UserServer {
 /// servidor (`port_context`, o PortContext do accept) vai ao PortContext de
 /// um cliente com ReturnExtendedInfo, como no AlpcpAcceptConnectPort do
 /// 19041 (0x5e162c); o fechamento da porta de conexão não tem PortContext.
-fn refuse(connection: &PendingConnection, port_context: Option<u64>) {
+fn refuse(server: &UserServer, connection: &Arc<PendingConnection>, port_context: Option<u64>) {
     if let Some(view) = &connection.view {
         view.withdraw();
     }
@@ -549,7 +643,7 @@ fn refuse(connection: &PendingConnection, port_context: Option<u64>) {
             }
         });
     }
-    *connection.decision.lock() = Some(Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() });
+    decide(server, connection, Decision { status: STATUS_PORT_CONNECTION_REFUSED, ..Decision::default() });
 }
 
 /// O valor que um cliente com ReturnExtendedInfo recebe em *PortHandle numa
@@ -620,6 +714,12 @@ impl Service for UserServer {
         Reply::Now(JobResult { status: decision.status, data: decision.data, sender: Some(server) })
     }
 
+    fn connect_deferred(&self, port: &Arc<Port>, data: &[u8], request: Option<&[u8]>, decided: ConnectDecided) -> Option<u32> {
+        let type_offset = offset_of!(PortMessage, u2.s2.type_);
+        let kernel_mode = request.and_then(|bytes| bytes.get(type_offset..type_offset + 2)).is_some_and(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) & LPC_KERNELMODE_MESSAGE != 0);
+        Some(self.request_connection_deferred(port, data, kernel_mode, decided))
+    }
+
     /// LPC_REQUEST ou LPC_DATAGRAM na fila; a resposta conclui o job.
     fn exchange(&self, port: &Arc<Port>, data: &[u8], request: &Arc<Request>) -> Reply {
         let (datagram, answer, synchronous, type_bits, mut sender, sent_attributes) = {
@@ -667,6 +767,7 @@ impl Service for UserServer {
     /// mensagens que o servidor mandou a ele e ainda esperam resposta
     /// terminam com STATUS_PORT_DISCONNECTED.
     fn disconnect(&self, port: &Arc<Port>) {
+        self.abandon_connections(port);
         let (link, id, sequence, abandoned) = {
             let mut state = self.state.lock();
             let Some(link) = state.links.remove(&port.pointer) else { return };
@@ -1671,8 +1772,7 @@ pub fn accept_legacy(out: u64, port_context: u64, request: u64, accept: bool, vi
         return Ok(Err(STATUS_INVALID_CID));
     }
     if !accept {
-        refuse(&pending, Some(port_context));
-        kernel_entry::notify_waiters();
+        refuse(&server, &pending, Some(port_context));
         return Ok(Ok(LegacyAccepted::default()));
     }
     if mode != 0 && !state::probe_user_write(out, 8) {
@@ -1765,8 +1865,7 @@ fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, ou
         COMMUNICATION.lock().insert(communication.pointer, (server.clone(), client_pointer));
         server.state.lock().links.insert(client_pointer, Link { server_port: communication.clone(), context: port_context, disconnected: false });
         let server_view = accepted.server_view.as_ref().map(|(_, remote)| remote.clone());
-        *pending.decision.lock() = Some(Decision { status: STATUS_SUCCESS, data, server_view });
-        kernel_entry::notify_waiters();
+        decide(server, pending, Decision { status: STATUS_SUCCESS, data, server_view });
         Ok(STATUS_SUCCESS)
     });
     crate::ntos::ob::objects::dispatcher::collect(communication.pointer);
@@ -2052,9 +2151,15 @@ pub fn accept_connect_port_with(out: u64, connection: u64, attributes: u64, port
         let id_offset = offset_of!(PortMessage, message_id);
         let id = u32::from_le_bytes([captured.header[id_offset], captured.header[id_offset + 1], captured.header[id_offset + 2], captured.header[id_offset + 3]]);
         let Some(pending) = server.state.lock().connections.get(&id).cloned() else { return Ok(STATUS_REPLY_MESSAGE_MISMATCH) };
+        // AlpcpAcceptConnectPort (0x5e15b2): a porta do cliente que já se
+        // desconectou (o cliente de uma conexão adiada que fechou a porta
+        // depois de o servidor receber o pedido) dá STATUS_PORT_DISCONNECTED.
+        if pending.client.closed() {
+            decide(&server, &pending, Decision { status: STATUS_PORT_DISCONNECTED, ..Decision::default() });
+            return Ok(STATUS_PORT_DISCONNECTED);
+        }
         if !accept {
-            refuse(&pending, Some(port_context));
-            kernel_entry::notify_waiters();
+            refuse(&server, &pending, Some(port_context));
             return Ok(STATUS_SUCCESS);
         }
         if mode != 0 && !state::probe_user_write(out, 8) {

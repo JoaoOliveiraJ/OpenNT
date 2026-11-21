@@ -35,6 +35,16 @@ use crate::ntos::mm::guest_memory as guest;
 /// Conexões aguardando a decisão do servidor (porta → pedido).
 static PENDING: SpinLock<Vec<(Arc<Port>, Arc<Request>)>> = SpinLock::new(Vec::new());
 
+/// A decisão de uma conexão sem ALPC_MSGFLG_SYNC_REQUEST
+/// (`Service::connect_deferred`), quando o servidor a der.
+struct DeferredDecision(Arc<SpinLock<Option<JobResult>>>);
+
+impl crate::ntos::alpc::transport::Job for DeferredDecision {
+    fn poll(&mut self) -> Option<JobResult> {
+        self.0.lock().take()
+    }
+}
+
 fn completed(status: u32) -> Result<Box<dyn Pending>, KernelError> {
     Ok(Box::new(Completed(status)))
 }
@@ -564,7 +574,24 @@ fn connect(shared: &Shared, transferred: &mut bool, pointers: [u64; 10], flags: 
     // O callback pode fechar a própria porta: o job é publicado antes que
     // `run` reavalie a limpeza, para que o cancelamento também o libere.
     let bytes = request.state.lock().connect_bytes.clone();
-    let decision = port.run(|| service.connect_waiting(&port, &message.data, Some(&bytes), crate::ntos::alpc::transport::ConnectWait::from_flags(flags, mode)));
+    // Sem ALPC_MSGFLG_SYNC_REQUEST o AlpcpProcessConnectionRequest não espera
+    // a decisão (0x5dee92): um servidor que decide depois a entrega pelo job,
+    // e o pump enfileira o LPC_CONNECTION_REPLY (`finish_server`).
+    let deferred = if synchronous {
+        None
+    } else {
+        let decided: Arc<SpinLock<Option<JobResult>>> = Arc::new(SpinLock::new(None));
+        let filled = decided.clone();
+        match port.run(|| service.connect_deferred(&port, &message.data, Some(&bytes), Box::new(move |result| *filled.lock() = Some(result)))) {
+            Some(0) => Some(Reply::Later(Box::new(DeferredDecision(decided)))),
+            Some(status) => return completed(status),
+            None => None,
+        }
+    };
+    let decision = match deferred {
+        Some(reply) => reply,
+        None => port.run(|| service.connect_waiting(&port, &message.data, Some(&bytes), crate::ntos::alpc::transport::ConnectWait::from_flags(flags, mode))),
+    };
     let immediate = match decision {
         Reply::Now(result) => Some(result),
         Reply::Later(job) => {
