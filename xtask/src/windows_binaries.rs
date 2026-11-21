@@ -890,8 +890,11 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// que o ShellFeatureRolloutCoordinator::Initialize do DesktopShellExt.dll
 /// ativa no PreInitialize (sem a classe, o get_activation_factory do
 /// C++/WinRT lança um hresult_error com REGDB_E_CLASSNOTREG, o CATCH_LOG do
-/// DesktopShellExt não reconhece o tipo e o sihost para em fail fast); os
-/// imports estáticos deles que faltavam (AppXDeploymentClient.dll,
+/// DesktopShellExt não reconhece o tipo e o sihost para em fail fast); o
+/// ExecModelClient.dll, que o servidor CoreUI do CoreUIComponents.dll no
+/// sihost carrega pelo nome (g_dllExecModelClient, DllName::Import): sem ele
+/// o Cn::Throw::DllNotFoundException leva o CoreUIHost ao fail fast
+/// (0xC0000602); os imports estáticos deles que faltavam (AppXDeploymentClient.dll,
 /// fltLib.dll, container.dll, tquery.dll e esent.dll); e as cargas
 /// atrasadas de primeiro nível deles com o fecho estático de cada uma: o
 /// sihost trata como falha crítica (fail fast) qualquer HRESULT de erro de
@@ -952,6 +955,7 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "cdp.dll",
     "NPSM.dll",
     "fcon.dll",
+    "ExecModelClient.dll",
     // Os imports estáticos dos componentes.
     "AppXDeploymentClient.dll",
     "fltLib.dll",
