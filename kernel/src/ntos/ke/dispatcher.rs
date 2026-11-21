@@ -9,7 +9,7 @@
 //! contexto de boot drena timers, DPCs, work items e o escalonador enquanto
 //! aguarda o estado ou o prazo.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +17,7 @@ use super::{clock, context_switch, dpc, thread_alert, timer, wait};
 use crate::ntos::inc::types::{DispatcherHeader, Field, Kevent, Kmutant, Ksemaphore, LargeInteger, ListEntry, NtStruct};
 use crate::ntos::io::work_items;
 use crate::ntos::ps::{process, scheduler};
-use crate::rtl::SpinLock;
+use crate::rtl::{PtrMap, SpinLock};
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_TIMEOUT: u32 = 0x102;
@@ -148,8 +148,14 @@ struct PulseRecord {
 
 /// A contagem de pulsos anotados (o relógio das esperas sondadas).
 static PULSE_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Os eventos pulsados, pelo endereço do KEVENT.
-static PULSES: SpinLock<BTreeMap<u64, PulseRecord>> = SpinLock::new(BTreeMap::new());
+/// Os eventos pulsados, pelo endereço do KEVENT, e a ordem dos pulsos
+/// (evento, contagem) para tirar o mais antigo sem percorrer o mapa.
+struct Pulses {
+    records: PtrMap<PulseRecord>,
+    order: VecDeque<(u64, u64)>,
+}
+
+static PULSES: SpinLock<Pulses> = SpinLock::new(Pulses { records: PtrMap::new(), order: VecDeque::new() });
 /// Eventos lembrados: além disso sai o de pulso mais antigo.
 const PULSED_EVENTS: usize = 256;
 
@@ -181,14 +187,32 @@ pub fn wake_epoch() -> u64 {
 /// Anota um pulso (ou o reset de um objeto sinalizado): eventos e timers.
 fn note_pulse(event: u64, unclaimed: bool) {
     note_wake();
-    let mut pulses = PULSES.lock();
+    let mut guard = PULSES.lock();
+    let pulses = &mut *guard;
     let pulse = PULSE_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-    if !pulses.contains_key(&event) && pulses.len() >= PULSED_EVENTS {
-        if let Some(oldest) = pulses.iter().min_by_key(|(_, record)| record.last).map(|(&address, _)| address) {
-            pulses.remove(&oldest);
+    if !pulses.records.contains_key(&event) && pulses.records.len() >= PULSED_EVENTS {
+        // O de pulso mais antigo: a primeira entrada da ordem que ainda é o
+        // último pulso do evento dela (as outras ficaram velhas).
+        while let Some((oldest, at)) = pulses.order.pop_front() {
+            if pulses.records.get(&oldest).is_some_and(|record| record.last == at) {
+                pulses.records.remove(&oldest);
+                break;
+            }
         }
     }
-    let record = pulses.entry(event).or_insert(PulseRecord { last: 0, unclaimed: [0; 4] });
+    pulses.order.push_back((event, pulse));
+    // A ordem só guarda entradas velhas de eventos pulsados de novo: com
+    // muitas delas, é refeita a partir do mapa.
+    if pulses.order.len() > 4 * PULSED_EVENTS {
+        let mut current: Vec<(u64, u64)> = pulses.records.iter().map(|(address, record)| (address, record.last)).collect();
+        current.push((event, pulse));
+        current.sort_by_key(|&(_, last)| last);
+        pulses.order = current.into_iter().collect();
+    }
+    if pulses.records.get(&event).is_none() {
+        pulses.records.insert(event, PulseRecord { last: 0, unclaimed: [0; 4] });
+    }
+    let Some(record) = pulses.records.get_mut(&event) else { return };
     record.last = pulse;
     if unclaimed && matches!(header_at(event).type_.get(), object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION) {
         // Sem lugar, o pulso mais antigo cede o dele.
@@ -243,7 +267,7 @@ pub fn pulsed_since(objects: &[u64], wait_type: u32, since: u64) -> Option<u32> 
     }
     let mut pulses = PULSES.lock();
     for (index, object) in objects.iter().enumerate() {
-        let Some(record) = pulses.get_mut(object) else { continue };
+        let Some(record) = pulses.records.get_mut(object) else { continue };
         match header_at(*object).type_.get() {
             object_type::EVENT_NOTIFICATION | object_type::TIMER_NOTIFICATION | object_type::TIMER2_NOTIFICATION if record.last > since => return Some(index as u32),
             object_type::EVENT_SYNCHRONIZATION | object_type::TIMER_SYNCHRONIZATION | object_type::TIMER2_SYNCHRONIZATION => {

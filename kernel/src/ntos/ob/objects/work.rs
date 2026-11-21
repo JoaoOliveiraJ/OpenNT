@@ -183,6 +183,15 @@ impl WaitPacket {
         self.phases.lock().association.clone()
     }
 
+    /// O alvo, a contagem de pulsos do começo da associação e se a porta já
+    /// fechou, sem clonar a associação (a sondagem de cada volta do pump).
+    pub fn association_probe(&self) -> Option<(u64, u64, bool)> {
+        if self.phase() != 1 {
+            return None;
+        }
+        self.phases.lock().association.as_ref().map(|association| (association.target_pointer, association.pulses_since, association.port.closed()))
+    }
+
     pub fn set_association(&self, value: Option<Association>) {
         let body = self.body();
         body.phase.set(value.is_some() as u32);

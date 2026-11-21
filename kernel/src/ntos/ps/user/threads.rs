@@ -463,6 +463,9 @@ impl UserThread {
 }
 
 static THREADS: SpinLock<Vec<Arc<UserThread>>> = SpinLock::new(Vec::new());
+/// O mesmo índice pela KTHREAD ([`find_by_pointer`], consultado a cada
+/// despacho): sem percorrer a lista tomando a trava de cada thread.
+static BY_POINTER: SpinLock<crate::rtl::PtrMap<Arc<UserThread>>> = SpinLock::new(crate::rtl::PtrMap::new());
 /// O despachante está ativo em cada CPU (um [`dispatch_one`] ou um
 /// [`dispatch_on_processor`] em curso, ou a simulação dos autotestes):
 /// nenhum despacho aninhado.
@@ -526,12 +529,27 @@ pub fn push(thread: Arc<UserThread>) {
     if let Some(state) = process_state::get(owner) {
         state.threads.lock().push(thread.clone());
     }
+    let pointer = thread.pointer();
+    if pointer != 0 {
+        BY_POINTER.lock().insert(pointer, thread.clone());
+    }
     THREADS.lock().push(thread);
 }
 
 /// Retira a thread do índice e da lista do processo dono, sem liberar nada.
 pub fn remove(thread: &Arc<UserThread>) {
     THREADS.lock().retain(|candidate| !Arc::ptr_eq(candidate, thread));
+    // A liberação zera o ponteiro antes de tirar a thread do índice: sem
+    // ele, a entrada sai pela identidade.
+    let pointer = thread.pointer();
+    {
+        let mut index = BY_POINTER.lock();
+        if pointer != 0 && index.get(&pointer).is_some_and(|candidate| Arc::ptr_eq(candidate, thread)) {
+            index.remove(&pointer);
+        } else if pointer == 0 {
+            index.retain(|_, candidate| !Arc::ptr_eq(candidate, thread));
+        }
+    }
     let owner = thread.with(|thread| thread.process_pointer);
     if let Some(state) = process_state::get(owner) {
         state.threads.lock().retain(|candidate| !Arc::ptr_eq(candidate, thread));
@@ -564,7 +582,13 @@ pub fn find_by_id(id: u64) -> Option<Arc<UserThread>> {
 }
 
 pub fn find_by_pointer(pointer: u64) -> Option<Arc<UserThread>> {
-    THREADS.lock().iter().find(|thread| pointer != 0 && thread.pointer() == pointer).cloned()
+    if pointer == 0 {
+        return None;
+    }
+    // A entrada de uma thread cuja KTHREAD a liberação já soltou (o ponteiro
+    // zerado, ainda no índice) não vale.
+    let thread = BY_POINTER.lock().get(&pointer).cloned()?;
+    (thread.pointer() == pointer).then_some(thread)
 }
 
 /// O número desta CPU.

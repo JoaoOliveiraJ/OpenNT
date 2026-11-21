@@ -105,16 +105,19 @@ pub fn create(out: u64, access: u32, attributes: u64) -> Result<u32, KernelError
 fn poll(packet: &Arc<WaitPacket>) -> bool {
     let association = {
         let claim = CLAIM.lock();
-        let Some(association) = packet.association() else { return false };
-        if association.port.closed() {
+        // A sondagem sem clonar a associação; só o pacote que vai à fila a
+        // clona.
+        let Some((target_pointer, pulses_since, closed)) = packet.association_probe() else { return false };
+        if closed {
             drop(claim);
             detach(packet, true);
             return false;
         }
-        let target = [association.target_pointer];
-        if dispatcher::try_wait_objects(&target, 1).or_else(|| dispatcher::pulsed_since(&target, 1, association.pulses_since)).is_none() {
+        let target = [target_pointer];
+        if dispatcher::try_wait_objects(&target, 1).or_else(|| dispatcher::pulsed_since(&target, 1, pulses_since)).is_none() {
             return false;
         }
+        let Some(association) = packet.association() else { return false };
         // A associação sai do pacote sob o lock: só quem tomou o sinal o
         // entrega.
         packet.set_association(None);

@@ -56,7 +56,6 @@
 //! contexto de boot (o próprio despachante) consulta o objeto entre voltas
 //! do pump.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::{bugcheck, clock, context_switch, dispatcher, thread_alert, thread_dispatch, timer};
@@ -65,7 +64,7 @@ use crate::ntos::inc::types::{DispatcherHeader, Kthread, KwaitBlock, ListEntry, 
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ps::scheduler;
 use crate::rtl::sync::SpinLockGuard;
-use crate::rtl::SpinLock;
+use crate::rtl::{PtrMap, SpinLock};
 
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_ABANDONED: u32 = 0x80;
@@ -141,10 +140,12 @@ struct ActiveWait {
 static NEXT_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 struct WaitTable {
-    waits: BTreeMap<u64, ActiveWait>,
+    /// As esperas ligadas, pela KTHREAD (consultado a cada sinal, alerta,
+    /// APC e despertar: um `PtrMap`).
+    waits: PtrMap<ActiveWait>,
 }
 
-static DISPATCHER: SpinLock<WaitTable> = SpinLock::new(WaitTable { waits: BTreeMap::new() });
+static DISPATCHER: SpinLock<WaitTable> = SpinLock::new(WaitTable { waits: PtrMap::new() });
 
 fn kthread(thread: u64) -> &'static Kthread {
     // SAFETY: as esperas só registram KTHREADs vivas (a thread não termina

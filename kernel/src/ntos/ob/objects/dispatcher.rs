@@ -19,7 +19,7 @@ use crate::ntos::ob::shared_policy::{self, SharedPolicy};
 use crate::ntos::mm::section::create as create_section;
 use crate::ntos::se::model::SecurityPolicy;
 use crate::ntos::se::token::tokens;
-use crate::rtl::{KernelError, SpinLock};
+use crate::rtl::{KernelError, PtrMap, SpinLock};
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
 use crate::ntos::inc::types::ObjectAttributes;
 use crate::ntos::mm::guest_memory as guest;
@@ -68,7 +68,9 @@ struct Body {
     hooks: DispatcherHooks,
 }
 
-static BODIES: SpinLock<BTreeMap<u64, Body>> = SpinLock::new(BTreeMap::new());
+/// Os corpos pelo endereço do objeto: consultado a cada referência, handle
+/// e tipo (um `PtrMap`, sem a busca de nó em nó de uma árvore).
+static BODIES: SpinLock<PtrMap<Body>> = SpinLock::new(PtrMap::new());
 
 /// Os tipos dos corpos, um registro por OBJECT_TYPE.
 static TYPES: SpinLock<alloc::vec::Vec<Arc<ObjectType>>> = SpinLock::new(alloc::vec::Vec::new());
