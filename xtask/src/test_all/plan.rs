@@ -125,7 +125,7 @@ impl Test {
         );
         let own_qemu = [
             ("--keys", parsed.keys.is_some()),
-            ("--send/--dismiss/--mouse/--start-menu/--context-menu/--double-click/--run/--open/--type", !parsed.inputs.is_empty()),
+            ("--send/--dismiss/--mouse/--start-menu/--context-menu/--double-click/--run/--open/--type/--command", !parsed.inputs.is_empty()),
             ("--hold", parsed.hold_ms > 0),
             ("--kd", !options.kd.is_empty()),
             ("--script", parsed.script.is_some()),

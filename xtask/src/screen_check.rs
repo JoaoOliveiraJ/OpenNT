@@ -1340,12 +1340,15 @@ pub fn context_menu_open(before: &Image, after: &Image, x: usize, y: usize) -> R
 // O `--double-click`, o `--run` e o `--open` do test-boot abrem um programa
 // como uma pessoa (o duplo clique num ícone, a caixa Executar, um atalho de
 // teclado) e conferem a janela dele na tela ([`window_opened`]); o `--type`
-// digita numa janela e confere o texto ([`text_typed`]).
+// digita numa janela e confere o texto ([`text_typed`]); o `--command` digita
+// um comando e o Enter num console e confere a saída ([`command_output`]).
 
 /// O marcador da janela nova na tela.
 pub const WINDOW_OPENED_MARKER: &str = "WINDOW_OPENED_OK";
 /// O marcador do texto digitado que apareceu na janela.
 pub const TEXT_TYPED_MARKER: &str = "TEXT_TYPED_OK";
+/// O marcador da saída do comando digitado no console.
+pub const COMMAND_OUTPUT_MARKER: &str = "COMMAND_OUTPUT_OK";
 /// As linhas de cima de uma janela em que fica a barra de título.
 const TITLE_ROWS: usize = 30;
 
@@ -1465,6 +1468,87 @@ pub fn text_typed(before: &Image, after: &Image, typed: usize) -> Result<String,
         Some(line) => Ok(format!("linha de texto {} com {typed} caracteres; {changed} pixels mudaram acima da barra", line.describe())),
         None => Err(format!("nenhuma das mudancas ({}) e uma linha de texto de {} colunas ou mais sobre um fundo liso", describe.join(", "), 6 * typed)),
     }
+}
+
+/// A linha mais baixa que mudou de `before` para `after` acima da barra de
+/// tarefas (a última linha do texto digitado), se alguma mudou.
+pub fn lowest_change(before: &Image, after: &Image) -> Option<usize> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return None;
+    }
+    let width = before.width;
+    let row = |y: usize| &before.rgb[y * width * 3..(y + 1) * width * 3] != &after.rgb[y * width * 3..(y + 1) * width * 3];
+    (0..above_taskbar(before)).rev().find(|&y| row(y))
+}
+
+/// A saída de um comando de `command` caracteres em `after`, a tela depois do
+/// Enter, sobre `typed`, a tela com o comando digitado, cuja linha termina na
+/// linha `below` da tela ([`lowest_change`]). Acima da barra de tarefas a
+/// tela muda em até 1/8 (o console, não uma janela nova); na caixa que junta
+/// as mudanças abaixo da linha do comando (o cursor que pisca nela não
+/// conta), as linhas de texto (as faixas de linhas com algum pixel a 0x60 ou
+/// mais da luminância mediana da caixa, separadas por pelo menos duas linhas
+/// sem nenhum, de 6 a 48 linhas de altura) são duas ou mais, e a mais larga
+/// tem 6 colunas por caractere para 12 caracteres ou para o comando e mais
+/// um, o que for maior: o texto que o comando escreveu e o prompt seguinte.
+/// O Enter sem saída (só o prompt de novo) e o comando que abriu outra
+/// janela não passam.
+pub fn command_output(typed: &Image, after: &Image, command: usize, below: usize) -> Result<String, String> {
+    if (typed.width, typed.height) != (after.width, after.height) || typed.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", typed.width, typed.height, after.width, after.height));
+    }
+    let (width, area) = (typed.width, above_taskbar(typed));
+    let at = |x: usize, y: usize| (y * width + x) * 3;
+    let differs = |x: usize, y: usize| typed.rgb[at(x, y)..at(x, y) + 3] != after.rgb[at(x, y)..at(x, y) + 3];
+    let changed = (0..area).map(|y| (0..width).filter(|&x| differs(x, y)).count()).sum::<usize>();
+    if changed == 0 {
+        return Err("a tela acima da barra de tarefas nao mudou".into());
+    }
+    if changed * 8 > width * area {
+        return Err(format!("{}% da tela mudou (maximo 1/8): nao e so a saida do comando", changed * 100 / (width * area)));
+    }
+    let rows: Vec<usize> = (below + 1..area).filter(|&y| (0..width).any(|x| differs(x, y))).collect();
+    let columns: Vec<usize> = (0..width).filter(|&x| rows.iter().any(|&y| differs(x, y))).collect();
+    let (Some(&left), Some(&right), Some(&top), Some(&bottom)) = (columns.first(), columns.last(), rows.first(), rows.last()) else {
+        return Err(format!("nada mudou abaixo da linha do comando (linha {below})"));
+    };
+    let median = median_luma(after, left..right + 1, top..bottom + 1);
+    // (altura, largura da tinta) de cada linha de texto.
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut ink_left, mut ink_right, mut blank) = (None::<usize>, usize::MAX, 0usize, 2usize);
+    let mut close = |start: &mut Option<usize>, end: usize, ink_left: usize, ink_right: usize| {
+        if let Some(first) = start.take() {
+            lines.push((end + 1 - first, ink_right + 1 - ink_left));
+        }
+    };
+    let mut last_ink = top;
+    for y in top..=bottom {
+        let ink: Vec<usize> = (left..=right).filter(|&x| luma(&after.rgb[at(x, y)..at(x, y) + 3]).abs_diff(median) >= TEXT_CONTRAST).collect();
+        if let (Some(&first), Some(&last)) = (ink.first(), ink.last()) {
+            if start.is_none() {
+                start = Some(y);
+                ink_left = usize::MAX;
+                ink_right = 0;
+            }
+            ink_left = ink_left.min(first);
+            ink_right = ink_right.max(last);
+            last_ink = y;
+            blank = 0;
+        } else {
+            blank += 1;
+            if blank >= 2 {
+                close(&mut start, last_ink, ink_left, ink_right);
+            }
+        }
+    }
+    close(&mut start, last_ink, ink_left, ink_right);
+    let text: Vec<(usize, usize)> = lines.into_iter().filter(|&(height, _)| (6..=48).contains(&height)).collect();
+    let widest = text.iter().map(|&(_, ink)| ink).max().unwrap_or(0);
+    let needed = 6 * 12usize.max(command + 1);
+    if text.len() < 2 || widest < needed {
+        return Err(format!("na caixa das mudancas {}x{} em ({left},{top}) ha {} linha(s) de texto, a mais larga com {widest} colunas (minimo 2 linhas e {needed} colunas)", right + 1 - left, bottom + 1 - top, text.len()));
+    }
+    Ok(format!("{} linhas de texto em {}x{} em ({left},{top}), a mais larga com {widest} colunas; {changed} pixels mudaram acima da barra", text.len(), right + 1 - left, bottom + 1 - top))
 }
 
 /// Telas sintéticas para os testes da vigia.
@@ -2191,5 +2275,31 @@ mod tests {
         let mut echoed = console.clone();
         paint(&mut echoed, 126..216, 116..132, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0xCC, 0xCC, 0xCC] } else { [0x0C, 0x0C, 0x0C] });
         assert!(text_typed(&console, &echoed, 10).is_ok(), "{:?}", text_typed(&console, &echoed, 10));
+    }
+
+    /// A saída do comando no console: duas linhas de texto claro novas sobre
+    /// o preto, uma delas longa, passam; só o prompt de novo, a tela parada e
+    /// uma janela nova não.
+    #[test]
+    fn command_output_sees_lines_below_the_command() {
+        let desk = desktop(40, 218, true);
+        let console = window(&desk, 120, 80, 640, 420, [0x0C, 0x0C, 0x0C]);
+        let glyphs = |x: usize, y: usize| if (x * 7 + y * 3) % 5 < 2 { [0xCC, 0xCC, 0xCC] } else { [0x0C, 0x0C, 0x0C] };
+        let mut typed = console.clone();
+        paint(&mut typed, 126..246, 116..132, glyphs);
+        let mut after = typed.clone();
+        paint(&mut after, 126..390, 148..164, glyphs);
+        paint(&mut after, 126..228, 180..196, glyphs);
+        assert_eq!(lowest_change(&console, &typed), Some(131));
+        let output = command_output(&typed, &after, 3, 131).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(output.starts_with("2 linhas de texto"), "{output}");
+        let mut prompt_only = typed.clone();
+        paint(&mut prompt_only, 126..228, 148..164, glyphs);
+        assert!(command_output(&typed, &prompt_only, 3, 131).unwrap_err().contains("1 linha(s)"));
+        let mut caret = typed.clone();
+        paint(&mut caret, 246..254, 128..132, |_, _| [0xCC, 0xCC, 0xCC]);
+        assert!(command_output(&typed, &caret, 3, 131).unwrap_err().contains("nada mudou abaixo"));
+        assert!(command_output(&typed, &typed, 3, 131).unwrap_err().contains("nao mudou"));
+        assert!(command_output(&typed, &window(&desk, 100, 60, 800, 500, [0xFF, 0xFF, 0xFF]), 3, 131).unwrap_err().contains("nao e so a saida"));
     }
 }

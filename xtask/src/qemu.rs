@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CONTEXT_MENU_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, COMMAND_OUTPUT_MARKER, CONTEXT_MENU_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -640,6 +640,10 @@ pub enum InputAction {
     /// Digita o texto na janela que tem o foco e confere que ele apareceu
     /// ([`screen_check::text_typed`], o `TEXT_TYPED_OK`).
     Type(String),
+    /// Digita o comando no console que tem o foco, confere a linha dele,
+    /// aperta Enter e confere a saída ([`screen_check::command_output`], o
+    /// `COMMAND_OUTPUT_OK`).
+    Command(String),
 }
 
 /// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
@@ -730,6 +734,16 @@ impl InputSend {
             return Err(format!("--type={text}: o texto e de letras, algarismos e espacos"));
         }
         Ok(InputSend { after, delay, action: InputAction::Type(typed.to_string()) })
+    }
+
+    /// `--command=MARCADOR[+MS]:COMANDO`: letras, algarismos e espaço, como
+    /// o `--type`; o Enter vem depois.
+    pub fn command(text: &str) -> Result<InputSend, String> {
+        let (after, delay, command) = Self::when("--command", text)?;
+        if !command.chars().all(|character| character.is_ascii_alphanumeric() || character == ' ') {
+            return Err(format!("--command={text}: o comando e de letras, algarismos e espacos"));
+        }
+        Ok(InputSend { after, delay, action: InputAction::Command(command.to_string()) })
     }
 
     /// `--mouse=MARCADOR[+MS]:DX,DY`.
@@ -1833,6 +1847,23 @@ fn type_text(monitor: &mut TcpStream, ppm: &Path, text: &str, sent: &mut Option<
     screen_check::text_typed(&before, &after, typed)
 }
 
+/// O `--command`: o comando como no `--type` ([`type_text`]); com a linha
+/// dele na tela, o Enter e a tela parada com a saída
+/// ([`screen_check::command_output`]).
+fn run_console_command(monitor: &mut TcpStream, ppm: &Path, command: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, command)?;
+    let length = command.chars().count();
+    let typed = still_screen(monitor, ppm, TYPE_WAIT, |image| screen_check::text_typed(&before, image, length)).map_err(|missing| format!("o comando {command:?} nao apareceu: {missing}"))?;
+    let line = screen_check::text_typed(&before, &typed, length)?;
+    let below = screen_check::lowest_change(&before, &typed).unwrap_or(0);
+    type_keys(monitor, "{ret}")?;
+    let after = still_screen(monitor, ppm, TYPE_WAIT, |image| screen_check::command_output(&typed, image, length, below)).map_err(|missing| format!("o comando {command:?} nao escreveu a saida: {missing}"))?;
+    let output = screen_check::command_output(&typed, &after, length, below)?;
+    Ok(format!("comando: {line}; saida: {output}"))
+}
+
 /// O `sendkey` da parada manual: Ctrl direito segurado e Scroll Lock duas
 /// vezes. O i8042prt.sys real (CrashOnCtrlScroll=1 na semente do Registro)
 /// chama o KeBugCheckEx(0xE2) na ISR do teclado; com CrashDumpEnabled o
@@ -2383,6 +2414,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] texto digitado pelo monitor (aos {at:.1} s), sem aparecer: {missing}"));
                             return Err(format!("o texto {text:?} nao apareceu na janela: {missing}"));
+                        }
+                    }
+                }
+                InputAction::Command(command) => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| run_console_command(monitor, &ppm, command, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] comando {command} e Enter pelo monitor (aos {at:.1} s): {description}\n{COMMAND_OUTPUT_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] comando {command} e Enter pelo monitor (aos {at:.1} s), sem a saida: {missing}"));
+                            return Err(format!("o comando {command:?} nao escreveu a saida no console: {missing}"));
                         }
                     }
                 }

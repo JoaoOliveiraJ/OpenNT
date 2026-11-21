@@ -7780,7 +7780,14 @@ em até 1/20, e algum grupo de mudanças tem de 8 a 48 linhas de altura, 6
 colunas ou mais por caractere, metade ou mais no fundo, a até 0x20 da
 luminância mediana do grupo, e 1/100 ou mais de letras, a 0x60 ou mais
 dela: o texto escuro do Bloco de Notas e o claro do console), e o log ganha
-o `TEXT_TYPED_OK`. As janelas dos programas
+o `TEXT_TYPED_OK`. O `--command=...:COMANDO` digita o comando (letras,
+algarismos e espaços) no console que tem o foco, espera a linha dele como o
+`--type`, aperta Enter e espera a tela parada com a saída
+(`screen_check::command_output`: acima da barra a tela muda em até 1/8, e
+abaixo da linha do comando, onde o cursor que pisca não conta, há duas
+linhas de texto ou mais, a mais larga com 6 colunas por caractere para 12
+caracteres ou para o comando e mais um: o que o comando escreveu e o
+prompt seguinte), e o log ganha o `COMMAND_OUTPUT_OK`. As janelas dos programas
 também saem do kernel, como observação (`init/initial_process.rs`,
 `program_window_created`): o primeiro NtUserCreateWindowEx de cada programa
 da sessão 1 com a classe da janela principal dele põe na serial o

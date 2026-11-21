@@ -221,7 +221,10 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --open=MARCADOR[+MS]:TECLAS (repetivel: digita as teclas, um atalho que abre um
                    programa, e confere a janela nova na tela: WINDOW_OPENED_OK)
                    --type=MARCADOR[+MS]:TEXTO (repetivel: digita o texto, letras, algarismos e
-                   espacos, e confere que ele apareceu numa linha da janela: TEXT_TYPED_OK)";
+                   espacos, e confere que ele apareceu numa linha da janela: TEXT_TYPED_OK)
+                   --command=MARCADOR[+MS]:COMANDO (repetivel: digita o comando, letras, algarismos
+                   e espacos, no console com o foco, aperta Enter e confere a saida em duas linhas
+                   de texto ou mais: COMMAND_OUTPUT_OK)";
 
 struct Arguments {
     command: String,
@@ -439,6 +442,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--run" => parsed.inputs.push(qemu::InputSend::run(&required()?)?),
             "--open" => parsed.inputs.push(qemu::InputSend::open(&required()?)?),
             "--type" => parsed.inputs.push(qemu::InputSend::type_text(&required()?)?),
+            "--command" => parsed.inputs.push(qemu::InputSend::command(&required()?)?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
@@ -519,7 +523,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss, --mouse, --start-menu, --context-menu, --double-click, --run, --open e --type sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse, --start-menu, --context-menu, --double-click, --run, --open, --type e --command sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -842,7 +846,7 @@ mod tests {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         assert!(parse_words(&["run", "--context-menu=X:1,1"]).is_err());
-        let parsed = parse_words(&["test-boot", "--double-click=DESKTOP_OK+5000:38,140", "--run=DESKTOP_OK:notepad", "--open=X:{ctrl-shift-esc}", "--type=WINDOW_OPENED_OK+2000:ola 123"]).unwrap();
+        let parsed = parse_words(&["test-boot", "--double-click=DESKTOP_OK+5000:38,140", "--run=DESKTOP_OK:notepad", "--open=X:{ctrl-shift-esc}", "--type=WINDOW_OPENED_OK+2000:ola 123", "--command=CONSOLE_WINDOW_CREATED+2000:ver"]).unwrap();
         assert_eq!(
             parsed.inputs,
             vec![
@@ -850,9 +854,10 @@ mod tests {
                 InputSend { after: "DESKTOP_OK".into(), delay: Duration::ZERO, action: InputAction::Run("notepad".into()) },
                 InputSend { after: "X".into(), delay: Duration::ZERO, action: InputAction::Open("{ctrl-shift-esc}".into()) },
                 InputSend { after: "WINDOW_OPENED_OK".into(), delay: Duration::from_millis(2000), action: InputAction::Type("ola 123".into()) },
+                InputSend { after: "CONSOLE_WINDOW_CREATED".into(), delay: Duration::from_millis(2000), action: InputAction::Command("ver".into()) },
             ]
         );
-        for bad in ["--double-click=X:1024,1", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}"] {
+        for bad in ["--double-click=X:1024,1", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}", "--command=X:", "--command=X:dir /w"] {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         // Os nomes do QEMU passam, também nos combos e no --keys.
