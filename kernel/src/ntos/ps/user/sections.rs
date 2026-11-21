@@ -1216,7 +1216,9 @@ pub fn map(section: &Arc<Section>, options: &MapRequest) -> Result<Mapped, Kerne
     // a vista vai: a dele, ou a do System no espaço de sistema.
     let space = super::memory::Space::of(options.owner_process.unwrap_or_else(crate::ntos::ps::process::get_current_process));
     let root = if options.system_space { SYSTEM_ROOT } else { space.root() };
-    // Primeira faixa livre (de baixo para cima, ou de cima no MEM_TOP_DOWN).
+    // Primeira faixa livre (de baixo para cima, ou de cima no MEM_TOP_DOWN),
+    // da escolha até a vista entrar no VAD (a AddressCreationLock).
+    let _creation = super::memory::address_creation(if options.system_space { super::memory::Space::system() } else { space });
     let find = section_address::FindOptions { system_space: options.system_space, size, alignment, base, top_down: options.top_down, upper: options.upper, minimum: options.minimum, root };
     let base = match section_address::find(&find, &occupied_regions(options.system_space, space)) {
         Ok(base) => base,

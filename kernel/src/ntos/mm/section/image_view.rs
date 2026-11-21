@@ -69,6 +69,9 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let space = user_memory::Space::of(process);
     let root = space.root();
     let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, root, ..FindOptions::default() };
+    // Da escolha da faixa até a vista entrar no VAD (a control area pode ser
+    // montada no meio, lendo o arquivo): a AddressCreationLock.
+    let _creation = user_memory::address_creation(space);
     let occupied = user_memory::occupied(space);
     // Sem base pedida: a ImageBase do cabeçalho quando está livre, senão a
     // primeira faixa livre (STATUS_IMAGE_NOT_AT_BASE).

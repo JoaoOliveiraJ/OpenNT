@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{FileObject, Guid, Kpcr, ObjectAttributes, WorkQueueItem};
+use crate::ntos::inc::types::{FileObject, Guid, ObjectAttributes, WorkQueueItem};
 use crate::ntos::ke::pcr;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::shared_user_data;
@@ -109,8 +109,7 @@ pub fn dismount_complete(status: u32) {
 /// FsRtlUpdateDiskCounters(BytesRead, BytesWritten): KPRCB.FsCounters do
 /// processador corrente.
 pub fn update_disk_counters(bytes_read: u64, bytes_written: u64) {
-    // SAFETY: o KPCR do processador corrente (KPRCB embutido).
-    let counters = &unsafe { Kpcr::at(pcr::get_pcr_address()) }.prcb.fs_counters;
+    let counters = &pcr::current().prcb.fs_counters;
     if bytes_read != 0 {
         counters.fs_bytes_read.atomic().fetch_add(bytes_read, Ordering::SeqCst);
     }

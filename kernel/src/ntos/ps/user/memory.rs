@@ -76,9 +76,40 @@ use crate::ntos::mm::section::handles::{self as section_handles, Kind};
 use crate::ntos::mm::section::{address as section_address, views as section_views};
 use crate::ntos::ke::context_switch;
 use crate::ntos::ps::process;
-use crate::rtl::{KernelError, SpinLock};
+use crate::rtl::{KernelError, SharedLock, SharedLockGuard, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::types::{MemAddressRequirements, MemExtendedParameter, NtStruct};
+
+/// A AddressCreationLock de um espaço sem estado de processo (o System antes
+/// do registro dele).
+static SYSTEM_ADDRESS_CREATION: SharedLock = SharedLock::new();
+
+/// A posse da EPROCESS.AddressCreationLock de um espaço
+/// (`ProcessState::address_creation`), como o 19041 a toma do
+/// MiFindEmptyAddressRange até o VAD entrar na árvore (o MiReserveVad, o
+/// MiMapViewOfSection): a escolha de uma faixa livre (`occupied` e
+/// `section_address::find`) e o registro da região no VAD são um passo só.
+/// Com as threads de um processo em CPUs diferentes, duas alocações (a pilha
+/// de uma thread nova e a vista de uma DLL) achariam a mesma faixa livre. A
+/// posse é solta antes do estado que ela retém.
+pub struct AddressCreation {
+    _guard: SharedLockGuard<'static>,
+    _state: Option<Arc<ProcessState>>,
+}
+
+/// Toma a AddressCreationLock do espaço ([`AddressCreation`]).
+pub fn address_creation(space: Space) -> AddressCreation {
+    match space.state() {
+        Some(state) => {
+            // SAFETY: a posse fica na mesma estrutura que o Arc do estado,
+            // declarada antes dele: é solta antes de o Arc poder soltar o
+            // estado (e a trava dentro dele).
+            let guard = unsafe { core::mem::transmute::<SharedLockGuard<'_>, SharedLockGuard<'static>>(state.address_creation.acquire_exclusive()) };
+            AddressCreation { _guard: guard, _state: Some(state) }
+        }
+        None => AddressCreation { _guard: SYSTEM_ADDRESS_CREATION.acquire_exclusive(), _state: None },
+    }
+}
 
 const PAGE: u64 = 0x1000;
 const MAX_SAFE: u64 = (1 << 53) - 1;
@@ -627,6 +658,7 @@ fn allocate_region(space: Space, base_pointer: u64, size_pointer: u64, allocatio
     if space.state().is_none() {
         return Ok(STATUS_PROCESS_IS_TERMINATING);
     }
+    let _creation = address_creation(space);
     if !write_watch::valid_allocation_type(allocation_type) {
         return Ok(STATUS_INVALID_PARAMETER);
     }
@@ -798,6 +830,7 @@ fn register_user_region(space: Space, size: u64, alignment: u64, top_down: bool)
     if space.state().is_none() {
         return Err(KernelError::with_status("regiao de usuario num processo sem VAD", STATUS_PROCESS_IS_TERMINATING));
     }
+    let _creation = address_creation(space);
     let base = find_free(space, size, alignment, top_down).map_err(|status| KernelError::with_status("sem VA livre na metade de usuario", status))?;
     let region = PrivateRegion::new(base, size, 4, MEM_COMMIT | MEM_RESERVE, false);
     let charged = process_commit::charge(space.process(), size / PAGE);
@@ -916,11 +949,13 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
     if rounded == 0 {
         return Err(KernelError::new("Regiao compartilhada vazia"));
     }
+    let creation = address_creation(Space::system());
     let va = find_free(Space::system(), rounded, PAGE, true).map_err(|status| KernelError::with_status("sem VA livre para a regiao compartilhada", status))?;
     // A faixa entra na lista antes das páginas: nenhuma escolha de VA no
     // meio do mapeamento a reutiliza.
     let entry: Region = Arc::new(SharedRegion { base: va, size: rounded });
     state::with(|state| state.shared_user_regions.push(entry));
+    drop(creation);
     let mut offset = 0;
     while offset < size {
         let frame = pfn::alloc_page();

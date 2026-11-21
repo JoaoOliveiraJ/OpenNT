@@ -66,6 +66,9 @@ pub fn insert_queue_dpc(dpc: u64, first: u64, second: u64) -> bool {
     object.system_argument1.set(first);
     object.system_argument2.set(second);
     STATE.lock().queue.push_back(dpc);
+    // As DPCs rodam no BSP: a enfileirada num AP acorda o BSP ocioso (o
+    // KiInsertQueueDpc pede a interrupção de DISPATCH ao processador alvo).
+    super::thread_dispatch::wake_processor(0);
     true
 }
 

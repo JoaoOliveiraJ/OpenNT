@@ -24,7 +24,7 @@ fn flush() -> Result<(), KernelError> {
 }
 
 fn map(frame: u64, flags: u64, nx: bool) -> bool {
-    paging::map_page(memory_map::direct_map(frame), frame, flags, MapOptions { nx, skip_invalidate: false, deferred_tables: None })
+    paging::map_page(memory_map::direct_map(frame), frame, flags, MapOptions { nx, ..MapOptions::default() })
 }
 
 /// PAGE_NOCACHE (PCD|PWT) ou PAGE_WRITECOMBINE (PAT) no alias do mapa direto.

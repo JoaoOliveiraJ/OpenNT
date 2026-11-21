@@ -89,8 +89,10 @@ pub fn alloc(bytes: u64) -> u64 {
 pub fn free(base: u64) -> Result<(), KernelError> {
     let (size, frames) = POOL.lock().allocations.remove(&base).ok_or_else(|| KernelError::new("invalid kernel data free"))?;
     for offset in (0..size).step_by(4096) {
-        paging::unmap_page(base + offset, MapOptions::default());
+        paging::unmap_page(base + offset, MapOptions { batch_remote: true, ..MapOptions::default() });
     }
+    // As outras CPUs descartam as traduções antes de os frames voltarem.
+    paging::invalidate_kernel_batch();
     for frame in frames {
         pfn::free_page(frame);
     }

@@ -4,7 +4,7 @@
 //! flags sob KTHREAD.ThreadLock.
 
 use super::{pcr, thread_lock};
-use crate::ntos::inc::types::{Kpcr, Kthread, NtStruct};
+use crate::ntos::inc::types::{Kthread, NtStruct};
 use crate::rtl::KernelError;
 
 /// KAPC_STATE.UserApcPendingAll bit 1: UserApcPending.
@@ -19,8 +19,7 @@ pub fn test(processor_mode: u64) -> Result<u8, KernelError> {
         return Err(KernelError::new("KeTestAlertThread requires an initialized KPCR"));
     }
     // A identidade vem de PRCB.CurrentThread, a mesma que o código nativo lê por GS.
-    // SAFETY: a KPCR está mapeada desde `pcr::init`.
-    let thread = unsafe { Kpcr::at(region) }.prcb.current_thread.get();
+    let thread = pcr::current().prcb.current_thread.get();
     // SAFETY: a thread corrente.
     let current = unsafe { Kthread::at(thread) };
     let mode = processor_mode as u8 as i8 as i64;

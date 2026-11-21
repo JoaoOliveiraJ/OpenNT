@@ -9,7 +9,7 @@
 
 use super::process;
 use crate::ntos::inc::field::{Field, NtStruct};
-use crate::ntos::inc::types::{Eprocess, Ethread, Ewow64process, Kpcr};
+use crate::ntos::inc::types::{Eprocess, Ethread, Ewow64process};
 use crate::ntos::ke::pcr;
 use crate::rtl::KernelError;
 
@@ -124,8 +124,7 @@ pub fn current_wow64_process() -> Result<u64, KernelError> {
     if region == 0 {
         return Err(KernelError::new("current WOW64 query requires an initialized KPCR"));
     }
-    // SAFETY: a KPCR inicializada do processador corrente.
-    let thread = unsafe { Kpcr::at(region) }.prcb.current_thread.get();
+    let thread = pcr::current().prcb.current_thread.get();
     // SAFETY: Prcb.CurrentThread é o ETHREAD em execução.
     Ok(wow64_process(unsafe { Ethread::at(thread) }.tcb.apc_state.process.get()))
 }
@@ -145,8 +144,7 @@ pub fn wrap_apc_wow64_thread(apc_routine: u64) -> Result<u32, KernelError> {
     if region == 0 {
         return Err(KernelError::new("PsWrapApcWow64Thread requires an initialized KPCR"));
     }
-    // SAFETY: a KPCR inicializada do processador corrente.
-    let thread = unsafe { Kpcr::at(region) }.prcb.current_thread.get();
+    let thread = pcr::current().prcb.current_thread.get();
     // SAFETY: Prcb.CurrentThread é o ETHREAD em execução.
     let process = unsafe { Ethread::at(thread) }.tcb.apc_state.process.get();
     let wow64 = eprocess(process).wo_w64_process.get();

@@ -420,9 +420,11 @@ deixa a CPU leva o CR8 em KTHREAD.WaitIrql e o recoloca ao voltar
 (`context_switch`); cada CPU parte com o seu em 0 (o INIT o zera), e o
 depurador do kernel lê o de cada processador parado. A execução em curso do `ke/thread_dispatch` (o contexto ativo, a
 pilha de execuções aninhadas e o início da contagem de ciclos) é de cada CPU;
-as filas prontas, a NextThread e o lock delas são os da KPRCB do processador
-que despacha as threads (o de boot, no M0), de onde quer que venha a
-prontidão. O anel 3 só entra numa CPU armada (assert em
+as filas prontas e o lock delas são uma fila só, a da KPRCB do BSP, para
+toda CPU que despacha (como a KSHARED_READY_QUEUE que o 19041 divide entre
+até quatro processadores), e cada CPU reserva a escolhida na NextThread da
+própria KPRCB (veja **Threads de usuário em várias CPUs**, abaixo). O anel 3
+só entra numa CPU armada (assert em
 `exec_user_mode`/`exec_user_context`): como o KiInitializeProcessor do 19041
 dá a cada processador a GDT, a TSS, a IDT, as pilhas e os MSRs de syscall,
 `usermode::processor_user_mode_init` monta a GDT da CPU (a de boot com os
@@ -444,10 +446,11 @@ slot pelo LAPIC, sem GS), se arma, liga o timer local no vetor 0x41 (o
 0x40 continua sendo o relógio global do BSP; o stub conta os tiques do AP
 na KPCR dele e trata o 0x41 como o 0x40 no fim de um intervalo de usuário)
 e fica no laço ocioso (`smp::processor_loop`, o KiIdleLoop do 19041): atende
-os trabalhos da mailbox e, sem trabalho, dorme no `sti; hlt`; o
-`start_job` manda, depois da NMI, o IPI de reescalonamento (vetor 0xE1, o
-do HalpInterruptSendIpi), que fica pendente no IRR até o HLT. Ainda não há
-thread de usuário despachada num AP. As linhas da serial têm uma trava
+os trabalhos da mailbox, dá intervalos às threads de usuário prontas (com o
+despacho de usuário ligado, `smp::enable_user_dispatch`) e, sem trabalho nem
+thread pronta, dorme no `sti; hlt`; o `start_job` manda, depois da NMI, o
+IPI de reescalonamento (vetor 0xE1, o do HalpInterruptSendIpi), que fica
+pendente no IRR até o HLT. As linhas da serial têm uma trava
 própria com espera limitada (`rtl::print`), para duas CPUs não misturarem
 linhas. O autoteste `ntos/test/multiprocess/per_cpu.rs` confere os blocos
 distintos de cada CPU e uma syscall de teste que devolve gs:[10h] igual ao
@@ -482,6 +485,67 @@ Teb sintética própria: cada uma vê em gs:[188h] a própria thread, dela o
 próprio processo e TID, e em gs:[30h] a Teb dela, e o PsGetCurrentThread
 do BSP no meio da janela devolve a dele; a volta a nenhuma thread ou a uma
 de sistema deixa a Teb em gs:[30h].
+
+**Threads de usuário em várias CPUs.** Com a opção de boot `--user-smp`
+(USERSMP), cada AP armado também despacha threads de usuário: o laço ocioso
+dele escolhe a pronta de usuário mais prioritária que pode rodar
+(`thread_dispatch::peek_for`, o KiSelectNextThread; as threads de sistema,
+KTHREAD.MiscFlags.SystemThread, ficam no BSP) e lhe dá um intervalo
+(`threads::dispatch_on_processor`). Os pumps, as sondagens das esperas, as
+DPCs, as IRQs, os timers, as threads de kernel, os fins de processo e o
+recolhimento das threads continuam no BSP; o fim de processo que um
+intervalo de AP pede e as threads mortas vão a ele por uma fila
+(`EXIT_REQUESTS`), e o BSP ocioso é acordado. A posse de uma thread segue
+19041: ela é de no máximo uma CPU, que a executa (Running) ou a reservou
+(Standby), pelo KTHREAD.NextProcessor, e só essa CPU mexe no estado de
+execução dela (o CONTEXT, a pilha de kernel, a espera instalada, as APCs
+de kernel). Quem trata uma thread fora da CPU no lugar dela (a sondagem da
+espera, as APCs de kernel drenadas no contexto dela, o término direto) a
+toma emprestada (`thread_dispatch::try_borrow`): emprestada, nenhuma outra
+CPU a escolhe, e a prontidão que chega a deixa DeferredReady (o
+KiEnterDeferredReadyState) até a devolução. A thread deixa de ser Running só
+no fim do intervalo, com o estado novo decidido sob o PrcbLock
+(`end_execution_with`, a ideia do KiCommitThreadWait): uma retomada, uma
+conclusão ou um término de outra CPU antes da decisão é visto nela, e um
+depois encontra a thread fora da CPU (a suspensão e a retomada também
+decidem sob o PrcbLock). O término, a suspensão e o fim do processo
+pedidos para uma thread que outra CPU executa valem no fim do intervalo
+dela: a espera instalada conclui pela dona (`deferred_termination`), a
+thread sem estado do win32k termina no próprio contexto (o
+KeRequestTerminationThread), e o IPI de reescalonamento à dona encerra o
+intervalo no anel 3 (o stub trata o 0xE1 como o timer) ou a saída do
+serviço vê o pedido. A prontidão acorda uma CPU que pode rodar a thread (o
+KiDeferredReadySingleThread com o KiChooseTargetProcessor): uma ociosa (o
+bit dela entra nas ociosas antes da última conferência com as
+interrupções desligadas, o KiSetProcessorIdle), senão o AP que roda a
+thread de usuário de menor prioridade abaixo dela; a APC enfileirada para
+uma thread em outra CPU manda o IPI à dona (o KiSignalThreadForApc), que
+entrega as APCs de kernel antes do intervalo seguinte. Uma PTE presente que
+muda numa VA de usuário invalida as outras CPUs com a raiz carregada
+(`smp::flush_root`, o KeFlushTb do espaço de endereçamento: o registro da
+raiz de cada CPU é publicado antes da carga do CR3), e uma da metade de
+sistema invalida todas (`smp::flush_kernel_page`; as desmontagens de várias
+páginas invalidam uma vez no fim do lote, `MapOptions::batch_remote`); o
+BSP atende a NMI de shootdown pela confirmação dele na mailbox, e dois
+shootdowns ao mesmo tempo esperam a vez. A escolha de uma faixa livre de VA
+de usuário e o registro dela no VAD são um passo só, sob a
+AddressCreationLock do processo (`memory::address_creation`). Um pulso (ou
+o sinal seguido do reset) que outra CPU dá entre a instalação de uma espera
+adiada e a ligação dos blocos dela a satisfaz na ligação, como satisfaria a
+do 19041, ligada dentro do serviço. Uma espera que gira num AP (o
+`wait_until` de quem retém uma trava) entrega as conclusões e as APCs de
+kernel da própria thread; o BSP que disputa um SharedLock atende as IRQs e
+as DPCs e roda as threads de kernel quando não pode dar intervalo de
+usuário. A linha `[perf] t=N ms aps:` soma os intervalos e o HLT dos APs, os
+empréstimos recusados, os IPIs de reescalonamento e os shootdowns. O
+autoteste `ntos/test/multiprocess/user_smp.rs` (com dois processadores ou
+mais) liga o despacho de usuário nos APs e, com o BSP só girando, confere
+que o serviço é atendido num AP, que cada sinal do BSP conclui exatamente
+uma espera adiada de uma thread num AP sem o anel 3 ver STATUS_PENDING,
+que a thread que se suspende a cada serviço é retomada pelo BSP 500 vezes
+sem perder nenhuma, que o fim do processo pedido pelo BSP encerra as
+threads que giram no anel 3 dos APs e que a página liberada pelo BSP falta
+na leitura seguinte da thread do AP.
 
 **Identidade de cada CPU.** Cada processador monta a própria KPRCB com o
 próprio CPUID, como o ntoskrnl 19041 no boot de cada CPU
@@ -994,7 +1058,7 @@ consumidora perdida.
 syscall deixa a CPU, como no KiSwapContext do NT, em vez de girar o
 `pump_kernel` com o despachante parado. A decisão fica em
 `ke/context_switch.rs`: `can_block` exige a thread de usuário da syscall
-despachada nesta CPU (o BSP, no M0), rodando na própria pilha de kernel e
+despachada nesta CPU (qualquer uma que despacha), rodando na própria pilha de kernel e
 sendo a execução em curso do `thread_dispatch` (nada aninhado: um passo do
 escalonador, uma APC drenada em nome de outra thread), IRQL abaixo de
 DISPATCH_LEVEL e nenhum SpinLock nem SharedLock retido — cada CPU conta as

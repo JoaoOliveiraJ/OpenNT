@@ -7,7 +7,7 @@
 use super::{debugger_data, dump_memory, irql, pcr, smp};
 use crate::ntos::mm::loaded_images;
 use crate::ntos::ps::process;
-use crate::ntos::inc::types::{Context, Eprocess, Ethread, Kpcr, Kprcb, Kprocess, KsystemTime, Kthread, KuserSharedData, NtStruct};
+use crate::ntos::inc::types::{Context, Eprocess, Ethread, Kprcb, Kprocess, KsystemTime, Kthread, KuserSharedData, NtStruct};
 use crate::rtl::KernelError;
 
 pub const DUMP_BYTE_LENGTH: usize = 0x40000;
@@ -80,8 +80,7 @@ pub fn capture(context: u64, thread: u64, bugcheck_code: u32, first: u64, second
     // SAFETY: a thread pedida (ou a corrente) e o PCONTEXT do chamador.
     let (kthread, context_record) = unsafe { (Kthread::at(thread), Context::at(context)) };
     let process_address = kthread.apc_state.process.get();
-    // SAFETY: a KPCR está mapeada desde `pcr::init`.
-    let processor = unsafe { Kpcr::at(pcr::get_pcr_address()) }.current_prcb.get();
+    let processor = pcr::current().current_prcb.get();
     // A saída é limpa antes de ler o CONTEXT (que pode estar no próprio buffer).
     let mut dump = Dump(alloc::vec![0u8; DUMP_BYTE_LENGTH]);
     for offset in (0..0x2000).step_by(4) {

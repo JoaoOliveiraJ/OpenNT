@@ -389,7 +389,6 @@ pub fn try_shared(pointer: u64, flags: u32) -> Result<bool, KernelError> {
 // O KeAbPreAcquire/KeAbPostRelease (AutoBoost) não existe no OpenNT.
 
 use crate::ntos::inc::types::extra_fs_fat::{ExPushLockCacheAware, ExPushLockCacheAwarePadded};
-use crate::ntos::inc::types::Kpcr;
 
 pub const CACHE_AWARE_SLOT_COUNT: usize = 32;
 const CACHE_AWARE_TAG_TABLE: u32 = 0x7063_6C50; // 'Plcp'
@@ -449,8 +448,7 @@ pub fn release_cache_aware_exclusive(table: &ExPushLockCacheAware) -> Result<(),
 /// ExAcquireCacheAwarePushLockSharedEx: o slot da CPU (Prcb.Number & 31).
 pub fn acquire_cache_aware_shared(table: &ExPushLockCacheAware, flags: u32) -> Result<u64, KernelError> {
     cache_aware_check_flags(table.address(), flags);
-    // SAFETY: a KPCR da CPU corrente fica mapeada desde o boot.
-    let processor = unsafe { Kpcr::at(crate::ntos::ke::pcr::get_pcr_address()) }.prcb.number.get() as usize;
+    let processor = crate::ntos::ke::pcr::current().prcb.number.get() as usize;
     let lock = table.locks[processor & (CACHE_AWARE_SLOT_COUNT - 1)].get();
     acquire_shared(lock, flags)?;
     Ok(lock)

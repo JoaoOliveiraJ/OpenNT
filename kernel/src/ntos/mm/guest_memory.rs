@@ -845,11 +845,11 @@ impl GuestHeap {
         block + BLOCK_HEADER_SIZE
     }
 
-    fn free_bytes(&mut self, pointer: u64) {
+    fn free_bytes(&mut self, pointer: u64, caller: &core::panic::Location<'_>) {
         if pointer == 0 {
             return;
         }
-        assert!(self.allocations.remove(&pointer), "Invalid guest pool free at {pointer:#x}");
+        assert!(self.allocations.remove(&pointer), "Invalid guest pool free at {pointer:#x} (liberado de {caller})");
         let mut block = pointer - BLOCK_HEADER_SIZE;
         volatile::write32(block + 12, 1);
         let previous = self.previous(block);
@@ -910,8 +910,10 @@ pub fn alloc_raw(size: u64) -> u64 {
     alloc_aligned(size, 16, false)
 }
 
+#[track_caller]
 pub fn free_bytes(pointer: u64) {
-    with_pool_lock(|| HEAP.lock().free_bytes(pointer))
+    let caller = core::panic::Location::caller();
+    with_pool_lock(|| HEAP.lock().free_bytes(pointer, caller))
 }
 
 pub fn owns_allocation(pointer: u64) -> bool {

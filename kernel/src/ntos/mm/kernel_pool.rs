@@ -250,10 +250,14 @@ impl Pool {
             let _ = volume.remove(path);
         }
         for page in &region.pages {
-            if !paging::unmap_page(page.va, MapOptions::default()) {
+            if !paging::unmap_page(page.va, MapOptions { batch_remote: true, ..MapOptions::default() }) {
                 return Err(KernelError::new("cannot unmap pool page"));
             }
             self.pages_by_va.remove(&page.va);
+        }
+        // As outras CPUs descartam as traduções antes de os frames voltarem.
+        paging::invalidate_kernel_batch();
+        for page in &region.pages {
             if page.frame != 0 && !pfn::free_page(page.frame) {
                 return Err(KernelError::new("pool free lost frame ownership"));
             }

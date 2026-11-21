@@ -29,7 +29,7 @@ use crate::ntos::ex::resource;
 use crate::ntos::fsrtl::ntstatus;
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::extra_fsrtl::FsrtlCommonFcbHeader;
-use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, Irp, Kpcr, Kprcb, LargeInteger};
+use crate::ntos::inc::types::{DeviceObject, DriverObject, FastIoDispatch, FileObject, IoStackLocation, IoStatusBlock, Irp, Kprcb, LargeInteger};
 use crate::ntos::init::exports::invoke_handler;
 use crate::ntos::io::irp_request;
 use crate::ntos::io::threads::top_level_irp;
@@ -69,8 +69,7 @@ fn counter_field(prcb: &Kprcb, counter: CacheCounter) -> &Field<u32> {
 
 /// FsRtlIncrementCc*: soma 1 ao contador da KPRCB do processador.
 pub fn increment(counter: CacheCounter) {
-    // SAFETY: a KPCR publicada em IA32_GS_BASE (KPRCB embutida).
-    let prcb = &unsafe { Kpcr::at(pcr::get_pcr_address()) }.prcb;
+    let prcb = &pcr::current().prcb;
     counter_field(prcb, counter).atomic().fetch_add(1, Ordering::Relaxed);
 }
 

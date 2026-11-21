@@ -169,6 +169,29 @@ irq_common:
     # fronteiras em que o GS ainda e o do usuario).
     cmp byte ptr [rsp + 72], 2
     jne irq_common_not_nmi
+    # O shootdown de TLB pedido por um AP (so o BSP passa por aqui: os APs
+    # tem a propria NMI na IDT deles): a geracao da mailbox ainda nao
+    # confirmada pelo BSP descarta as traducoes (CR4.PGE alternado e o CR3
+    # recarregado, o WBINVD se pedido) e e confirmada, sem tocar no GS. Uma
+    # NMI sem geracao nova segue o caminho de antes (o depurador).
+    movabs rcx, {direct_mailbox}
+    mov r8d, dword ptr [rcx + 0x30]
+    cmp dword ptr [rcx + {bootstrap_ack}], r8d
+    je irq_nmi_not_shootdown
+    cmp dword ptr [rcx + 0x34], 0
+    je irq_nmi_translations
+    wbinvd
+irq_nmi_translations:
+    mov rax, cr4
+    mov rdx, rax
+    and rdx, -129
+    mov cr4, rdx
+    mov rdx, cr3
+    mov cr3, rdx
+    mov cr4, rax
+    mov dword ptr [rcx + {bootstrap_ack}], r8d
+    jmp irq_nmi_return
+irq_nmi_not_shootdown:
     cmp byte ptr [rip + opennt_kd_trap_active], 0
     jne irq_nmi
     # Sem o depurador, a NMI do perfil por amostragem (`kd::sampler`, a
@@ -231,6 +254,10 @@ irq_sample_done:
     # o timer local de cada AP com o anel 3 armado, que tambem conta os
     # tiques dele na KPCR (pelo GS: o do usuario ja foi trocado acima).
     cmp edi, 0x40
+    je irq_timer_context
+    # O IPI de reescalonamento (0xE1) tambem encerra o intervalo de usuario:
+    # a preempcao por outra CPU, o pedido de termino ou de suspensao.
+    cmp edi, 0xE1
     je irq_timer_context
     cmp edi, 0x41
     jne irq_context_saved
@@ -359,6 +386,8 @@ irq_restore_interval:
     # Fim do intervalo de usuario pelo timer (o do BSP ou o de um AP): volta
     # ao escalonador (tipo 2).
     cmp edi, 0x40
+    je irq_timer_interval
+    cmp edi, 0xE1
     je irq_timer_interval
     cmp edi, 0x41
     jne irq_restore_registers
@@ -807,6 +836,8 @@ irq_kernel_resume_vector:
     native_frame = const crate::ntos::ke::pcr::layout::NATIVE_FRAME,
     native_owner = const crate::ntos::ke::pcr::layout::NATIVE_OWNER,
     processor_ticks = const crate::ntos::ke::pcr::layout::PROCESSOR_TICKS,
+    direct_mailbox = const memory_map::direct_map(memory_map::SMP_MAILBOX_PHYS),
+    bootstrap_ack = const 0x40,
 );
 
 extern "C" {

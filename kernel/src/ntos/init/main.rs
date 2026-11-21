@@ -180,9 +180,11 @@ pub fn kmain() -> ! {
         debug_print!("[usermode] anel 3 nao armado: {}", error);
     }
     // `--user-smp`: os APs armam o anel 3 (a GDT, a TSS, a IDT, os MSRs de
-    // syscall e o timer local de cada um) e esperam no laço ocioso deles.
+    // syscall e o timer local de cada um) e despacham threads de usuário no
+    // laço ocioso deles, junto com o BSP.
     if boot_config::user_smp() {
         crate::ntos::ke::smp::start_scheduling_all();
+        crate::ntos::ke::smp::enable_user_dispatch();
     }
     // Os valores iniciais de GUID_ACDC_POWER_SOURCE (o
     // PopInitilizeAcDcSettings do PoInitSystem).

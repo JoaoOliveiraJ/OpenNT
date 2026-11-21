@@ -64,6 +64,21 @@ pub static KERNEL_STEPS: Section = Section::new();
 /// conclua uma espera andou desde a anterior (a época de despertar e o
 /// tique do relógio).
 pub static POLLS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Os intervalos de usuário dados pelos APs (`threads::dispatch_on_processor`),
+/// somados de todos eles.
+pub static PROCESSOR_SLICES: Section = Section::new();
+/// O HLT do laço ocioso dos APs, somado de todos eles.
+pub static PROCESSOR_HALT: Section = Section::new();
+/// As threads que a sondagem do BSP deixou para depois porque outra CPU era
+/// dona delas (`thread_dispatch::try_borrow`).
+pub static BORROWS_REFUSED: AtomicU64 = AtomicU64::new(0);
+/// Os IPIs de reescalonamento enviados.
+pub static RESCHEDULE_IPIS: AtomicU64 = AtomicU64::new(0);
+/// Os shootdowns de TLB de um espaço de usuário pedidos por uma mudança de
+/// PTE, com o tempo de espera das confirmações.
+pub static SHOOTDOWNS: Section = Section::new();
+/// Os da metade de sistema.
+pub static KERNEL_SHOOTDOWNS: Section = Section::new();
 /// Esperas de usuário sondadas.
 pub static POLLS: AtomicU64 = AtomicU64::new(0);
 /// Trocas de processo (cargas de CR3) nas sondagens.
@@ -245,10 +260,53 @@ pub fn report_if_due() {
         values[21],
         values[22]
     );
+    report_processors(now);
     report_exits();
     report_threads();
     crate::ntos::kd::sampler::report_images();
     crate::ntos::kd::sampler::report();
+}
+
+/// O que andou nos APs desde a linha anterior.
+static LAST_PROCESSORS: crate::rtl::SpinLock<[u64; 8]> = crate::rtl::SpinLock::new([0; 8]);
+
+/// A linha dos APs (`[perf] t=N ms aps: ...`), com o despacho em várias CPUs.
+fn report_processors(now: u64) {
+    if !crate::ntos::ke::thread_dispatch::concurrent() {
+        return;
+    }
+    let (slice, slices) = PROCESSOR_SLICES.take();
+    let (halt, halts) = PROCESSOR_HALT.take();
+    let (shootdown, shootdowns) = SHOOTDOWNS.take();
+    let (kernel_shootdown, kernel_shootdowns) = KERNEL_SHOOTDOWNS.take();
+    let current = [slice, slices, halt, halts, BORROWS_REFUSED.load(Ordering::Relaxed), RESCHEDULE_IPIS.load(Ordering::Relaxed), shootdowns, kernel_shootdowns];
+    let delta = {
+        let mut last = LAST_PROCESSORS.lock();
+        let mut delta = [0u64; 8];
+        for (index, value) in current.iter().enumerate() {
+            delta[index] = value.wrapping_sub(last[index]);
+        }
+        *last = current;
+        delta
+    };
+    static LAST_SHOOTDOWN_TSC: AtomicU64 = AtomicU64::new(0);
+    static LAST_KERNEL_SHOOTDOWN_TSC: AtomicU64 = AtomicU64::new(0);
+    let shootdown_delta = shootdown.wrapping_sub(LAST_SHOOTDOWN_TSC.swap(shootdown, Ordering::Relaxed));
+    let kernel_shootdown_delta = kernel_shootdown.wrapping_sub(LAST_KERNEL_SHOOTDOWN_TSC.swap(kernel_shootdown, Ordering::Relaxed));
+    crate::debug_print!(
+        "[perf] t={} ms aps: intervalos {} ms ({}x), hlt {} ms ({}x), emprestimos recusados {}, IPIs de reescalonamento {}, shootdowns de usuario {} ({} us), de sistema {} ({} us)",
+        now,
+        milliseconds(delta[0]),
+        delta[1],
+        milliseconds(delta[2]),
+        delta[3],
+        delta[4],
+        delta[5],
+        delta[6],
+        milliseconds(shootdown_delta.saturating_mul(1000)),
+        delta[7],
+        milliseconds(kernel_shootdown_delta.saturating_mul(1000))
+    );
 }
 
 /// Os intervalos de uma thread de usuário no intervalo da linha `[perf]`.

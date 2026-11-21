@@ -7597,6 +7597,8 @@ pub fn run(assert: Assert) {
     // Por último entre os do despachante: arma o anel 3 nos APs, que daqui
     // em diante atendem os trabalhos pelo laço ocioso deles.
     crate::ntos::test::multiprocess::processor_ring3::run(assert);
+    // Com os APs armados: as threads de usuário despachadas neles.
+    crate::ntos::test::multiprocess::user_smp::run(assert);
     user_handle_table(assert);
     user_memory_helpers(assert);
     map_view_parameter_validation(assert);

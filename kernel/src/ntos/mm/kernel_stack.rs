@@ -96,8 +96,9 @@ struct State {
     /// Reservas devolvidas, reusadas antes de abrir uma nova.
     free_slots: Vec<u64>,
     next_slot: u64,
-    /// Pilhas liberadas enquanto a CPU ainda estava nelas.
-    deferred: Vec<KernelStack>,
+    /// Pilhas liberadas enquanto a CPU ainda estava nelas, com o número
+    /// dessa CPU: só ela sabe quando saiu (o RSP dela).
+    deferred: Vec<(KernelStack, usize)>,
 }
 
 static STATE: SpinLock<State> = SpinLock::new(State { live: BTreeMap::new(), free_slots: Vec::new(), next_slot: 0, deferred: Vec::new() });
@@ -217,22 +218,24 @@ fn release(stack: KernelStack) {
 /// MmDeleteKernelStack: devolve a pilha; adiada se a CPU ainda está nela.
 pub fn delete(stack: KernelStack) {
     if in_use(&stack) {
-        STATE.lock().deferred.push(stack);
+        STATE.lock().deferred.push((stack, crate::ntos::ke::context_switch::processor()));
         return;
     }
     release(stack);
 }
 
-/// Libera as pilhas adiadas que a CPU já deixou.
+/// Libera as pilhas adiadas por esta CPU que ela já deixou (a de outra CPU
+/// fica para ela: o RSP desta não diz se a outra ainda está na pilha).
 pub fn reap() {
+    let cpu = crate::ntos::ke::context_switch::processor();
     let ready: Vec<KernelStack> = {
         let mut state = STATE.lock();
         if state.deferred.is_empty() {
             return;
         }
-        let (ready, kept) = state.deferred.drain(..).partition(|stack| !in_use(stack));
+        let (ready, kept): (Vec<_>, Vec<_>) = state.deferred.drain(..).partition(|(stack, owner)| *owner == cpu && !in_use(stack));
         state.deferred = kept;
-        ready
+        ready.into_iter().map(|(stack, _)| stack).collect()
     };
     for stack in ready {
         release(stack);

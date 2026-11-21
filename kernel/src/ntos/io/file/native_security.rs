@@ -17,7 +17,7 @@ use crate::ntos::ps::process;
 use crate::ntos::se::query_descriptor::{self, QueryResult};
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{DeviceObject, FileObject, IoStackLocation, IoStatusBlock, Irp, Kpcr, Kthread, Mdl, NtStruct, SecurityDescriptorRelative};
+use crate::ntos::inc::types::{DeviceObject, FileObject, IoStackLocation, IoStatusBlock, Irp, Kthread, Mdl, NtStruct, SecurityDescriptorRelative};
 use crate::ntos::io::irp_builder::{self, BuildOptions};
 
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
@@ -164,10 +164,8 @@ fn dispatch_query(file: u64, device: u64, information: u32, buffer: u64, capacit
         // SAFETY: a thread corrente.
         let counter = &unsafe { Kthread::at(thread) }.other_operation_count;
         counter.set(counter.get().wrapping_add(1));
-        let processor = pcr::get_pcr_address();
-        if processor != 0 {
-            // SAFETY: KPCR da CPU corrente.
-            let count = &unsafe { Kpcr::at(processor) }.prcb.io_other_operation_count;
+        if pcr::get_pcr_address() != 0 {
+            let count = &pcr::current().prcb.io_other_operation_count;
             count.atomic().fetch_add(1, Ordering::Relaxed);
         }
         {

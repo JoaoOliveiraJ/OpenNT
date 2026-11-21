@@ -80,7 +80,7 @@ pub fn unmap(address: u64) -> bool {
     let base = address & !(PAGE - 1);
     let Some(pages) = release(base) else { return false };
     for index in 0..pages {
-        paging::unmap_page(base + index * PAGE, MapOptions::default());
+        paging::unmap_page(base + index * PAGE, MapOptions { batch_remote: true, ..MapOptions::default() });
     }
     let _ = crate::ntos::ke::smp::flush_remote_tlb(false);
     true

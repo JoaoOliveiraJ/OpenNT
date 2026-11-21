@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::ntos::em::database::{Arguments, STATE_FALSE, STATE_TRUE, STATE_UNKNOWN};
 use crate::ntos::em::provider::CallbackRequest;
-use crate::ntos::inc::types::{Kpcr, Kprcb, NtStruct};
+use crate::ntos::inc::types::{Kprcb, NtStruct};
 use crate::ntos::mm::guest_memory as guest;
 
 /// EmpCachedBiosDate.
@@ -115,7 +115,7 @@ fn cpu_match(arguments: &Arguments) -> u32 {
         return STATE_UNKNOWN;
     }
     // SAFETY: a KPCR do processador corrente e a KPRCB embutida nela.
-    let prcb = unsafe { Kprcb::at(Kpcr::at(crate::ntos::ke::pcr::get_pcr_address()).current_prcb.get()) };
+    let prcb = unsafe { Kprcb::at(crate::ntos::ke::pcr::current().current_prcb.get()) };
     let vendor = c_string(arguments.strings[0]);
     if vendor.first() != Some(&b'*') {
         let mut current = alloc::vec::Vec::new();

@@ -158,6 +158,32 @@ fn observed() -> bool {
     OBSERVED.load(Ordering::Acquire)
 }
 
+/// A tradução de `va` na raiz `root`, que estava presente, mudou (ou uma
+/// tabela do caminho dela vai voltar ao PFN): com as threads de usuário
+/// despachadas em várias CPUs, as outras que podem guardá-la na TLB a
+/// descartam antes de a mudança valer, como o KeFlushSingleTb do 19041 —
+/// numa VA de usuário as CPUs com a raiz carregada (`smp::flush_root`),
+/// numa de sistema todas (`smp::flush_kernel_page`). Antes disso os APs só
+/// rodam trabalhos, cada um depois de recarregar o CR3.
+/// O fim de um lote de desmontagem na metade de sistema
+/// (`MapOptions::batch_remote`): as outras CPUs descartam as traduções.
+pub fn invalidate_kernel_batch() {
+    if crate::ntos::ke::thread_dispatch::concurrent() {
+        crate::ntos::ke::smp::flush_kernel_page();
+    }
+}
+
+fn invalidate_elsewhere(root: u64, va: u64) {
+    if !crate::ntos::ke::thread_dispatch::concurrent() {
+        return;
+    }
+    if in_kernel_half(va) {
+        crate::ntos::ke::smp::flush_kernel_page();
+    } else {
+        crate::ntos::ke::smp::flush_root(root);
+    }
+}
+
 /// Entrada sem NX: NX não faz parte do endereço nem das permissões baixas.
 pub fn read_entry(address: u64) -> u64 {
     physical::read64(address) & ENTRY_MASK
@@ -617,6 +643,7 @@ fn reclaim_empty_tables(root: u64, va: u64, deferred: Option<&mut Vec<u64>>) {
         return;
     }
     cpu::reload_cr3(); // descarta caches de estruturas antes de reusar os frames
+    invalidate_elsewhere(root, va);
     for frame in retired {
         pfn::free_page(frame);
     }
@@ -699,6 +726,11 @@ pub struct MapOptions<'a> {
     /// `false` dispensa o INVLPG (o chamador invalida em lote).
     pub skip_invalidate: bool,
     pub deferred_tables: Option<&'a mut Vec<u64>>,
+    /// O chamador invalida as outras CPUs uma vez depois do lote
+    /// ([`invalidate_kernel_batch`], `smp::flush_remote_tlb`), antes de os
+    /// frames ou as VAs voltarem a uso: a desmontagem de uma faixa de
+    /// sistema de várias páginas não manda uma NMI por página.
+    pub batch_remote: bool,
 }
 
 /// Mapeia uma página de 4KB na raiz corrente: va -> pa com flags. PAGE_USER
@@ -729,9 +761,14 @@ pub fn map_page_in(root: u64, va: u64, pa: u64, flags: u64, options: MapOptions<
         reclaim_empty_tables(root, va, None);
         return false;
     }
-    write_entry(pt_address + pt_index(va) * 8, pa + (flags & 0xFFF), options.nx);
+    let at = pt_address + pt_index(va) * 8;
+    let previous = read_entry_exact(at);
+    write_entry(at, pa + (flags & 0xFFF), options.nx);
     if !options.skip_invalidate {
         cpu::invalidate_page(va);
+        if previous & PAGE_PRESENT != 0 && read_entry_exact(at) != previous && options.deferred_tables.is_none() {
+            invalidate_elsewhere(root, va);
+        }
     }
     true
 }
@@ -760,9 +797,16 @@ pub fn unmap_page_in(root: u64, va: u64, options: MapOptions<'_>) -> bool {
         entry = read_entry(pd_entry_address);
     }
     let pt_address = table_of(entry);
-    write_entry(pt_address + pt_index(va) * 8, 0, false);
+    let at = pt_address + pt_index(va) * 8;
+    let present = read_entry(at) & PAGE_PRESENT != 0;
+    write_entry(at, 0, false);
     if !options.skip_invalidate {
         cpu::invalidate_page(va);
+        // Quem passa as tabelas adiadas (ou pede o lote) invalida as outras
+        // CPUs uma vez antes de devolver os frames.
+        if present && options.deferred_tables.is_none() && !options.batch_remote {
+            invalidate_elsewhere(root, va);
+        }
     }
     reclaim_empty_tables(root, va, options.deferred_tables);
     true
@@ -799,9 +843,14 @@ pub fn write_leaf_in(root: u64, va: u64, value: u64) -> bool {
     if entry & PAGE_PRESENT == 0 || entry & PAGE_PS != 0 {
         return false;
     }
-    write_entry(table_of(entry) + pt_index(va) * 8, value, value & NX_BIT != 0);
+    let at = table_of(entry) + pt_index(va) * 8;
+    let previous = read_entry_exact(at);
+    write_entry(at, value, value & NX_BIT != 0);
     if root == current_root() {
         cpu::invalidate_page(va);
+    }
+    if previous & PAGE_PRESENT != 0 && previous != value {
+        invalidate_elsewhere(root, va);
     }
     true
 }
@@ -834,6 +883,9 @@ pub fn map_large_page_in(root: u64, va: u64, pa: u64, flags: u64, nx: bool) -> b
     let large_flags = (flags & 0xF7F) | PAGE_PS | if flags & 0x80 != 0 { 0x1000 } else { 0 };
     write_entry(at, pa + large_flags, nx);
     cpu::invalidate_page(va);
+    if prior & PAGE_PRESENT != 0 {
+        invalidate_elsewhere(root, va);
+    }
     true
 }
 
@@ -852,8 +904,12 @@ pub fn unmap_large_page_in(root: u64, va: u64, deferred_tables: Option<&mut Vec<
         if read_entry(at) & PAGE_PS == 0 {
             return false;
         }
+        let present = read_entry(at) & PAGE_PRESENT != 0;
         write_entry(at, 0, false);
         cpu::invalidate_page(va);
+        if present && deferred_tables.is_none() {
+            invalidate_elsewhere(root, va);
+        }
     }
     reclaim_empty_tables(root, va, deferred_tables);
     true

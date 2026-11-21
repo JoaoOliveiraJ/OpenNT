@@ -20,14 +20,14 @@ use crate::ntos::rtl::resource::memory as protected;
 use crate::rtl::KernelError;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::io::file::zw as zw_files;
-use crate::ntos::inc::types::{Kpcr, Kthread, NtStruct, ObjectAttributes, SecurityQualityOfService, UnicodeString};
+use crate::ntos::inc::types::{Kthread, NtStruct, ObjectAttributes, SecurityQualityOfService, UnicodeString};
 use core::mem::offset_of;
 
 /// NtDeleteFile incrementa OtherOperationCount antes do OB, mesmo quando os
 /// atributos não permitem completar a abertura.
 fn count_operation() {
     // SAFETY: a thread corrente e o KPCR da CPU corrente.
-    let (thread, processor) = unsafe { (Kthread::at(process::get_current_thread()), Kpcr::at(pcr::get_pcr_address())) };
+    let (thread, processor) = (unsafe { Kthread::at(process::get_current_thread()) }, pcr::current());
     let counter = &thread.other_operation_count;
     counter.set(counter.get().wrapping_add(1));
     processor.prcb.io_other_operation_count.atomic().fetch_add(1, core::sync::atomic::Ordering::Relaxed);

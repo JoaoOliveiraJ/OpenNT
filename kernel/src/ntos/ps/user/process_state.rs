@@ -57,7 +57,7 @@ use crate::ntos::mm::pe_loader::PeImage;
 use crate::ntos::mm::process_address_space;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::state::{self, UserHandleTable};
-use crate::rtl::{KernelError, SpinLock};
+use crate::rtl::{KernelError, SharedLock, SpinLock};
 
 /// O estado de um processo.
 pub struct ProcessState {
@@ -69,6 +69,10 @@ pub struct ProcessState {
     pub handles: SpinLock<UserHandleTable>,
     /// As regiões de usuário do processo (o papel do EPROCESS.VadRoot).
     pub vad: SpinLock<Vad>,
+    /// A EPROCESS.AddressCreationLock: a escolha de uma faixa livre de VA de
+    /// usuário e o registro dela no VAD são um passo só
+    /// (`memory::address_creation`).
+    pub address_creation: SharedLock,
     /// A raiz das tabelas de páginas, a mesma de KPROCESS.DirectoryTableBase:
     /// a do System até `mm::process_address_space::create` dar ao processo
     /// uma própria.
@@ -162,6 +166,7 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         images: SpinLock::new(Vec::new()),
         system_pages: SpinLock::new(Vec::new()),
         crash_reported: AtomicU64::new(0),
+        address_creation: SharedLock::new(),
     });
     let mut processes = PROCESSES.lock();
     if processes.contains_key(&process) {

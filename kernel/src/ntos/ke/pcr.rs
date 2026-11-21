@@ -111,11 +111,11 @@ struct Pcr {
 static PCR: SpinLock<Pcr> = SpinLock::new(Pcr { address: 0, backing_pages: Vec::new(), secondary: Vec::new(), io_database_lock: 0, vpb_lock: 0 });
 static ADDRESS: AtomicU64 = AtomicU64::new(0);
 
-/// A KPCR publicada (nenhuma antes de `init`).
+/// A KPCR da CPU corrente (nenhuma antes de `init`): o aninhamento e os
+/// pedidos de DPC são do processador que executa, e as entradas da
+/// LockQueue de todos apontam para os mesmos KSPIN_LOCKs.
 fn kpcr() -> Option<&'static Kpcr> {
-    let address = PCR.lock().address;
-    // SAFETY: as páginas da KPCR ficam mapeadas em PCR_VIRTUAL_BASE desde `init`.
-    (address != 0).then(|| unsafe { Kpcr::at(address) })
+    (ADDRESS.load(Ordering::Acquire) != 0).then(current)
 }
 
 /// A VA da reserva do processador `number`.
@@ -323,6 +323,13 @@ pub fn set_current_thread(thread: u64) {
 
 pub fn get_pcr_address() -> u64 {
     ADDRESS.load(Ordering::Acquire)
+}
+
+/// A VA da KPRCB do processador `number`, pela reserva fixa dele (sem
+/// trava: o despacho a lê a cada escolha). Só vale para um processador
+/// online, cuja KPCR fica mapeada por toda a vida do sistema.
+pub fn prcb_address(number: u32) -> u64 {
+    reservation(number) + layout::PRCB
 }
 
 /// KiProcessorBlock[number]: a KPRCB embutida na KPCR do processador

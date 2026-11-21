@@ -148,6 +148,12 @@ pub fn is_root_loaded(root: u64) -> bool {
     LOADED.iter().any(|loaded| loaded.load(Ordering::SeqCst) == root)
 }
 
+/// As CPUs (pelo número) com `root` carregada: os alvos do shootdown de uma
+/// PTE de usuário dessa raiz (`smp::flush_root`).
+pub fn processors_with_root(root: u64) -> u64 {
+    LOADED.iter().enumerate().filter(|(_, loaded)| loaded.load(Ordering::SeqCst) == root).fold(0, |mask, (number, _)| mask | 1 << number)
+}
+
 /// Carrega `root` no CR3 desta CPU quando ela ainda não é a carregada. A
 /// raiz tem de ser a do System ou uma raiz do Mm. Interrupções ficam
 /// desligadas entre o registro e o CR3, para que uma troca aninhada (uma
@@ -257,7 +263,7 @@ fn current_rsp() -> u64 {
 }
 
 /// Uma espera pode deixar a CPU: a thread corrente é a thread de usuário de
-/// uma syscall despachada nesta CPU (o BSP, no M0), roda na pilha de kernel
+/// uma syscall despachada nesta CPU (qualquer uma que despacha), roda na pilha de kernel
 /// corrente dela (KTHREAD.InitialStack/StackLimit) e é a execução em curso
 /// (nada de contexto aninhado: um passo do escalonador, uma APC drenada em
 /// nome de outra thread), abaixo de DISPATCH_LEVEL e sem SpinLock nem
@@ -280,7 +286,7 @@ fn current_rsp() -> u64 {
 pub fn can_block() -> bool {
     let Some(thread) = threads::current() else { return false };
     let pointer = thread.pointer();
-    if pointer == 0 || pointer != process::get_current_thread() || processor() != 0 || !usermode::in_service() {
+    if pointer == 0 || pointer != process::get_current_thread() || !usermode::in_service() {
         return false;
     }
     if irql::get_irql() >= irql::DISPATCH_LEVEL || sync::spin_locks_held() != 0 || sync::shared_locks_held() != 0 {

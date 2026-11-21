@@ -83,28 +83,38 @@ fn change_priority(thread: u64, requested: i32, deferred: &mut Vec<u64>) -> Resu
         return Ok(());
     }
     let target = kthread(thread);
-    let state = target.state.get();
-    if state == thread_dispatch::state::READY {
-        thread_dispatch::remove_ready(thread)?;
-    }
-    target.priority.set(priority as i8);
-    if state == thread_dispatch::state::READY {
-        // A comparação unsigned reproduz KiPrepareReadyThreadForRescheduling
-        // (0x35ba58), inclusive o wrap do tick: 300 ticks do 19041, em ms do
-        // tick do OpenNT.
-        let wait_time = target.wait_time.get();
-        if (1..=14).contains(&priority) && thread_dispatch::tick_count().wrapping_sub(thread_dispatch::STARVATION_READY_MS) >= wait_time {
-            target.priority_decrement.set((((15 - priority) << 4) & 255) as u8 as i8);
-            target.priority.set(15);
-            thread_dispatch::ensure_minimum_quantum(thread);
-        }
-        thread_dispatch::defer_ready(thread, deferred);
-    } else if priority < previous && (state == thread_dispatch::state::RUNNING || state == thread_dispatch::state::STANDBY) && (state == thread_dispatch::state::STANDBY || thread_dispatch::next_thread() == 0) {
-        let replacement = thread_dispatch::take_ready_above(priority)?;
-        if replacement != 0 {
-            thread_dispatch::reserve_next(replacement);
-            if state == thread_dispatch::state::STANDBY {
-                thread_dispatch::defer_ready(thread, deferred);
+    // A thread pronta muda de fila sob o PrcbLock, num trecho só: outra CPU
+    // que a escolhesse no meio a acharia numa lista que não é a da
+    // prioridade dela.
+    let state = thread_dispatch::reprioritize(
+        thread,
+        priority,
+        || {
+            // A comparação unsigned reproduz KiPrepareReadyThreadForRescheduling
+            // (0x35ba58), inclusive o wrap do tick: 300 ticks do 19041, em ms do
+            // tick do OpenNT.
+            let wait_time = target.wait_time.get();
+            if (1..=14).contains(&priority) && thread_dispatch::tick_count().wrapping_sub(thread_dispatch::STARVATION_READY_MS) >= wait_time {
+                target.priority_decrement.set((((15 - priority) << 4) & 255) as u8 as i8);
+                target.priority.set(15);
+                thread_dispatch::ensure_minimum_quantum(thread);
+            }
+        },
+        deferred,
+    )?;
+    if priority < previous && (state == thread_dispatch::state::RUNNING || state == thread_dispatch::state::STANDBY) {
+        // Em execução ou reservada em outra CPU: a dona confere a preempção
+        // na saída do serviço ou no fim do intervalo (o KiSetPriorityThread
+        // pede o despacho dela pelo IPI).
+        if let Some(owner) = thread_dispatch::owned_elsewhere(thread) {
+            thread_dispatch::kick_processor(owner);
+        } else if state == thread_dispatch::state::STANDBY || thread_dispatch::next_thread() == 0 {
+            let replacement = thread_dispatch::take_ready_above(priority)?;
+            if replacement != 0 {
+                thread_dispatch::reserve_next(replacement);
+                if state == thread_dispatch::state::STANDBY {
+                    thread_dispatch::defer_ready(thread, deferred);
+                }
             }
         }
     }

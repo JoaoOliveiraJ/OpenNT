@@ -392,8 +392,9 @@ pub fn unmap_reserved_mapping(descriptor: u64) {
     let offset = descriptor.byte_offset.get() as u64;
     let base = descriptor.mapped_system_va.get() - offset;
     for index in 0..(offset + count).div_ceil(0x1000) {
-        paging::unmap_page(base + index * 0x1000, paging::MapOptions::default());
+        paging::unmap_page(base + index * 0x1000, paging::MapOptions { batch_remote: true, ..paging::MapOptions::default() });
     }
+    paging::invalidate_kernel_batch();
     set_flags(descriptor, 0, MDL_MAPPED_TO_SYSTEM_VA);
 }
 

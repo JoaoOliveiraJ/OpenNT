@@ -9,14 +9,14 @@
 //! ociosa publicada em IdleThread, os valores ficam zero (IdleThread NULL
 //! conta como zero ticks ociosos).
 
-use crate::ntos::inc::types::{Field, Kpcr, Kprcb, Kthread, NtStruct};
+use crate::ntos::inc::types::{Field, Kprcb, Kthread, NtStruct};
 use crate::ntos::ke::pcr;
 
 /// KPCR.CurrentPrcb do processador corrente.
 fn current_prcb() -> &'static Kprcb {
     // SAFETY: a KPCR está mapeada desde `pcr::init` e CurrentPrcb aponta para
     // a KPRCB embutida nela.
-    unsafe { Kprcb::at(Kpcr::at(pcr::get_pcr_address()).current_prcb.get()) }
+    unsafe { Kprcb::at(pcr::current().current_prcb.get()) }
 }
 
 /// Ticks de kernel da thread ociosa (zero sem IdleThread publicada).

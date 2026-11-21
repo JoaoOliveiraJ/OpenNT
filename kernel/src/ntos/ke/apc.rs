@@ -204,6 +204,12 @@ pub fn insert_with_increment(apc: u64, first: u64, second: u64, increment: i8) -
         // O KiInsertQueueApc: uma thread de kernel parada numa espera que a
         // APC interrompe sai dela (STATUS_KERNEL_APC/STATUS_USER_APC).
         super::wait::apc_queued(thread, user_mode, special, increment);
+        // A thread em execução em outra CPU (o KiSignalThreadForApc
+        // 0x3436d0): o IPI encerra o intervalo dela no anel 3, e a dona
+        // entrega as APCs antes do próximo.
+        if let Some(owner) = super::thread_dispatch::owned_elsewhere(thread) {
+            super::thread_dispatch::kick_processor(owner);
+        }
     }
     inserted
 }

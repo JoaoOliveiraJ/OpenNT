@@ -19,8 +19,15 @@
 //! quem precisa do fim dele bloqueia em [`wait_for_process`], que despacha
 //! todos enquanto espera, e o `scheduler::tick` do kernel também despacha
 //! intervalos de usuário (o timer encerra o intervalo de quem não cede a
-//! CPU, então um processo não segura os outros). No M0 só o BSP despacha
-//! usuário (assert).
+//! CPU, então um processo não segura os outros). Com o despacho em várias
+//! CPUs, cada AP também dá intervalos ([`dispatch_on_processor`]): escolhe a
+//! pronta de usuário mais prioritária da fila comum e a roda, sem os pumps,
+//! as sondagens e os fins de processo, que continuam no BSP (o AP lhe passa
+//! o que o intervalo pediu, [`EXIT_REQUESTS`]). Uma thread é de uma CPU só
+//! por vez (`thread_dispatch`: Running, Standby ou emprestada); a sondagem e
+//! as APCs de kernel de uma thread fora da CPU passam por um empréstimo, e o
+//! término ou a suspensão pedidos para uma thread que outra CPU executa
+//! valem no fim do intervalo dela, decididos sob o PrcbLock.
 //!
 //! O fim de um processo, pedido de qualquer contexto (o NtTerminateProcess
 //! dele mesmo, o de outro processo por handle, uma exceção fatal), passa por
@@ -78,6 +85,7 @@ use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, peb_teb};
+use crate::ntos::mm::memory_map::MAX_CPUS;
 use crate::ntos::inc::types::{ClientId, Context, Eprocess, Ethread, ImageDosHeader, ImageNtHeaders64, Kthread, KwaitBlock, NtStruct, ObjectAttributes, Peb, PsAttribute, PsAttributeList, Teb, ThreadBasicInformation};
 use core::mem::offset_of;
 
@@ -158,26 +166,32 @@ pub struct Registered {
     serial: u64,
     /// Uptime (ms) da última sondagem de uma acordada.
     polled_at: u64,
+    /// A contagem de pulsos quando o serviço instalou a espera
+    /// (`dispatcher::pulse_clock`): os blocos só são ligados quando a thread
+    /// deixa a CPU, e o pulso (ou o sinal seguido do reset) que outra CPU der
+    /// nesse meio a satisfaz na ligação, como satisfaria a espera do 19041,
+    /// ligada dentro do serviço.
+    since: Option<u64>,
 }
 
 impl Registered {
     /// Uma espera de objetos de UserMode (o NtWaitForSingleObject, o
     /// NtWaitForMultipleObjects): `kind` WaitAny ou WaitAll.
     pub fn objects(thread: u64, objects: Vec<u64>, kind: u8, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
-        Registered { thread, objects, kind, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0 }
+        Registered { thread, objects, kind, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0, since: Some(dispatcher::pulse_clock()) }
     }
 
     /// Só o timer da thread (o KeDelayExecutionThread): STATUS_SUCCESS no
     /// vencimento.
     pub fn delay(thread: u64, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
-        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline, timeout_status: 0, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0 }
+        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline, timeout_status: 0, alertable, woken: false, poll_deadline: None, serial: 0, polled_at: 0, since: None }
     }
 
     /// Uma espera acordada: o sinal de `watch` (blocos de notificação, que
     /// não consomem), um `ke::wait::wake` ou o prazo devolvem a thread à
     /// fila, e a sondagem da espera decide.
     pub fn woken(thread: u64, watch: Vec<u64>, deadline: crate::ntos::ke::wait::Deadline, alertable: bool) -> Self {
-        Registered { thread, objects: watch, kind: crate::ntos::ke::wait::wait_type::NOTIFICATION, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: true, poll_deadline: None, serial: 0, polled_at: clock::uptime_ms() }
+        Registered { thread, objects: watch, kind: crate::ntos::ke::wait::wait_type::NOTIFICATION, deadline, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable, woken: true, poll_deadline: None, serial: 0, polled_at: clock::uptime_ms(), since: None }
     }
 
     /// A espera de kernel dentro de um serviço (o KeWaitFor*, o
@@ -186,7 +200,7 @@ impl Registered {
     /// desfecho à retomada; o laço decide o resto (a APC de kernel, a espera
     /// de novo).
     fn linked(thread: u64, serial: u64) -> Self {
-        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline: crate::ntos::ke::wait::Deadline::Infinite, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable: false, woken: false, poll_deadline: None, serial, polled_at: 0 }
+        Registered { thread, objects: Vec::new(), kind: crate::ntos::ke::wait::wait_type::ANY, deadline: crate::ntos::ke::wait::Deadline::Infinite, timeout_status: crate::ntos::ke::wait::STATUS_TIMEOUT, alertable: false, woken: false, poll_deadline: None, serial, polled_at: 0, since: None }
     }
 
     fn spec(&self, reason: u8) -> crate::ntos::ke::wait::WaitSpec {
@@ -214,7 +228,14 @@ impl Registered {
     /// Liga os blocos (a tentativa dos objetos e o prazo primeiro):
     /// `Some(status)` quando concluiu ali mesmo.
     fn link(&mut self, reason: u8) -> Option<u32> {
-        use crate::ntos::ke::wait::{begin_user_wait, UserWaitStart};
+        use crate::ntos::ke::wait::{begin_user_wait, wait_type, UserWaitStart};
+        // O pulso entre a instalação e a ligação (só a primeira: depois os
+        // blocos já estavam ligados).
+        if let Some(since) = self.since.take().filter(|_| !self.woken && self.kind == wait_type::ANY && !self.objects.is_empty()) {
+            if let Some(index) = dispatcher::pulsed_since(&self.objects, wait_type::ANY as u32, since) {
+                return Some(index);
+            }
+        }
         let deadline = self.wake_deadline();
         match begin_user_wait(self.thread, &self.objects, deadline, self.spec(reason)) {
             Ok(UserWaitStart::Done(status)) => Some(status),
@@ -316,6 +337,13 @@ pub struct ThreadMut {
     waiting: bool,
     /// Serviço suspenso na pilha de kernel da thread.
     kernel: KernelState,
+    /// Um término pedido enquanto outra CPU era dona da thread, que não pôde
+    /// concluir a espera dela de fora: `Some(true)` (a thread morreu) conclui
+    /// qualquer espera instalada com STATUS_THREAD_IS_TERMINATING, `Some(false)`
+    /// (o pedido de término do 19041) só a de UserMode. A dona aplica no fim
+    /// do intervalo, ou a sondagem que a tomar emprestada
+    /// ([`apply_deferred_termination`]).
+    deferred_termination: Option<bool>,
 }
 
 pub struct UserThread {
@@ -358,6 +386,7 @@ impl UserThread {
                 wait: None,
                 waiting: false,
                 kernel: KernelState::User,
+                deferred_termination: None,
             }),
         })
     }
@@ -434,10 +463,16 @@ impl UserThread {
 }
 
 static THREADS: SpinLock<Vec<Arc<UserThread>>> = SpinLock::new(Vec::new());
-/// O despachante está ativo no BSP (um [`dispatch_one`] em curso, ou a
-/// simulação dos autotestes): nenhum despacho aninhado.
-static RUNNING: AtomicBool = AtomicBool::new(false);
-static CURRENT: SpinLock<Option<Arc<UserThread>>> = SpinLock::new(None);
+/// O despachante está ativo em cada CPU (um [`dispatch_one`] ou um
+/// [`dispatch_on_processor`] em curso, ou a simulação dos autotestes):
+/// nenhum despacho aninhado.
+static DISPATCHING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+/// A thread de usuário do intervalo em curso em cada CPU.
+static CURRENT: [SpinLock<Option<Arc<UserThread>>>; MAX_CPUS] = [const { SpinLock::new(None) }; MAX_CPUS];
+/// O que o intervalo de um AP pede ao BSP, que roda os fins de processo e
+/// recolhe as threads: o processo da thread e, no fim do processo pedido no
+/// intervalo (o NtTerminateProcess dele, uma exceção fatal), o status.
+static EXIT_REQUESTS: SpinLock<Vec<(u64, Option<u32>)>> = SpinLock::new(Vec::new());
 /// Processos com o fim pedido ([`begin_exit`]) cujo término espera os
 /// serviços suspensos das threads deles serem desfeitos.
 static EXITING: SpinLock<Vec<PendingExit>> = SpinLock::new(Vec::new());
@@ -532,12 +567,18 @@ pub fn find_by_pointer(pointer: u64) -> Option<Arc<UserThread>> {
     THREADS.lock().iter().find(|thread| pointer != 0 && thread.pointer() == pointer).cloned()
 }
 
+/// O número desta CPU.
+fn cpu() -> usize {
+    context_switch::processor()
+}
+
 pub fn current() -> Option<Arc<UserThread>> {
-    CURRENT.lock().clone()
+    CURRENT[cpu()].lock().clone()
 }
 
 pub fn active() -> bool {
-    RUNNING.load(Ordering::Acquire) && CURRENT.lock().is_some()
+    let cpu = cpu();
+    DISPATCHING[cpu].load(Ordering::Acquire) && CURRENT[cpu].lock().is_some()
 }
 
 /// Estado do despachante (`running`) e a entrada do processo corrente nele;
@@ -550,8 +591,9 @@ pub fn set_running(running: bool, current: Option<Arc<UserThread>>) {
 }
 
 fn set_dispatching(running: bool, current: Option<Arc<UserThread>>) {
-    RUNNING.store(running, Ordering::Release);
-    *CURRENT.lock() = current;
+    let cpu = cpu();
+    DISPATCHING[cpu].store(running, Ordering::Release);
+    *CURRENT[cpu].lock() = current;
 }
 
 /// APCs de kernel podem rodar com a thread suspensa ou esperando: nada de
@@ -586,6 +628,10 @@ pub fn drain_kernel_apcs() {
         if pointer == previous && caller_irql != 0 {
             continue;
         }
+        // A thread que outra CPU executa entrega as próprias APCs: a dona
+        // as entrega antes do intervalo seguinte, e o IPI de quem as
+        // enfileirou encerra o intervalo em curso.
+        let Some(borrow) = thread_dispatch::try_borrow(pointer) else { continue };
         process::set_current_thread(pointer);
         if caller_irql != 0 {
             irql::lower_irql(0);
@@ -600,9 +646,31 @@ pub fn drain_kernel_apcs() {
             irql::raise_irql(caller_irql);
         }
         process::set_current_thread(previous);
+        thread_dispatch::release_borrow(borrow);
     }
     process::set_current_thread(previous);
     DRAINING_APCS.store(false, Ordering::Release);
+}
+
+/// Num AP, a espera que gira dentro de um serviço (o `wait_until` de quem não
+/// pode deixar a CPU, com uma trava retida) entrega as conclusões de E/S e as
+/// APCs de kernel da própria thread, como o [`drain_kernel_apcs`] do pump do
+/// BSP faz com a thread corrente dele: a conclusão de um pedido de arquivo só
+/// termina no contexto de quem pediu, e a espera do pedido não acaba sem
+/// ela. O resto do pump (IRQs, DPCs, timers) é do BSP.
+pub fn drain_own_kernel_apcs() {
+    if irql::get_irql() != irql::PASSIVE_LEVEL {
+        return;
+    }
+    let pointer = process::get_current_thread();
+    if pointer == 0 || current().is_none_or(|thread| thread.pointer() != pointer) {
+        return;
+    }
+    if !crate::ntos::ke::thread_apcs_pending(pointer) && !crate::ntos::io::file::request::has_completions_for(pointer) {
+        return;
+    }
+    crate::ntos::io::file::request::pump();
+    let _ = apc::deliver_all_queued();
 }
 
 /// O KTHREAD de uma thread de usuário.
@@ -710,23 +778,48 @@ fn poll_user_waits() {
     candidates.sort_by_cached_key(|thread| (core::cmp::Reverse(thread_priority::query_priority(thread.pointer())), thread.with(|thread| thread.process_pointer)));
     for candidate in candidates {
         let pointer = candidate.pointer();
+        // A thread que outra CPU executa, reservou ou sonda fica para a
+        // próxima sondagem: só a dona mexe na espera dela.
+        let Some(borrow) = thread_dispatch::try_borrow(pointer) else {
+            dispatch_perf::BORROWS_REFUSED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        apply_deferred_termination(&candidate);
         match poll_installed(&candidate) {
-            Polled::Waiting => continue,
+            Polled::Waiting => {}
             // A registrada concluída volta à fila direto.
             Polled::Settled => {
                 let _ = thread_dispatch::make_ready(pointer);
-                continue;
             }
-            Polled::Free => {}
+            Polled::Free => {
+                // O despacho de usuário só roda fora de qualquer intervalo: uma
+                // thread de usuário Running que não está numa CPU é um estado
+                // restaurado por engano, e o `make_ready` a pularia para sempre.
+                if thread_dispatch::thread_state(pointer) == thread_dispatch::state::RUNNING && !thread_dispatch::on_processor(pointer) {
+                    crate::debug_print!("[thread] tid={} pronta com KTHREAD.State Running fora da CPU; volta a Waiting para entrar na fila", candidate.thread_id);
+                    let _ = thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING);
+                }
+                let _ = thread_dispatch::make_ready(pointer);
+            }
         }
-        // O despacho de usuário só roda fora de qualquer intervalo: uma thread
-        // de usuário Running que não está numa CPU é um estado restaurado por
-        // engano, e o `make_ready` a pularia para sempre.
-        if thread_dispatch::thread_state(pointer) == thread_dispatch::state::RUNNING && !thread_dispatch::on_processor(pointer) {
-            crate::debug_print!("[thread] tid={} pronta com KTHREAD.State Running fora da CPU; volta a Waiting para entrar na fila", candidate.thread_id);
-            let _ = thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING);
-        }
-        let _ = thread_dispatch::make_ready(pointer);
+        thread_dispatch::release_borrow(borrow);
+    }
+}
+
+/// O término pedido enquanto outra CPU era dona da thread
+/// (`deferred_termination`), aplicado por quem agora é dono dela (a CPU no
+/// fim do intervalo, ou a sondagem com a thread emprestada): a espera
+/// instalada conclui com STATUS_THREAD_IS_TERMINATING, como o término teria
+/// feito na hora com a thread fora da CPU. `true` se uma espera concluiu.
+fn apply_deferred_termination(thread: &UserThread) -> bool {
+    let Some(any_wait) = thread.with(|thread| thread.deferred_termination.take()) else { return false };
+    let Some(wait) = thread.take_wait() else { return false };
+    if any_wait || !wait.kernel {
+        finish_wait(thread, wait, THREAD_IS_TERMINATING);
+        true
+    } else {
+        thread.restore_wait(wait);
+        false
     }
 }
 
@@ -856,7 +949,7 @@ pub fn can_dispatch() -> bool {
         && irql::get_irql() == irql::PASSIVE_LEVEL
         && sync::spin_locks_held() == 0
         && sync::shared_locks_held() == 0
-        && !RUNNING.load(Ordering::Acquire)
+        && !DISPATCHING[0].load(Ordering::Acquire)
         && !DRAINING_APCS.load(Ordering::Acquire)
         && !crate::hal::amd64::usermode::executing()
 }
@@ -908,15 +1001,15 @@ pub fn dispatch_one() -> Result<Dispatched, KernelError> {
     if context_switch::in_kernel_thread() {
         return Ok(Dispatched::Idle);
     }
-    if RUNNING.swap(true, Ordering::AcqRel) {
+    if DISPATCHING[0].swap(true, Ordering::AcqRel) {
         return Ok(Dispatched::Idle);
     }
     let started = crate::hal::cpu::rdtsc();
     let caller = process::get_current_thread();
     let result = dispatch_from(executor, caller);
     process::set_current_thread(caller);
-    *CURRENT.lock() = None;
-    RUNNING.store(false, Ordering::Release);
+    *CURRENT[0].lock() = None;
+    DISPATCHING[0].store(false, Ordering::Release);
     dispatch_perf::DISPATCH.add_since(started);
     result
 }
@@ -929,13 +1022,14 @@ pub fn dispatch_one() -> Result<Dispatched, KernelError> {
 /// posto na IOCP do servidor por um cliente que em seguida espera a
 /// resposta). Mesmas condições do despacho; um despacho em curso já sonda.
 pub fn refresh_waiting() {
-    if !can_dispatch() || RUNNING.swap(true, Ordering::AcqRel) {
+    if !can_dispatch() || DISPATCHING[0].swap(true, Ordering::AcqRel) {
         return;
     }
     let caller = process::get_current_thread();
+    serve_exit_requests(caller);
     refresh_ready_user_threads();
     process::set_current_thread(caller);
-    RUNNING.store(false, Ordering::Release);
+    DISPATCHING[0].store(false, Ordering::Release);
 }
 
 /// O corpo de [`dispatch_one`], com o despacho já marcado como em curso.
@@ -943,6 +1037,7 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
     // Os pumps sem o tick do escalonador: o despacho roda dentro do tick,
     // que já alterna as threads de kernel e as de usuário pela prioridade.
     let started = crate::hal::cpu::rdtsc();
+    serve_exit_requests(caller);
     dispatcher::pump_kernel_work();
     let pumps = *PUMPS.lock();
     for routine in pumps.into_iter().flatten() {
@@ -968,46 +1063,7 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
             thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
             continue;
         };
-        // Na fila com a espera ainda instalada: a registrada que o sinal
-        // satisfez conclui aqui, no contexto da thread (o status vai ao
-        // CONTEXT, ou à retomada do serviço bloqueado); a que segue (uma
-        // acordada sem conclusão, ou a thread aprontada por fora da espera)
-        // volta a esperar.
-        if next.waiting() {
-            process::set_current_thread(pointer);
-            let settled = settle(&next);
-            process::set_current_thread(caller);
-            if !settled {
-                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
-                continue;
-            }
-        }
-        let (dead, process) = next.with(|thread| (thread.dead, thread.process_pointer));
-        let kernel = next.kernel_state();
-        // Bloqueada no kernel com a espera ainda pendente (um alerta a
-        // pôs na fila antes da sondagem): volta a esperar.
-        if kernel == (KernelState::Blocked { status: None }) {
-            thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
-            continue;
-        }
-        if kernel == KernelState::User {
-            // Terminada, ou de um processo que não entrou no despachante
-            // (ou já saiu dele): sai da fila de prontas sem rodar.
-            if dead {
-                thread_dispatch::suspend(pointer, thread_dispatch::state::TERMINATED)?;
-                continue;
-            }
-            // Suspensa (o sinal de uma espera registrada apronta mesmo a
-            // suspensa) ou com a espera instalada: a retomada (ou a
-            // sondagem) a põe na fila de novo.
-            if hold_before_ring3(&next)? {
-                continue;
-            }
-            if !process_started(process) {
-                thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
-                continue;
-            }
-        }
+        let Some((process, kernel)) = admit(&next, pointer, caller)? else { continue };
         dispatch_perf::slice_begin(next.thread_id, process);
         let started = crate::hal::cpu::rdtsc();
         let dispatched = run_slice(&next, process, kernel, executor, caller);
@@ -1016,6 +1072,118 @@ fn dispatch_from(executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatche
         return Ok(dispatched);
     }
     Ok(Dispatched::Idle)
+}
+
+/// As conferências da thread escolhida e reservada nesta CPU, antes do
+/// intervalo: o processo dela e onde está o fluxo de kernel, ou `None`
+/// quando ela não roda agora (voltou a esperar, terminou, está suspensa).
+fn admit(next: &Arc<UserThread>, pointer: u64, caller: u64) -> Result<Option<(u64, KernelState)>, KernelError> {
+    // Na fila com a espera ainda instalada: a registrada que o sinal
+    // satisfez conclui aqui, no contexto da thread (o status vai ao
+    // CONTEXT, ou à retomada do serviço bloqueado); a que segue (uma
+    // acordada sem conclusão, ou a thread aprontada por fora da espera)
+    // volta a esperar.
+    if next.waiting() {
+        process::set_current_thread(pointer);
+        let settled = settle(next);
+        process::set_current_thread(caller);
+        if !settled {
+            thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+            return Ok(None);
+        }
+    }
+    let (dead, process) = next.with(|thread| (thread.dead, thread.process_pointer));
+    let kernel = next.kernel_state();
+    // Bloqueada no kernel com a espera ainda pendente (um alerta a
+    // pôs na fila antes da sondagem): volta a esperar.
+    if kernel == (KernelState::Blocked { status: None }) {
+        thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+        return Ok(None);
+    }
+    if kernel == KernelState::User {
+        // Terminada, ou de um processo que não entrou no despachante
+        // (ou já saiu dele): sai da fila de prontas sem rodar.
+        if dead {
+            thread_dispatch::suspend(pointer, thread_dispatch::state::TERMINATED)?;
+            return Ok(None);
+        }
+        // Suspensa (o sinal de uma espera registrada apronta mesmo a
+        // suspensa) ou com a espera instalada: a retomada (ou a
+        // sondagem) a põe na fila de novo.
+        if hold_before_ring3(next)? {
+            return Ok(None);
+        }
+        if !process_started(process) {
+            thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+            return Ok(None);
+        }
+    }
+    Ok(Some((process, kernel)))
+}
+
+/// O despacho de usuário de um AP (o KiIdleLoop dele, com a escolha do
+/// KiSelectNextThread 0x2568ec): a pronta de usuário mais prioritária que
+/// esta CPU pode rodar (`thread_dispatch::peek_for`) ganha um intervalo. Os
+/// pumps, as sondagens das esperas, os fins de processo e o recolhimento das
+/// threads continuam no BSP: o que o intervalo pede a ele vai a
+/// [`EXIT_REQUESTS`], e ele é acordado. `Idle` sem nenhuma pronta.
+pub fn dispatch_on_processor() -> Result<Dispatched, KernelError> {
+    let Some(executor) = *EXECUTOR.lock() else { return Ok(Dispatched::Idle) };
+    let cpu = cpu();
+    if cpu == 0 || DISPATCHING[cpu].swap(true, Ordering::AcqRel) {
+        return Ok(Dispatched::Idle);
+    }
+    thread_dispatch::clear_kick();
+    let caller = process::get_current_thread();
+    let result = dispatch_processor_from(cpu, executor, caller);
+    process::set_current_thread(caller);
+    *CURRENT[cpu].lock() = None;
+    DISPATCHING[cpu].store(false, Ordering::Release);
+    result
+}
+
+/// O corpo de [`dispatch_on_processor`].
+fn dispatch_processor_from(cpu: usize, executor: fn(u64, u64) -> u32, caller: u64) -> Result<Dispatched, KernelError> {
+    for _ in 0..DISCARD_LIMIT {
+        let Some((pointer, owner)) = thread_dispatch::peek_for(cpu, true)? else { return Ok(Dispatched::Idle) };
+        if owner.runtime & thread_dispatch::USER_RUNTIME == 0 {
+            thread_dispatch::unreserve(pointer);
+            return Ok(Dispatched::Idle);
+        }
+        let Some(next) = find_by_pointer(pointer) else {
+            thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
+            continue;
+        };
+        let Some((process, kernel)) = admit(&next, pointer, caller)? else { continue };
+        deliver_owned_apcs(&next, pointer, kernel, caller);
+        let started = crate::hal::cpu::rdtsc();
+        let dispatched = run_slice_on_processor(&next, process, kernel, executor, caller);
+        dispatch_perf::PROCESSOR_SLICES.add_since(started);
+        return Ok(dispatched);
+    }
+    Ok(Dispatched::Idle)
+}
+
+/// As APCs de kernel da thread escolhida por um AP, entregues por ele, dono
+/// dela, no contexto dela antes do intervalo (o KiSignalThreadForApc 0x3436d0
+/// manda o processador da thread entregá-las): as conclusões de E/S que só o
+/// contexto dela termina e as APCs da fila de kernel, como o
+/// [`drain_kernel_apcs`] do BSP faz com as threads fora da CPU.
+fn deliver_owned_apcs(thread: &UserThread, pointer: u64, kernel: KernelState, caller: u64) {
+    if !crate::ntos::ke::thread_apcs_pending(pointer) && !crate::ntos::io::file::request::has_completions_for(pointer) {
+        return;
+    }
+    // Bloqueada no kernel acima de PASSIVE_LEVEL: as APCs esperam a retomada.
+    if kernel != KernelState::User && kernel_thread(pointer).wait_irql.get() != irql::PASSIVE_LEVEL {
+        return;
+    }
+    if thread.dead() || irql::get_irql() != irql::PASSIVE_LEVEL {
+        return;
+    }
+    process::set_current_thread(pointer);
+    crate::ntos::io::file::request::pump();
+    let _ = apc::deliver_all_queued();
+    process::set_current_thread(caller);
 }
 
 /// O status de saída de um processo cujo despacho falhou.
@@ -1027,7 +1195,44 @@ fn dispatch_failure(error: &KernelError) -> u32 {
 /// [`dispatch_from`], e o que vem depois dele.
 fn run_slice(next: &Arc<UserThread>, process: u64, kernel: KernelState, executor: fn(u64, u64) -> u32, caller: u64) -> Dispatched {
     let pointer = next.pointer();
-    *CURRENT.lock() = Some(next.clone());
+    let (exit, kind) = run_interval(next, kernel, executor);
+    // Daqui em diante a thread do intervalo não é mais a corrente: o
+    // término e a liberação a recolhem.
+    process::set_current_thread(caller);
+    if let Some(status) = exit {
+        crate::ntos::ps::create::exit_process(process, status);
+    }
+    finish_pending_exits(false);
+    release_finished(process);
+    // Fora de qualquer pilha de thread: as liberações adiadas.
+    kernel_stack::reap();
+    Dispatched::Ran { thread: pointer, exit_kind: kind }
+}
+
+/// O intervalo de `next` escolhido por um AP ([`dispatch_on_processor`]):
+/// como [`run_slice`], mas o fim do processo pedido no intervalo, os fins
+/// adiados e o recolhimento das threads mortas vão ao BSP
+/// ([`EXIT_REQUESTS`]), que é acordado.
+fn run_slice_on_processor(next: &Arc<UserThread>, process: u64, kernel: KernelState, executor: fn(u64, u64) -> u32, caller: u64) -> Dispatched {
+    let pointer = next.pointer();
+    let (exit, kind) = run_interval(next, kernel, executor);
+    process::set_current_thread(caller);
+    let finished = next.dead() || exit_pending(process) || process::with_record(process, |record| record.terminated || record.exiting) == Some(true);
+    if exit.is_some() || finished {
+        EXIT_REQUESTS.lock().push((process, exit));
+        thread_dispatch::wake_processor(0);
+    }
+    kernel_stack::reap();
+    Dispatched::Ran { thread: pointer, exit_kind: kind }
+}
+
+/// O intervalo da thread escolhida nesta CPU, que quem chama já conferiu
+/// ([`admit`]): a entrega das APCs de usuário, a execução e o tratamento da
+/// saída. Devolve o status do fim do processo, quando o intervalo o pediu, e
+/// o tipo de saída.
+fn run_interval(next: &Arc<UserThread>, kernel: KernelState, executor: fn(u64, u64) -> u32) -> (Option<u32>, u32) {
+    let pointer = next.pointer();
+    *CURRENT[cpu()].lock() = Some(next.clone());
     process::set_current_thread(pointer);
     process::dispatch_thread(pointer);
     // Retorno ao modo usuário (o KiInitiateUserApc do
@@ -1073,17 +1278,32 @@ fn run_slice(next: &Arc<UserThread>, process: u64, kernel: KernelState, executor
             }
         }
     }
-    // Daqui em diante a thread do intervalo não é mais a corrente: o
-    // término e a liberação a recolhem.
-    process::set_current_thread(caller);
-    if let Some(status) = exit {
-        crate::ntos::ps::create::exit_process(process, status);
+    (exit, kind)
+}
+
+/// Os pedidos dos intervalos dos APs ([`EXIT_REQUESTS`]), no BSP: o fim do
+/// processo que o intervalo pediu, os fins adiados e o recolhimento das
+/// threads mortas, como o [`run_slice`] faz depois de um intervalo dele.
+fn serve_exit_requests(caller: u64) {
+    let requests = core::mem::take(&mut *EXIT_REQUESTS.lock());
+    if requests.is_empty() {
+        return;
+    }
+    for &(process, status) in &requests {
+        if let Some(status) = status {
+            crate::ntos::ps::create::exit_process(process, status);
+        }
     }
     finish_pending_exits(false);
-    release_finished(process);
-    // Fora de qualquer pilha de thread: as liberações adiadas.
+    let mut released: Vec<u64> = Vec::new();
+    for &(process, _) in &requests {
+        if !released.contains(&process) {
+            released.push(process);
+            release_finished(process);
+        }
+    }
+    process::set_current_thread(caller);
     kernel_stack::reap();
-    Dispatched::Ran { thread: pointer, exit_kind: kind }
 }
 
 /// Recolhe as threads mortas de `process` que não têm mais serviço suspenso
@@ -1092,7 +1312,7 @@ fn run_slice(next: &Arc<UserThread>, process: u64, kernel: KernelState, executor
 /// intervalo, pelo NtTerminateThread), o que restou dele.
 fn release_finished(process: u64) {
     for finished in of_process(process) {
-        if finished.dead() && !finished.blocked_in_kernel() {
+        if finished.dead() && !finished.blocked_in_kernel() && thread_dispatch::owned_elsewhere(finished.pointer()).is_none() {
             release_execution_resources(&finished);
         }
     }
@@ -1110,7 +1330,7 @@ fn release_finished(process: u64) {
 /// uma thread de kernel própria), quando todas as threads de usuário dele
 /// morreram e desfizeram os serviços.
 pub fn wait_for_process(process: u64) -> Result<u32, KernelError> {
-    if RUNNING.load(Ordering::Acquire) {
+    if DISPATCHING[cpu()].load(Ordering::Acquire) {
         return Err(KernelError::new("espera de processo dentro do despachante"));
     }
     if process::reference(process).is_none() {
@@ -1194,14 +1414,16 @@ fn progress(process: u64) -> Progress {
 /// resultado e o tipo da saída.
 fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u32, u32), KernelError> {
     let pointer = thread.pointer();
+    let cpu = cpu();
     let kernel_before = process::thread_kernel_time(pointer);
     let started = clock::uptime_ms();
     thread_dispatch::begin_execution(pointer)?;
     // O intervalo do despachante em curso: só as saídas de serviço dele podem
-    // voltar direto ao anel 3 (`may_return_to_user`), até o próximo tique.
+    // voltar direto ao anel 3 (`may_return_to_user`), até o próximo tique do
+    // timer desta CPU.
     let mark_slice = || {
-        SLICE_TICK.store(crate::nano::interrupts::tick_count(), Ordering::Relaxed);
-        SLICE_THREAD.store(pointer, Ordering::Release);
+        SLICE_TICK[cpu].store(crate::nano::interrupts::processor_tick_count(), Ordering::Relaxed);
+        SLICE_THREAD[cpu].store(pointer, Ordering::Release);
     };
     let status = if thread.blocked_in_kernel() {
         mark_slice();
@@ -1214,7 +1436,10 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
         mark_slice();
         executor(context, teb)
     };
-    SLICE_THREAD.store(0, Ordering::Release);
+    SLICE_THREAD[cpu].store(0, Ordering::Release);
+    // Um término pedido por outra CPU durante o intervalo: a espera que ele
+    // concluiria conclui agora, pela dona.
+    apply_deferred_termination(thread);
     // A espera adiada que o serviço instalou liga os blocos agora, com o
     // serviço concluído e a thread ainda corrente (a sondagem de uma acordada
     // roda no contexto dela): concluída ali mesmo, a thread volta à fila.
@@ -1228,15 +1453,28 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
             thread.restore_wait(wait);
         }
     }
-    let (dead, waiting, suspended, registered) = thread.with(|thread| (thread.dead, thread.waiting, thread.suspend_count != 0, thread.wait.as_ref().is_some_and(|wait| wait.registered.is_some())));
-    let new_state = if dead {
-        thread_dispatch::state::TERMINATED
-    } else if waiting || suspended {
-        thread_dispatch::state::WAITING
-    } else {
-        thread_dispatch::state::READY
-    };
-    thread_dispatch::end_execution(pointer, new_state)?;
+    // O estado novo sai do que a thread pede (morta, esperando, suspensa)
+    // lido sob o PrcbLock, no mesmo trecho em que ela deixa de estar Running:
+    // uma retomada ou uma conclusão de outra CPU antes disso é vista aqui, e
+    // uma depois encontra a thread fora da CPU e a põe na fila.
+    let mut observed = (false, false, false, false);
+    thread_dispatch::end_execution_with(pointer, || {
+        observed = thread.with(|thread| (thread.dead, thread.waiting, thread.suspend_count != 0, thread.wait.as_ref().is_some_and(|wait| wait.registered.is_some())));
+        let (dead, waiting, suspended, _) = observed;
+        if dead {
+            thread_dispatch::state::TERMINATED
+        } else if waiting || suspended {
+            thread_dispatch::state::WAITING
+        } else {
+            thread_dispatch::state::READY
+        }
+    })?;
+    let (dead, waiting, suspended, registered) = observed;
+    // O término pedido entre a primeira conferência e a decisão: a espera
+    // conclui agora, com a thread já fora da CPU, e uma viva volta à fila.
+    if thread.with(|thread| thread.deferred_termination.is_some()) && apply_deferred_termination(thread) && !dead {
+        thread_dispatch::make_ready(pointer)?;
+    }
     // O KiCommitThreadWait, com a thread já Waiting e fora da CPU (como o
     // `scheduler::run_step` das threads de kernel): a espera registrada passa
     // a WaitCommitted e o sinal seguinte a apronta. A que já saiu antes
@@ -1262,7 +1500,10 @@ fn resume_terminated(executor: fn(u64, u64) -> u32, caller: u64) -> Result<(), K
         if !thread.with(|thread| thread.dead && matches!(thread.kernel, KernelState::Blocked { status: Some(_) })) {
             continue;
         }
-        *CURRENT.lock() = Some(thread.clone());
+        if thread_dispatch::owned_elsewhere(thread.pointer()).is_some() {
+            continue;
+        }
+        *CURRENT[cpu()].lock() = Some(thread.clone());
         process::set_current_thread(thread.pointer());
         let outcome = execute(&thread, executor);
         process::set_current_thread(caller);
@@ -1341,18 +1582,36 @@ pub fn begin_exit(process: u64, status: u32) -> bool {
             request_termination(&thread, status);
             continue;
         }
-        if let Some(wait) = thread.take_wait() {
-            finish_wait(&thread, wait, THREAD_IS_TERMINATING);
+        // A thread que outra CPU executa (ou sonda) só morre aqui: a dona
+        // conclui a espera dela e a tira da fila no fim do intervalo.
+        let borrow = thread_dispatch::try_borrow(thread.pointer());
+        if borrow.is_some() {
+            if let Some(wait) = thread.take_wait() {
+                finish_wait(&thread, wait, THREAD_IS_TERMINATING);
+            }
         }
         let (pointer, registered) = thread.with(|thread| {
             thread.dead = true;
             if thread.exit_status == PENDING {
                 thread.exit_status = status;
             }
+            if borrow.is_none() {
+                thread.deferred_termination = Some(true);
+            }
             (thread.thread_pointer, thread.scheduling_registered)
         });
-        if registered && pointer != 0 && thread_dispatch::thread_state(pointer) != thread_dispatch::state::RUNNING {
-            let _ = thread_dispatch::suspend(pointer, thread_dispatch::state::TERMINATED);
+        match borrow {
+            Some(borrow) => {
+                if registered && pointer != 0 && thread_dispatch::thread_state(pointer) != thread_dispatch::state::RUNNING {
+                    let _ = thread_dispatch::suspend(pointer, thread_dispatch::state::TERMINATED);
+                }
+                thread_dispatch::release_borrow(borrow);
+            }
+            None => {
+                if let Some(owner) = thread_dispatch::owned_elsewhere(pointer) {
+                    thread_dispatch::kick_processor(owner);
+                }
+            }
         }
     }
     true
@@ -1363,7 +1622,7 @@ pub fn begin_exit(process: u64, status: u32) -> bool {
 /// intervalo em curso nesta CPU, se houver, não é de uma delas.
 pub fn exit_ready(process: u64) -> bool {
     let in_slice = crate::hal::amd64::usermode::in_service() && current().is_some_and(|thread| thread.with(|thread| thread.process_pointer) == process);
-    !in_slice && !of_process(process).iter().any(|thread| thread.blocked_in_kernel() || thread.termination_pending())
+    !in_slice && !of_process(process).iter().any(|thread| thread.blocked_in_kernel() || thread.termination_pending() || thread_dispatch::owned_elsewhere(thread.pointer()).is_some())
 }
 
 /// O aviso de um término que segura o fim do processo: onde a thread está,
@@ -1743,6 +2002,13 @@ fn leave_cpu_in_callback(thread: &UserThread, stacks: &CalloutStacks, record_irq
                 None => thread.restore_wait(wait),
             }
         }
+        // Os pumps são do BSP; num AP a espera só entrega o que é da própria
+        // thread e gira.
+        if cpu() != 0 {
+            drain_own_kernel_apcs();
+            crate::hal::cpu::pause();
+            continue;
+        }
         dispatcher::pump_kernel();
         let pumps = *PUMPS.lock();
         for routine in pumps.into_iter().flatten() {
@@ -2063,6 +2329,15 @@ pub fn release_process(process: u64) {
     let in_slice = crate::hal::amd64::usermode::block().context.get();
     let owned: Vec<Arc<UserThread>> = all().into_iter().filter(|thread| thread.with(|thread| thread.process_pointer) == process).collect();
     for thread in owned {
+        // A thread que outra CPU executa, reservou ou sonda só morre: ela é
+        // recolhida numa chamada seguinte, já fora da CPU.
+        if thread_dispatch::owned_elsewhere(thread.pointer()).is_some() {
+            thread.with(|thread| {
+                thread.dead = true;
+                thread.deferred_termination = Some(true);
+            });
+            continue;
+        }
         if let Some(wait) = thread.take_wait() {
             finish_wait(&thread, wait, THREAD_IS_TERMINATING);
         }
@@ -2548,13 +2823,31 @@ fn adjust_suspend_count(thread: &UserThread, delta: i32) -> u32 {
     if delta < 0 {
         dispatcher::note_wake();
     }
-    let (previous, pointer, registered, suspended, waiting) = thread.with(|thread| {
-        let previous = thread.suspend_count;
-        thread.suspend_count = (previous as i32 + delta).max(0) as u32;
-        (previous, thread.thread_pointer, thread.scheduling_registered, thread.suspend_count != 0, thread.waiting)
+    let pointer = thread.pointer();
+    // A contagem muda e a decisão sai dela sob o PrcbLock: a thread que outra
+    // CPU executa ou reservou decide no fim do intervalo, no mesmo trecho
+    // (`execute`), e nenhuma retomada se perde entre a leitura e a fila.
+    let (previous, owner) = thread_dispatch::with_queues(|queues| {
+        let (previous, registered, suspended, waiting) = thread.with(|thread| {
+            let previous = thread.suspend_count;
+            thread.suspend_count = (previous as i32 + delta).max(0) as u32;
+            (previous, thread.scheduling_registered, thread.suspend_count != 0, thread.waiting)
+        });
+        if !registered || pointer == 0 {
+            return (previous, None);
+        }
+        if let Some(owner) = queues.running_elsewhere(pointer) {
+            return (previous, Some(owner));
+        }
+        if queues.state(pointer) != thread_dispatch::state::RUNNING {
+            let _ = if suspended || waiting { queues.suspend(pointer, thread_dispatch::state::WAITING) } else { queues.make_ready(pointer) };
+        }
+        (previous, None)
     });
-    if registered && thread_dispatch::thread_state(pointer) != thread_dispatch::state::RUNNING {
-        let _ = if suspended || waiting { thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING) } else { thread_dispatch::make_ready(pointer) };
+    // A suspensão de uma thread em execução em outra CPU vale quando ela
+    // deixa a CPU: o IPI encerra o intervalo no anel 3.
+    if let (Some(owner), true) = (owner, delta > 0) {
+        thread_dispatch::kick_processor(owner);
     }
     previous
 }
@@ -2647,6 +2940,21 @@ fn terminate_thread(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelE
         request_termination(thread, status);
         return Ok(());
     }
+    // Uma thread que outra CPU executa termina no próprio contexto, como no
+    // 19041 toda thread termina (o KeRequestTerminationThread 0x35bd28): o
+    // pedido de término e o IPI à dona. As demais terminam aqui, emprestadas
+    // durante todo o término.
+    let Some(borrow) = thread_dispatch::try_borrow(thread.pointer()) else {
+        request_termination(thread, status);
+        return Ok(());
+    };
+    let result = terminate_borrowed(thread, status);
+    thread_dispatch::release_borrow(borrow);
+    result
+}
+
+/// O corpo de [`terminate_thread`] com a thread fora de qualquer outra CPU.
+fn terminate_borrowed(thread: &Arc<UserThread>, status: u32) -> Result<(), KernelError> {
     if let Some(wait) = thread.take_wait() {
         finish_wait(thread, wait, THREAD_IS_TERMINATING);
     }
@@ -2804,12 +3112,24 @@ fn request_termination(thread: &Arc<UserThread>, status: u32) {
     let tcb = kernel_thread(pointer);
     tcb.thread_flags.atomic().fetch_or(Kthread::TERMINATION_APC_REQUEST_MASK as i32, Ordering::SeqCst);
     thread_lock::with_lock(pointer, || tcb.apc_state.set_user_apc_pending(1));
-    if let Some(wait) = thread.take_wait() {
-        if wait.kernel {
-            thread.restore_wait(wait);
-        } else {
-            finish_wait(thread, wait, THREAD_IS_TERMINATING);
+    // A espera de uma thread que outra CPU executa (ou sonda) conclui pela
+    // dona, no fim do intervalo, ou pela sondagem seguinte.
+    match thread_dispatch::try_borrow(pointer) {
+        Some(borrow) => {
+            if let Some(wait) = thread.take_wait() {
+                if wait.kernel {
+                    thread.restore_wait(wait);
+                } else {
+                    finish_wait(thread, wait, THREAD_IS_TERMINATING);
+                }
+            }
+            thread_dispatch::release_borrow(borrow);
         }
+        None => thread.with(|thread| {
+            if thread.deferred_termination.is_none() {
+                thread.deferred_termination = Some(false);
+            }
+        }),
     }
     // A espera registrada de UserMode de um serviço bloqueado sai com
     // STATUS_USER_APC, como a sondada pelo KiCheckAlertability.
@@ -2823,6 +3143,11 @@ fn request_termination(thread: &Arc<UserThread>, status: u32) {
     let suspended = thread.with(|thread| thread.suspend_count);
     if suspended != 0 {
         adjust_suspend_count(thread, -(suspended as i32));
+    }
+    // A dona em outra CPU: no anel 3 o IPI encerra o intervalo, e num
+    // serviço a saída dele vê o término.
+    if let Some(owner) = thread_dispatch::owned_elsewhere(pointer) {
+        thread_dispatch::kick_processor(owner);
     }
 }
 
@@ -2942,10 +3267,10 @@ fn poll_due() -> bool {
     dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) || crate::nano::interrupts::tick_count() != POLLED_TICK.load(Ordering::Relaxed)
 }
 
-/// O intervalo despachado em curso ([`execute`]): a KTHREAD e o tique do
-/// começo dele.
-static SLICE_THREAD: AtomicU64 = AtomicU64::new(0);
-static SLICE_TICK: AtomicU32 = AtomicU32::new(0);
+/// O intervalo despachado em curso em cada CPU ([`execute`]): a KTHREAD e o
+/// tique do timer da CPU no começo dele.
+static SLICE_THREAD: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static SLICE_TICK: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 /// A volta direta ligada sem a opção de boot (os autotestes dela).
 static FAST_EXIT_FORCED: AtomicBool = AtomicBool::new(false);
 
@@ -2980,7 +3305,8 @@ pub fn may_return_to_user() -> Result<(), usize> {
         return Err(why::DISABLED);
     }
     let pointer = process::get_current_thread();
-    if pointer == 0 || SLICE_THREAD.load(Ordering::Acquire) != pointer {
+    let cpu = cpu();
+    if pointer == 0 || SLICE_THREAD[cpu].load(Ordering::Acquire) != pointer {
         return Err(why::NOT_DISPATCHED);
     }
     let tcb = kernel_thread(pointer);
@@ -3010,14 +3336,20 @@ pub fn may_return_to_user() -> Result<(), usize> {
     if thread_dispatch::preemption_pending(pointer) {
         return Err(why::PREEMPT);
     }
-    if crate::nano::interrupts::tick_count() != SLICE_TICK.load(Ordering::Relaxed) {
+    if crate::nano::interrupts::processor_tick_count() != SLICE_TICK[cpu].load(Ordering::Relaxed) {
         return Err(why::TICK);
     }
-    if crate::ntos::ke::dpc::pending() != 0 || crate::nano::interrupts::has_pending_devices() {
-        return Err(why::INTERRUPT);
-    }
-    if dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) {
-        return Err(why::WAKE);
+    // As DPCs, as IRQs de dispositivo e as sondagens são do BSP: num AP o
+    // intervalo segue, e o BSP ocioso é acordado para sondar.
+    if cpu == 0 {
+        if crate::ntos::ke::dpc::pending() != 0 || crate::nano::interrupts::has_pending_devices() {
+            return Err(why::INTERRUPT);
+        }
+        if dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) {
+            return Err(why::WAKE);
+        }
+    } else if dispatcher::wake_epoch() != POLLED_EPOCH.load(Ordering::Acquire) {
+        thread_dispatch::wake_processor(0);
     }
     if context_switch::require_loadable(process_pointer).ok() != Some(context_switch::loaded_root()) {
         return Err(why::STATE);

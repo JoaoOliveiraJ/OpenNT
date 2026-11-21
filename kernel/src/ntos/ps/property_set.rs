@@ -16,7 +16,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::ntos::inc::types::{Ejob, Eprocess, Ethread, Kpcr, Kprcb, NtStruct};
+use crate::ntos::inc::types::{Ejob, Eprocess, Ethread, Kprcb, NtStruct};
 use crate::ntos::ke::{irql, pcr};
 use crate::ntos::ob::{get_object_type, object_types};
 use crate::ntos::ps::process;
@@ -104,7 +104,7 @@ fn below_dispatch() -> bool {
 fn current_idle_thread() -> u64 {
     // SAFETY: a KPCR está mapeada desde `pcr::init` e CurrentPrcb aponta para
     // a KPRCB embutida nela.
-    unsafe { Kprcb::at(Kpcr::at(pcr::get_pcr_address()).current_prcb.get()) }.idle_thread.get()
+    unsafe { Kprcb::at(pcr::current().current_prcb.get()) }.idle_thread.get()
 }
 
 /// PspValidateThread: a thread ociosa e a thread corrente dentro de uma DPC

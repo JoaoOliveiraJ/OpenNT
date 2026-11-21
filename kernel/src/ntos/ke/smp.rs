@@ -94,6 +94,13 @@ static STATE: SpinLock<Smp> = SpinLock::new(Smp {
 static SCHEDULING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Os slots cujo AP não conseguiu armar o anel 3.
 static ARM_FAILED_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Os APs armados despacham threads de usuário no laço ocioso
+/// ([`enable_user_dispatch`]).
+static USER_DISPATCH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// O identificador do APIC de cada processador, pelo número (o BSP é o 0;
+/// o de número N é o AP da N-ésima posição entre os online): o destino do
+/// IPI de reescalonamento, sem a trava do estado.
+static PROCESSOR_APIC: [core::sync::atomic::AtomicU32; map::MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; map::MAX_CPUS];
 
 /// Prazo para o ICR voltar a ocioso (DeliveryStatus) na partida dos APs,
 /// medido em tempo, em hardware e sob hipervisor. Os IPIs do sistema em
@@ -524,6 +531,13 @@ pub fn init() -> Result<(), KernelError> {
     for number in online.len() as u32 + 1..=identifiers.len() as u32 {
         pcr::release_processor(number);
     }
+    PROCESSOR_APIC[0].store(bootstrap, core::sync::atomic::Ordering::Release);
+    for (index, &slot) in online.iter().enumerate() {
+        if index + 1 < map::MAX_CPUS {
+            PROCESSOR_APIC[index + 1].store(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), core::sync::atomic::Ordering::Release);
+        }
+    }
+    super::thread_dispatch::set_reschedule_sender(send_reschedule);
     // A pilha de um AP que recebeu SIPI fica com ele, mesmo sem resposta (um
     // AP atrasado ainda pode carregá-la); as dos slots que nem partiram
     // voltam ao Mm.
@@ -670,6 +684,44 @@ pub fn scheduling_resources(slot: usize) -> Option<(u64, u64, u64)> {
     STATE.lock().armed.iter().find(|armed| armed.slot == slot).map(|armed| (armed.fallback.initial, armed.double_fault.initial, armed.idt_frame))
 }
 
+/// O IPI de reescalonamento (vetor 0xE1, o do HalpInterruptSendIpi do
+/// KiDeferredReadySingleThread) ao processador de número `number`: acorda-o
+/// do HLT do laço ocioso; no anel 3 encerra o intervalo em curso. Não espera
+/// confirmação (só a entrega pelo ICR): fica pendente no IRR enquanto o alvo
+/// está com as interrupções desligadas.
+pub fn send_reschedule(number: usize) {
+    use core::sync::atomic::Ordering;
+    let Some(identifier) = PROCESSOR_APIC.get(number).map(|cell| cell.load(Ordering::Acquire)).filter(|&identifier| identifier != u32::MAX) else { return };
+    // As duas escritas do ICR sem uma interrupção no meio que mande outro IPI.
+    let flags = cpu::save_and_disable_interrupts();
+    send_processor_interrupt(identifier, 0x4000 | crate::nano::interrupts::VECTOR_RESCHEDULE as u32);
+    cpu::restore_interrupts(flags);
+    crate::ntos::ps::dispatch_perf::RESCHEDULE_IPIS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Daqui em diante os APs armados despacham threads de usuário no laço
+/// ocioso ([`processor_loop`]), junto com o BSP.
+pub fn enable_user_dispatch() {
+    USER_DISPATCH.store(true, core::sync::atomic::Ordering::Release);
+    for index in 0..ap_slot_count() {
+        if ap_slot(index).is_some_and(is_scheduling) {
+            send_reschedule(index + 1);
+        }
+    }
+}
+
+/// Os APs param de despachar threads de usuário (os autotestes que ligaram
+/// o despacho sem a opção de boot): cada um termina o intervalo em curso e
+/// volta a só atender trabalhos.
+pub fn disable_user_dispatch() {
+    USER_DISPATCH.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Os APs armados despacham threads de usuário.
+pub fn user_dispatch_enabled() -> bool {
+    USER_DISPATCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// [`start_scheduling`] em todo AP online, com o resultado na serial.
 pub fn start_scheduling_all() {
     for index in 0..ap_slot_count() {
@@ -709,13 +761,24 @@ extern "win64" fn ap_scheduler_entry(slot: u64, fallback: u64, double_fault: u64
 
 /// O laço ocioso de um AP armado, como o KiIdleLoop do 19041 (0x402020):
 /// atende os trabalhos da mailbox (a rotina publicada por último, os quatro
-/// argumentos, o resultado e a conclusão, como o laço do trampolim) e, sem
-/// trabalho, dorme no HLT com as interrupções ligadas (`sti; hlt`, o
-/// HalProcessorIdle); o timer local, uma NMI ou o IPI de reescalonamento o
-/// acordam. Cada trabalho começa com o mesmo `mov cr3, cr3` do laço do
-/// trampolim (o BSP pode remapear imagens com os APs ociosos).
+/// argumentos, o resultado e a conclusão, como o laço do trampolim); com o
+/// despacho de usuário ligado ([`enable_user_dispatch`]), dá intervalos às
+/// threads de usuário prontas (`threads::dispatch_on_processor`, o
+/// KiSelectNextThread e o SwapContext do laço ocioso) e, sem trabalho nem
+/// thread pronta, dorme no HLT com as interrupções ligadas (`sti; hlt`, o
+/// HalProcessorIdle) com o bit dela nas ociosas (o KiSetProcessorIdle):
+/// quem apronta uma thread manda o IPI de reescalonamento, e o timer local
+/// e uma NMI também o acordam. Cada trabalho começa com o mesmo
+/// `mov cr3, cr3` do laço do trampolim (o BSP pode remapear imagens com os
+/// APs ociosos).
 fn processor_loop(slot: usize) -> ! {
+    use crate::ntos::ke::thread_dispatch;
     let record = slot_address(slot);
+    let number = super::context_switch::processor();
+    let mut dispatcher = false;
+    // A contagem das entradas na fila da última escolha que não achou nada:
+    // até ela andar, o AP não escolhe de novo.
+    let mut empty_at: Option<u64> = None;
     loop {
         let routine = physical::read64(record + SLOT_JOB_ROUTINE);
         if routine != 0 {
@@ -729,12 +792,36 @@ fn processor_loop(slot: usize) -> ! {
             physical::write32(record + SLOT_JOB_COMPLETED, 1);
             continue;
         }
+        if !dispatcher && user_dispatch_enabled() {
+            dispatcher = true;
+            thread_dispatch::add_dispatcher(number);
+        }
+        let generation = thread_dispatch::ready_generation();
+        let dispatching = dispatcher && user_dispatch_enabled();
+        if dispatching && empty_at != Some(generation) {
+            match crate::ntos::ps::user::threads::dispatch_on_processor() {
+                Ok(crate::ntos::ps::user::threads::Dispatched::Ran { .. }) => {
+                    empty_at = None;
+                    continue;
+                }
+                Ok(crate::ntos::ps::user::threads::Dispatched::Idle) => empty_at = Some(generation),
+                Err(error) => {
+                    debug_print!("[smp] CPU {}: despacho de usuario falhou: {}", number, error);
+                    empty_at = Some(generation);
+                }
+            }
+        }
+        thread_dispatch::enter_idle();
         let flags = cpu::save_and_disable_interrupts();
-        if physical::read64(record + SLOT_JOB_ROUTINE) == 0 {
+        let quiet = physical::read64(record + SLOT_JOB_ROUTINE) == 0 && (!dispatching || thread_dispatch::ready_generation() == generation) && (dispatcher || !user_dispatch_enabled());
+        if quiet {
+            let started = cpu::rdtsc();
             cpu::processor_idle();
+            crate::ntos::ps::dispatch_perf::PROCESSOR_HALT.add_since(started);
         } else {
             cpu::restore_interrupts(flags);
         }
+        thread_dispatch::leave_idle();
     }
 }
 
@@ -825,13 +912,41 @@ pub fn send_nmi_to_application_processors() -> u32 {
     sent
 }
 
-/// NMI direcionada aos processadores online e espera da confirmação da
-/// geração de invalidação; `flush_caches` pede WBINVD também. A espera não
-/// tem prazo ([`wait_on_targets`]), como a do PacketBarrier no flush de TLB
-/// do 19041: um alvo que demora mais que [`slow_interrupt_report_ms`] vai à
-/// serial e a espera segue.
+/// NMI direcionada aos outros processadores online (o BSP também, quando
+/// quem pede é um AP) e espera da confirmação da geração de invalidação;
+/// `flush_caches` pede WBINVD também. A espera não tem prazo
+/// ([`wait_on_targets`]), como a do PacketBarrier no flush de TLB do 19041:
+/// um alvo que demora mais que [`slow_interrupt_report_ms`] vai à serial e a
+/// espera segue.
 pub fn flush_remote_tlb(flush_caches: bool) -> Result<(), KernelError> {
-    shootdown(u64::MAX, flush_caches, false)
+    shootdown(u64::MAX, flush_caches)
+}
+
+/// O shootdown de uma raiz de usuário cuja PTE presente mudou (o KeFlushTb do
+/// 19041 com o espaço de endereçamento, KiFlushAddressSpaceTb 0x38faac): as
+/// outras CPUs com `root` carregada descartam as traduções dela antes de a
+/// mudança valer. As que não estão com ela já descartaram tudo ao carregar
+/// outra raiz (sem PCID nem páginas globais); o registro da raiz de cada CPU
+/// é publicado antes da carga do CR3 (`context_switch::load_root`), e quem
+/// chama já gravou a PTE: uma CPU que carrega a raiz depois disso percorre a
+/// tabela nova.
+pub fn flush_root(root: u64) {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let targets = super::context_switch::processors_with_root(root) & !own_processor_bit();
+    if targets != 0 {
+        let started = cpu::rdtsc();
+        let _ = shootdown(targets, false);
+        crate::ntos::ps::dispatch_perf::SHOOTDOWNS.add_since(started);
+    }
+}
+
+/// O shootdown de uma PTE presente da metade de sistema (o KeFlushSingleTb
+/// com AllProcessors do 19041): todas as outras CPUs online.
+pub fn flush_kernel_page() {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    let started = cpu::rdtsc();
+    let _ = shootdown(u64::MAX, false);
+    crate::ntos::ps::dispatch_perf::KERNEL_SHOOTDOWNS.add_since(started);
 }
 
 /// O bit do processador de número N é o do AP da N-ésima posição entre os
@@ -840,23 +955,28 @@ fn processor_bit(online_index: usize) -> u64 {
     1u64.checked_shl(online_index as u32 + 1).unwrap_or(0)
 }
 
-/// A NMI de shootdown aos APs online cujo bit (pelo número do processador)
-/// está em `targets`, e a espera das confirmações deles. Outro shootdown em
-/// curso é um erro, ou, com `wait_busy`, espera a vez: a confirmação vem pela
-/// NMI, que nem o IF nem o IRQL retêm, então quem está em curso termina.
-fn shootdown(targets: u64, flush_caches: bool, wait_busy: bool) -> Result<(), KernelError> {
+/// A confirmação do BSP na mailbox (a geração de invalidação que ele
+/// atendeu na NMI dele, `irq_common`; os APs confirmam no slot de cada um).
+const MAILBOX_BOOTSTRAP_ACK: u64 = 0x40;
+
+/// A NMI de shootdown aos processadores online cujo bit (pelo número do
+/// processador) está em `targets`, menos o corrente, e a espera das
+/// confirmações deles. Outro shootdown em curso espera a vez: a confirmação
+/// vem pela NMI, que nem o IF nem o IRQL retêm, então quem está em curso
+/// termina, mesmo com esta CPU como alvo dele enquanto espera.
+fn shootdown(targets: u64, flush_caches: bool) -> Result<(), KernelError> {
+    let own = own_processor_bit();
+    let targets = targets & !own;
+    let bootstrap = targets & 1 != 0;
     let selected: Vec<(usize, usize)> = loop {
         let mut state = STATE.lock();
         let selected: Vec<(usize, usize)> = state.online_slots.iter().copied().enumerate().filter(|&(index, _)| targets & processor_bit(index) != 0).collect();
-        if selected.is_empty() {
+        if selected.is_empty() && !bootstrap {
             return Ok(());
         }
         if !state.invalidation_active {
             state.invalidation_active = true;
             break selected;
-        }
-        if !wait_busy {
-            return Err(KernelError::new("nested TLB shootdown"));
         }
         drop(state);
         cpu::pause();
@@ -865,13 +985,24 @@ fn shootdown(targets: u64, flush_caches: bool, wait_busy: bool) -> Result<(), Ke
     let result = (|| {
         let generation = physical::read32(MAILBOX + 0x30).wrapping_add(1);
         physical::write32(MAILBOX + 0x34, flush_caches as u32);
+        // O BSP fora dos alvos já confirma a geração: uma NMI dele que não é
+        // de shootdown (a do depurador) não é tomada por uma.
+        if !bootstrap {
+            physical::write32(MAILBOX + MAILBOX_BOOTSTRAP_ACK, generation);
+        }
         physical::write32(MAILBOX + 0x30, generation);
+        if bootstrap && !send_processor_interrupt(bsp_apic_id_unlocked(), 0x4400) {
+            return Err(KernelError::new("TLB shootdown delivery failed"));
+        }
         for &(_, slot) in &selected {
             if !send_processor_interrupt(physical::read32(slot_address(slot) + SLOT_CONTROLLER_IDENTIFIER), 0x4400) {
                 return Err(KernelError::new("TLB shootdown delivery failed"));
             }
         }
-        let pending = || selected.iter().filter(|&&(_, slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, &(index, _)| mask | processor_bit(index));
+        let pending = || {
+            let aps = selected.iter().filter(|&&(_, slot)| physical::read32(slot_address(slot) + 0x3C) != generation).fold(0u64, |mask, &(index, _)| mask | processor_bit(index));
+            aps | (bootstrap && physical::read32(MAILBOX + MAILBOX_BOOTSTRAP_ACK) != generation) as u64
+        };
         wait_on_targets(slow_interrupt_report_ms(), "confirmacao do shootdown de TLB", pending);
         Ok(())
     })();
@@ -880,10 +1011,16 @@ fn shootdown(targets: u64, flush_caches: bool, wait_busy: bool) -> Result<(), Ke
     result
 }
 
-/// Interrompe os APs online de `targets` (pelo número do processador) e
-/// espera as confirmações; outro shootdown em curso espera a vez.
+/// O identificador do APIC do BSP, gravado no `init`.
+fn bsp_apic_id_unlocked() -> u32 {
+    PROCESSOR_APIC[0].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Interrompe os processadores online de `targets` (pelo número do
+/// processador) e espera as confirmações; outro shootdown em curso espera a
+/// vez.
 pub fn interrupt_processors(targets: u64) -> Result<(), KernelError> {
-    shootdown(targets, false, true)
+    shootdown(targets, false)
 }
 
 /// A geração de invalidação corrente e a última que o AP da posição
@@ -908,9 +1045,8 @@ pub fn write_buffer_targets(active: u64, own: u64) -> u64 {
 /// Interromper a CPU serializa o que ela já escreveu: depois da volta, toda
 /// escrita que uma thread do processo fez em outro processador já é visível
 /// aqui (a trava assimétrica do CDDISync::CFreeThreadedLock do d3d11 depende
-/// disso). No OpenNT o IPI é a NMI de shootdown dos APs (o alvo também
-/// recarrega o CR3, o que não muda o efeito). O BSP não tem essa NMI; no M0
-/// só o BSP executa o anel 3, então o chamador do serviço é ele mesmo.
+/// disso). No OpenNT o IPI é a NMI de shootdown (o alvo também recarrega o
+/// CR3, o que não muda o efeito), inclusive ao BSP quando quem chama é um AP.
 pub fn flush_process_write_buffers(all_processors: bool) -> Result<(), KernelError> {
     use crate::ntos::inc::types::{Kprocess, Kthread, NtStruct};
     use crate::ntos::ke::irql;

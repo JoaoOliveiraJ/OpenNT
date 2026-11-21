@@ -167,6 +167,10 @@ static WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Anota uma mudança que pode concluir a espera sondada de outra thread.
 pub fn note_wake() {
     WAKE_EPOCH.fetch_add(1, Ordering::Release);
+    // Só o BSP sonda as esperas: o que um AP desperta acorda o BSP ocioso.
+    if super::thread_dispatch::concurrent() && context_switch::processor() != 0 {
+        super::thread_dispatch::wake_processor(0);
+    }
 }
 
 /// A época de despertar agora.
@@ -533,6 +537,14 @@ fn pump_scheduler() {
 /// pilha dela: a thread cede a vez (em DISPATCH_LEVEL ou acima, só os
 /// timers e as DPCs andam).
 pub fn pump_kernel() {
+    // As IRQs, os timers, as DPCs e o escalonador são do BSP: quem espera
+    // girando num AP só entrega as conclusões e as APCs de kernel da própria
+    // thread (o que só o contexto dela termina) e gira.
+    if context_switch::processor() != 0 {
+        crate::ntos::ps::user::threads::drain_own_kernel_apcs();
+        crate::hal::cpu::pause();
+        return;
+    }
     if context_switch::in_kernel_thread() {
         if context_switch::kernel_thread_can_block() {
             context_switch::yield_kernel_thread(false);
@@ -556,6 +568,9 @@ pub fn pump_kernel() {
 /// tick aninhado ali rodaria as threads de kernel a cada 2 ms fora da
 /// prioridade delas, contadas como despacho de usuário.
 pub fn pump_kernel_work() {
+    if context_switch::processor() != 0 {
+        return;
+    }
     super::interrupt_object::service_during_wait();
     timer::check_timers();
     let _ = dpc::run_queue();

@@ -116,6 +116,22 @@ fn owner_identity() -> u64 {
     current_processor() as u64 + 1
 }
 
+/// Uma identidade de dono para o diagnóstico: a thread (o CLIENT_ID da
+/// ETHREAD) ou o processador.
+fn describe_identity(identity: u64) -> alloc::string::String {
+    use crate::ntos::inc::field::NtStruct;
+    if identity == 0 {
+        return alloc::string::String::from("nenhum");
+    }
+    if identity < 0x1_0000 {
+        return alloc::format!("cpu{}", identity - 1);
+    }
+    // SAFETY: a identidade de um dono que é thread é a KTHREAD dela, viva
+    // enquanto possui o recurso (só leitura, para o diagnóstico).
+    let cid = &unsafe { crate::ntos::inc::types::Ethread::at(identity) }.cid;
+    alloc::format!("{:#x}({}:{})", identity, cid.unique_process.get(), cid.unique_thread.get())
+}
+
 pub struct SpinLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -252,6 +268,36 @@ impl SharedLock {
         }
     }
 
+    /// Uma espera longa por este recurso vai à serial uma vez, com o estado,
+    /// o dono exclusivo e os donos (as identidades: a KTHREAD, ou o número do
+    /// processador mais 1), e quem espera: o diagnóstico de um impasse.
+    fn report_long_wait(&self, started: u64, reported: &mut bool, exclusive: bool) {
+        if *reported {
+            return;
+        }
+        let frequency = crate::ntos::ke::clock::tsc_frequency_hz();
+        if frequency == 0 || cpu::rdtsc().wrapping_sub(started) < frequency.saturating_mul(10) {
+            return;
+        }
+        *reported = true;
+        let mut owners = alloc::string::String::new();
+        for slot in &self.owners {
+            let identity = slot.identity.load(Ordering::Acquire);
+            if identity != 0 {
+                owners.push_str(&alloc::format!(" {}x{}", describe_identity(identity), slot.depth.load(Ordering::Relaxed)));
+            }
+        }
+        crate::debug_print!(
+            "[sync] SharedLock {:#x}: {} esperado ha 10 s por {} (estado {:#x}, dono exclusivo {}, donos{})",
+            self as *const Self as u64,
+            if exclusive { "exclusivo" } else { "compartilhado" },
+            describe_identity(owner_identity()),
+            self.state.load(Ordering::Relaxed),
+            describe_identity(self.owner.load(Ordering::Relaxed)),
+            owners
+        );
+    }
+
     /// ExAcquireResourceSharedLite com espera.
     pub fn acquire_shared(&self) -> SharedLockGuard<'_> {
         let identity = owner_identity();
@@ -259,12 +305,14 @@ impl SharedLock {
             self.owners[slot].depth.fetch_add(1, Ordering::Relaxed);
             return SharedLockGuard { lock: self, slot, release: Release::Nested, counted: count(&SHARED_COUNTER, 1) };
         }
+        let (started, mut reported) = (cpu::rdtsc(), false);
         loop {
             let state = self.state.load(Ordering::Relaxed);
             if state & (EXCLUSIVE_OWNED | EXCLUSIVE_WAITERS) == 0 && self.state.compare_exchange_weak(state, state + 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
             }
             contention_yield();
+            self.report_long_wait(started, &mut reported, false);
         }
         let slot = self.claim_slot(identity);
         SharedLockGuard { lock: self, slot, release: Release::Shared, counted: count(&SHARED_COUNTER, 1) }
@@ -279,12 +327,14 @@ impl SharedLock {
             return SharedLockGuard { lock: self, slot, release: Release::Nested, counted: count(&SHARED_COUNTER, 1) };
         }
         self.state.fetch_add(EXCLUSIVE_WAITER, Ordering::Relaxed);
+        let (started, mut reported) = (cpu::rdtsc(), false);
         loop {
             let state = self.state.load(Ordering::Relaxed);
             if state & (EXCLUSIVE_OWNED | SHARED_OWNERS) == 0 && self.state.compare_exchange_weak(state, (state - EXCLUSIVE_WAITER) | EXCLUSIVE_OWNED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 break;
             }
             contention_yield();
+            self.report_long_wait(started, &mut reported, true);
         }
         self.owner.store(identity, Ordering::Relaxed);
         let slot = self.claim_slot(identity);

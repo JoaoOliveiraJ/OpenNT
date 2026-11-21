@@ -517,7 +517,7 @@ pub fn tick(minimum_priority: i32) {
     }
     while steps < budget || user_slices(slices) {
         let selected = refresh_waiting_threads().and_then(|_| thread_dispatch::peek());
-        let (thread, owner) = match selected {
+        let (mut thread, mut owner) = match selected {
             Ok(Some(selected)) => selected,
             // O 19041 apronta quem espera dentro do sinal (KiUnwaitThread ->
             // KiReadyThread, 0x247fb0). Uma espera de usuário sondada que o
@@ -557,15 +557,32 @@ pub fn tick(minimum_priority: i32) {
         repolled = false;
         if owner.runtime & thread_dispatch::USER_RUNTIME != 0 {
             if !user_slices(slices) {
-                break;
-            }
-            slices += 1;
-            match user_threads::dispatch_one() {
-                Ok(Dispatched::Ran { .. }) => continue,
-                Ok(Dispatched::Idle) => break,
-                Err(error) => {
-                    debug_print!("[sched] despacho de usuario falhou: {}", error);
+                // Sem intervalo de usuário possível aqui (dentro de um serviço,
+                // com uma trava retida) e com as threads de usuário nas
+                // outras CPUs: a de kernel mais prioritária roda, como o
+                // KiSwapThread escolhe entre as que esta CPU pode rodar. É
+                // ela que pode estar com o recurso que este contexto espera.
+                if !thread_dispatch::concurrent() {
                     break;
+                }
+                thread_dispatch::unreserve(thread);
+                match thread_dispatch::peek_kernel() {
+                    Ok(Some(selected)) if selected.1.runtime & thread_dispatch::USER_RUNTIME == 0 => (thread, owner) = selected,
+                    Ok(Some((other, _))) => {
+                        thread_dispatch::unreserve(other);
+                        break;
+                    }
+                    _ => break,
+                }
+            } else {
+                slices += 1;
+                match user_threads::dispatch_one() {
+                    Ok(Dispatched::Ran { .. }) => continue,
+                    Ok(Dispatched::Idle) => break,
+                    Err(error) => {
+                        debug_print!("[sched] despacho de usuario falhou: {}", error);
+                        break;
+                    }
                 }
             }
         }
@@ -618,6 +635,10 @@ pub fn idle() {
     if thread_dispatch::has_ready_threads() {
         return;
     }
+    // O bit do BSP nas ociosas antes da última conferência: um AP que
+    // apronta uma thread ou enfileira uma DPC depois dela o acorda pelo IPI
+    // de reescalonamento.
+    thread_dispatch::enter_idle();
     // Só em PASSIVE_LEVEL: com o CR8 acima, o tique (vetor 0x40) e as IRQs
     // do 8259 ficariam retidos no LAPIC e o HLT não voltaria.
     let flags = crate::hal::cpu::save_and_disable_interrupts();
@@ -633,6 +654,7 @@ pub fn idle() {
     } else {
         crate::hal::cpu::restore_interrupts(flags);
     }
+    thread_dispatch::leave_idle();
 }
 
 /// No contexto síncrono de boot, o próprio chamador aguarda as concorrentes
@@ -675,6 +697,13 @@ fn contention_yield() {
     if crate::ntos::ke::irql::get_irql() >= crate::ntos::ke::irql::DISPATCH_LEVEL || crate::rtl::sync::spin_locks_held() != 0 || crate::ntos::ke::context_switch::processor() != 0 {
         core::hint::spin_loop();
         return;
+    }
+    // Com as threads de usuário em outras CPUs, o dono pode ser uma delas,
+    // presa numa espera que só as interrupções e as DPCs do BSP concluem (o
+    // fim de uma leitura do disco com a posse retida, que ela espera girando):
+    // o BSP as atende aqui, como a espera de um driver as atende.
+    if thread_dispatch::concurrent() && !context_switch::in_kernel_thread() {
+        crate::ntos::ke::dispatcher::pump_kernel_work();
     }
     tick(-1);
 }

@@ -4,7 +4,7 @@ use super::process;
 use crate::ntos::ke::pcr;
 use crate::rtl::KernelError;
 use crate::ntos::inc::field::NtStruct;
-use crate::ntos::inc::types::{Ethread, Kpcr};
+use crate::ntos::inc::types::Ethread;
 
 /// Prcb.CurrentThread lido da KPCR (o gs:[0x188] visto pelos drivers).
 fn current_thread() -> Result<u64, KernelError> {
@@ -12,8 +12,7 @@ fn current_thread() -> Result<u64, KernelError> {
     if base == 0 {
         return Err(KernelError::new("PreviousMode requires an initialized KPCR"));
     }
-    // SAFETY: a KPCR inicializada do processador corrente.
-    Ok(unsafe { Kpcr::at(base) }.prcb.current_thread.get())
+    Ok(pcr::current().prcb.current_thread.get())
 }
 
 /// ExGetPreviousMode.
