@@ -199,6 +199,15 @@ pub fn init() {
 /// publicada pela HAL e o Ldr real do processo, que é o corrente (anexado).
 /// Um status de exceção sai no bloco de `crash_report` em vez deste.
 pub(crate) fn post_mortem(process_pointer: u64) {
+    // Quem chama anexa ao processo. Com --smp=4 a leitura da pilha abaixo já
+    // caiu no verificador de posse com outro processo corrente: a linha diz
+    // se a thread corrente ou o KAPC_STATE dela não eram os esperados.
+    let (thread, current) = (crate::ntos::ps::process::get_current_thread(), crate::ntos::ps::process::get_current_process());
+    if current != process_pointer {
+        // SAFETY: a thread corrente.
+        let index = unsafe { crate::ntos::inc::types::Ethread::at(thread) }.tcb.apc_state_index.get();
+        crate::debug_print!("[exit-stack] post-mortem de {:#x} fora do contexto dele: processo corrente {:#x}, thread {:#x}, ApcStateIndex {}, CPU {}", process_pointer, current, thread, index, crate::ntos::ke::context_switch::processor());
+    }
     // A pilha da thread que encerrou o processo.
     let termination = threads::of_process(process_pointer).iter().map(|thread| thread.with(|thread| thread.termination_rsp)).find(|&rsp| rsp != 0).unwrap_or(0);
     let images: Vec<(u64, u64, String)> = Space::of(process_pointer).images().iter().map(|image| (image.base(), image.size(), image.name().unwrap_or_default())).collect();
