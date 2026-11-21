@@ -467,7 +467,7 @@ fn dma_attempt(bmide: u16, table: DmaBuffer, lba: u64, count: u32, drive: u8, wr
         if expired {
             break Err(Failure::timeout("timeout do DMA", status, Some(bus_master)));
         }
-        cpu::pause();
+        poll_gap();
     };
     port::write8(bmide + BM_COMMAND, direction);
     port::read8(ATA_STATUS); // reconhece a interrupção do dispositivo
@@ -483,10 +483,42 @@ fn validate_range(lba: u64, count: u64, drive: u8) -> Result<(), KernelError> {
 }
 
 /// Os 400 ns que o dispositivo tem para publicar o status depois de uma
-/// seleção ou de um comando: quatro leituras do status alternativo.
+/// seleção ou de um comando: pelo TSC, quando calibrado; antes dele, quatro
+/// leituras do status alternativo (a espera do padrão ATA). Sob um
+/// hipervisor cada leitura de porta é uma saída da máquina virtual de
+/// alguns microssegundos, e o padrão só pede o tempo.
 fn settle() {
-    for _ in 0..4 {
-        port::read8(ATA_ALT_STATUS);
+    if !spin_ns(400) {
+        for _ in 0..4 {
+            port::read8(ATA_ALT_STATUS);
+        }
+    }
+}
+
+/// Gira `nanoseconds` pelo TSC, sem acesso a porta; `false` antes da
+/// calibração do TSC.
+fn spin_ns(nanoseconds: u64) -> bool {
+    let hertz = clock::tsc_frequency_hz();
+    if hertz == 0 {
+        return false;
+    }
+    let until = cpu::rdtsc().wrapping_add(hertz / 1_000_000 * nanoseconds / 1_000 + 1);
+    while cpu::rdtsc() < until {
+        cpu::pause();
+    }
+    true
+}
+
+/// O intervalo entre duas leituras de status na espera de um DMA. No QEMU
+/// cada leitura de porta é uma saída que toma o lock global do QEMU, o
+/// mesmo que a conclusão da E/S precisa: lidas sem intervalo, elas atrasam
+/// a conclusão que esperam. O intervalo é pequeno perto da duração de um
+/// comando.
+const DMA_POLL_GAP_NS: u64 = 20_000;
+
+fn poll_gap() {
+    if !spin_ns(DMA_POLL_GAP_NS) {
+        cpu::pause();
     }
 }
 
