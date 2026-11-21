@@ -3046,7 +3046,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   nega; as passagens SepNormalAccessCheck/SepMaximumAccessCheck com as
   máscaras das ACEs como estão (deny-only só nas negadas), a segunda passagem
   de um token restrito (só escrita num WRITE_RESTRICTED) e a de pacote de um
-  token LowBox. Os exports (SeAccessCheck, SeAccessCheckFromState(Ex),
+  token LowBox. Uma ACE ACCESS_ALLOWED_CALLBACK (tipo 9) com dados depois do
+  SID é condicional: a expressão `artx` (MS-DTYP 2.4.4.17,
+  `se/conditional_ace.rs`) é avaliada como no AuthzBasepEvaluateAceCondition,
+  com a lógica de três valores, sobre os atributos locais do token
+  (`WIN://...` também os do sistema, como o `WIN://ISMULTISESSIONSKU` do
+  SharedDataFlags), os atributos de recurso da SACL do descritor e os
+  grupos (Member_of e afins; os de dispositivo são falsos), e a ACE só vale
+  quando o resultado é TRUE; a negada condicional (tipo 0xA) não é
+  avaliada, como no 19041. Os exports (SeAccessCheck, SeAccessCheckFromState(Ex),
   SeAccessCheckEx, `se/access_check.rs`), o `object_access::check_token` de
   todas as aberturas do Object Manager e dos donos de corpos, o token
   (`se/token/access.rs`) e os diretórios do namespace usam essa avaliação;
@@ -7980,8 +7988,8 @@ dos pacotes (`kernel`, `boot`).
   o smss.exe (WinTcb no NT) perderia a escrita no \KnownDlls. A criação
   num diretório já existente confere o DIRECTORY_CREATE_OBJECT, mas o
   criador recebe o acesso pedido ao objeto novo sem verificação, como no
-  ObInsertObject. A avaliação não interpreta ACEs condicionais (callback) nem
-  listas de tipos de objeto, não audita e não monta o PRIVILEGE_SET dos
+  ObInsertObject. A avaliação não interpreta as ACEs de callback de objeto
+  nem listas de tipos de objeto, não audita e não monta o PRIVILEGE_SET dos
   privilégios usados. A verificação de travessia (ObpCheckTraverseAccess)
   não é feita: todos os tokens do OpenNT têm SeChangeNotifyPrivilege, com o
   qual o NT também a pula. Os diretórios criados pelo kernel no boot têm o

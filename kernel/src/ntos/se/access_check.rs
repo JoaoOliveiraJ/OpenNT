@@ -425,7 +425,17 @@ fn subject_from_access_information(information: u64) -> Option<Subject> {
         package: (package != 0).then(|| read_sid(package)),
         capabilities: hash_entries(information.capabilities_hash.get()),
         less_privileged_app_container: less_privileged(information.security_attributes.get()),
+        attributes: attributes_of(information.security_attributes.get()),
     })
+}
+
+/// Os atributos de segurança no formato interno (as afirmações locais das
+/// ACEs condicionais); sem conjunto legível, nenhum.
+fn attributes_of(attributes: u64) -> Vec<crate::ntos::se::security_attributes::SecurityAttribute> {
+    if attributes == 0 {
+        return Vec::new();
+    }
+    crate::ntos::se::security_attributes::decode_internal(attributes).unwrap_or_default()
 }
 
 /// O LPAC de um conjunto de atributos no formato interno (o
@@ -602,6 +612,7 @@ fn subject_from_token(token: u64) -> Option<Subject> {
         // O SeTokenFromAccessInformation do OpenNT não publica os atributos
         // de segurança no `_TOKEN` montado: um AppContainer comum.
         less_privileged_app_container: false,
+        attributes: Vec::new(),
     })
 }
 

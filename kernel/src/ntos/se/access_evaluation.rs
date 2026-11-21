@@ -53,13 +53,20 @@
 //! As máscaras das ACEs entram como estão (o NT não as mapeia aqui: o
 //! SeAssignSecurity e o SeSetSecurityDescriptorInfo já gravam as ACEs
 //! mapeadas pelo tipo); o acesso pedido já vem mapeado por quem chama.
-//! ACEs de callback (condicionais) e compostas não são avaliadas, e as ACEs
-//! de objeto só valem sem ObjectType (não há lista de tipos de objeto).
+//! A ACCESS_ALLOWED_CALLBACK_ACE com dados depois do SID vale como uma ACE
+//! de permissão quando a condição dela é verdadeira
+//! (`se/conditional_ace.rs`, o AuthzBasepEvaluateAceCondition que o
+//! SepNormalAccessCheck e o SepMaximumAccessCheck chamam, com os atributos
+//! de segurança do token e os de recurso da SACL); a negada de callback e as
+//! compostas não são avaliadas, e as ACEs de objeto só valem sem ObjectType
+//! (não há lista de tipos de objeto).
 
 use alloc::vec::Vec;
 
+use crate::ntos::se::conditional_ace::{self, Truth};
 use crate::ntos::se::model::{sid, Sid};
 use crate::ntos::se::policy_descriptor::OwnedDescriptor;
+use crate::ntos::se::security_attributes::SecurityAttribute;
 use crate::ntos::se::token::tokens::Token;
 
 // ACCESS_MASK.
@@ -82,6 +89,7 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
 const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
 const ACCESS_DENIED_OBJECT_ACE_TYPE: u8 = 0x06;
+const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x09;
 const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 /// ACE_OBJECT_TYPE_PRESENT / ACE_INHERITED_OBJECT_TYPE_PRESENT.
@@ -133,6 +141,9 @@ pub struct Subject {
     pub package: Option<Sid>,
     pub capabilities: Vec<(Sid, u32)>,
     pub less_privileged_app_container: bool,
+    /// Os atributos de segurança do token (as afirmações locais das ACEs
+    /// condicionais).
+    pub attributes: Vec<SecurityAttribute>,
 }
 
 impl Subject {
@@ -150,6 +161,7 @@ impl Subject {
             package: token.app_container.clone(),
             capabilities: token.capabilities.iter().map(|group| (group.sid.clone(), group.attributes)).collect(),
             less_privileged_app_container: crate::ntos::se::token::tokens::less_privileged(token),
+            attributes: token.security_attributes.clone(),
         }
     }
 
@@ -195,6 +207,9 @@ struct Entry<'a> {
     sid: Option<&'a [u8]>,
     /// ACE de objeto com ObjectType: só vale para uma lista de tipos.
     object_typed: bool,
+    /// Os dados depois do SID de uma ACCESS_ALLOWED_CALLBACK_ACE (a
+    /// expressão da condição); sem dados, a ACE não vale.
+    condition: Option<&'a [u8]>,
 }
 
 /// As ACEs de uma ACL (cabeçalho de 8 bytes; AceCount em +4).
@@ -225,7 +240,11 @@ fn entries(acl: &[u8]) -> Vec<Entry<'_>> {
             }
             _ => (sid_at(ace, 8), false),
         };
-        list.push(Entry { kind, flags, mask, sid, object_typed });
+        let condition = match (kind, sid) {
+            (ACCESS_ALLOWED_CALLBACK_ACE_TYPE, Some(found)) => ace.get(8 + found.len()..).filter(|data| !data.is_empty()),
+            _ => None,
+        };
+        list.push(Entry { kind, flags, mask, sid, object_typed, condition });
         offset += size;
     }
     list
@@ -289,10 +308,10 @@ fn package_ace_matches(subject: &Subject, ace_sid: &[u8]) -> bool {
 /// durante o SepNormalAccessCheck e o SepMaximumAccessCheck). As ACEs de
 /// negação não entram: o SepSidInToken das negadas só olha o usuário e os
 /// grupos.
-fn package_granted(dacl: &[u8], subject: &Subject) -> u32 {
+fn package_granted(dacl: &[u8], subject: &Subject, sacl: Option<&[u8]>) -> u32 {
     entries(dacl)
         .iter()
-        .filter(|entry| effective(entry) && is_allow(entry.kind) && package_ace_matches(subject, entry.sid.unwrap_or_default()))
+        .filter(|entry| effective(entry) && allows(entry, subject, sacl) && package_ace_matches(subject, entry.sid.unwrap_or_default()))
         .fold(0, |granted, entry| granted | entry.mask)
 }
 
@@ -306,13 +325,25 @@ fn is_allow(kind: u8) -> bool {
     kind == ACCESS_ALLOWED_ACE_TYPE || kind == ACCESS_ALLOWED_OBJECT_ACE_TYPE
 }
 
+/// A ACE de permissão vale: uma ACE de permissão comum, ou a de callback com
+/// a condição verdadeira (o `cmp [rsp+0x78], 1` depois do
+/// AuthzBasepEvaluateAceCondition, 0x2d16d2).
+fn allows(entry: &Entry, subject: &Subject, sacl: Option<&[u8]>) -> bool {
+    if is_allow(entry.kind) {
+        return true;
+    }
+    let Some(condition) = entry.condition else { return false };
+    let context = conditional_ace::Context { user: &subject.user, user_attributes: subject.user_attributes, groups: &subject.groups, local: &subject.attributes, sacl };
+    conditional_ace::evaluate(condition, &context) == Truth::True
+}
+
 fn is_deny(kind: u8) -> bool {
     kind == ACCESS_DENIED_ACE_TYPE || kind == ACCESS_DENIED_OBJECT_ACE_TYPE
 }
 
 /// SepNormalAccessCheck: os bits ainda pedidos depois da DACL (zero =
 /// tudo concedido; uma ACE negada que toca um pedido encerra a passagem).
-fn normal_access_check(dacl: &[u8], subject: &Subject, desired: u32, restricted: bool, is_owner: bool) -> u32 {
+fn normal_access_check(dacl: &[u8], sacl: Option<&[u8]>, subject: &Subject, desired: u32, restricted: bool, is_owner: bool) -> u32 {
     let mut remaining = desired;
     for entry in entries(dacl) {
         if remaining == 0 {
@@ -322,7 +353,7 @@ fn normal_access_check(dacl: &[u8], subject: &Subject, desired: u32, restricted:
             continue;
         }
         let ace_sid = entry.sid.unwrap_or_default();
-        if is_allow(entry.kind) {
+        if allows(&entry, subject, sacl) {
             if sid_in_subject(subject, ace_sid, false, restricted, is_owner) {
                 remaining &= !entry.mask;
             }
@@ -334,14 +365,14 @@ fn normal_access_check(dacl: &[u8], subject: &Subject, desired: u32, restricted:
 }
 
 /// SepMaximumAccessCheck: o acesso que a DACL dá ao sujeito.
-fn maximum_access_check(dacl: &[u8], subject: &Subject, restricted: bool, is_owner: bool) -> u32 {
+fn maximum_access_check(dacl: &[u8], sacl: Option<&[u8]>, subject: &Subject, restricted: bool, is_owner: bool) -> u32 {
     let (mut granted, mut denied) = (0u32, 0u32);
     for entry in entries(dacl) {
         if !effective(&entry) {
             continue;
         }
         let ace_sid = entry.sid.unwrap_or_default();
-        if is_allow(entry.kind) {
+        if allows(&entry, subject, sacl) {
             if sid_in_subject(subject, ace_sid, false, restricted, is_owner) {
                 granted |= entry.mask & !denied;
             }
@@ -516,29 +547,30 @@ fn sep_access_check(descriptor: &OwnedDescriptor, subject: &Subject, desired: u3
         return if desired == MAXIMUM_ALLOWED { finish(previous) } else { Err(STATUS_ACCESS_DENIED) };
     }
     let restriction = if subject.write_restricted { write_restriction_mask(mapping) } else { mapping[3] | 0x001F_FFFF };
+    let sacl = if descriptor.control & SACL_PRESENT != 0 { descriptor.sacl.as_deref() } else { None };
     if desired & MAXIMUM_ALLOWED == 0 {
-        if normal_access_check(dacl, subject, desired, false, is_owner) != 0 {
+        if normal_access_check(dacl, sacl, subject, desired, false, is_owner) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
-        if subject.restricted() && desired & restriction != 0 && normal_access_check(dacl, subject, desired & restriction, true, is_owner) != 0 {
+        if subject.restricted() && desired & restriction != 0 && normal_access_check(dacl, sacl, subject, desired & restriction, true, is_owner) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
         // O caminho normal do LowBox (0x2d0042): o pedido e os direitos do
         // dono precisam vir das ACEs de pacote e de capacidade.
-        if subject.lowbox() && (requested | owner_implied) & !package_granted(dacl, subject) != 0 {
+        if subject.lowbox() && (requested | owner_implied) & !package_granted(dacl, subject, sacl) != 0 {
             return Err(STATUS_ACCESS_DENIED);
         }
         return finish(previous | desired);
     }
-    let mut granted = maximum_access_check(dacl, subject, false, is_owner);
+    let mut granted = maximum_access_check(dacl, sacl, subject, false, is_owner);
     if subject.restricted() {
-        granted &= maximum_access_check(dacl, subject, true, is_owner) | !restriction;
+        granted &= maximum_access_check(dacl, sacl, subject, true, is_owner) | !restriction;
     }
     // O MAXIMUM_ALLOWED do LowBox (0x2d0242): o concedido cortado pelas ACEs
     // de pacote, e os direitos do dono saem do já concedido (voltam só se
     // essas ACEs os dão).
     if subject.lowbox() {
-        granted &= package_granted(dacl, subject);
+        granted &= package_granted(dacl, subject, sacl);
         previous &= !owner_implied;
     }
     if desired & !MAXIMUM_ALLOWED & !granted != 0 {
