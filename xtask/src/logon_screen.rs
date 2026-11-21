@@ -306,6 +306,18 @@ pub fn software_keys() -> Vec<HostKey> {
         // `Time Zones\<TimeZoneKeyName>` (o TZI e o `Dynamic DST`).
         let zones = "Microsoft\\Windows NT\\CurrentVersion\\Time Zones";
         registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{zones}"), zones, true, &mut keys);
+        // O pacote de idioma da instalação (`LanguagePack`: o `OpenType`, o
+        // arquivo de dados das fontes e os substitutos dos planos
+        // suplementares). O InitializeGre do win32kbase lê os REG_DWORD da
+        // chave pelo LpkShapeQueryRoutine (cada valor liga o bit 1 << valor
+        // na memória compartilhada do GDI), e o GdiProcessSetup do
+        // gdi32full só chama o LpkInitialize com algum bit ligado. Sem a
+        // chave o Uniscribe do processo fica sem a tabela das propriedades
+        // dos scripts (g_ppScriptProperties nulo), e o EditStringValidate
+        // do controle de edição do Bloco de Notas lia o ponteiro nulo na
+        // primeira tecla.
+        let language_pack = "Microsoft\\Windows NT\\CurrentVersion\\LanguagePack";
+        registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{language_pack}"), language_pack, true, &mut keys);
         // Os serviços de texto registrados na instalação (`Microsoft\CTF`:
         // os processadores de entrada de `TIP` com as categorias e os perfis
         // de cada idioma, `SystemShared` e `Modern`), que o MSCTF.dll lê
