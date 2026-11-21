@@ -77,6 +77,25 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     hal::serial::puts("\n*** PANIC: ");
     rtl::print::write_args(format_args!("{}", info));
     hal::serial::puts(" ***\n");
+    // A cadeia de RBP (o kernel é compilado com force-frame-pointers): os
+    // endereços de retorno, para simbolizar pelo ELF do kernel.
+    let mut frame: u64;
+    // SAFETY: só lê o registrador.
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) frame, options(nomem, nostack, preserves_flags)) };
+    hal::serial::puts("pilha do panico:");
+    for _ in 0..24 {
+        if frame < 0xFFFF_8000_0000_0000 || frame & 7 != 0 || ntos::mm::paging::translate(frame & !0xFFF) == 0 || ntos::mm::paging::translate((frame + 8) & !0xFFF) == 0 {
+            break;
+        }
+        // SAFETY: as páginas do quadro estão presentes (conferido acima).
+        let (next, ret) = unsafe { (core::ptr::read_volatile(frame as *const u64), core::ptr::read_volatile((frame + 8) as *const u64)) };
+        rtl::print::write_args(format_args!(" {:#x}", ret));
+        if next <= frame {
+            break;
+        }
+        frame = next;
+    }
+    hal::serial::puts("\n");
     // Com o depurador do kernel ligado, a máquina para antes de travar.
     ntos::kd::stop::panic_stop();
     hal::cpu::halt_forever()

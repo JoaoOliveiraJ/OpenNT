@@ -556,7 +556,14 @@ pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: b
         debug_print!("[section] {} paginas de commit cobradas sem frames livres ({} livres): STATUS_NO_MEMORY", charged, pfn::free_count());
         return Ok(0xC000_0017);
     }
-    let mut added: Vec<u64> = Vec::new();
+    // As páginas novas são preenchidas (do arquivo ou da imagem) em frames
+    // ainda fora da control area e só então publicadas nela, como o
+    // `commit_paged_file`: publicado antes da leitura, o frame zerado era
+    // visto e mapeado pela falta de outra CPU na mesma página (dois
+    // processos carregando a mesma DLL, a mesma fonte), o papel da página
+    // em trânsito do 19041 (MiWaitForInPageComplete). A página que outra
+    // CPU publicou no meio fica com o frame dela, e o nosso volta ao PFN.
+    let mut fresh: Vec<(u64, u64)> = Vec::new();
     let mut status = 0u32;
     let mut page = first;
     while page < first + count {
@@ -571,25 +578,19 @@ pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: b
             break;
         }
         physical::zero(frame, (span * PAGE) as usize);
-        {
-            let mut owner = area.lock();
-            for offset in 0..span {
-                owner.frames.insert(page + offset, frame + offset * PAGE);
-                added.push(page + offset);
-            }
+        for offset in 0..span {
+            fresh.push((page + offset, frame + offset * PAGE));
         }
         page += span;
     }
-    let frame_of = |page: u64| area.lock().frames.get(&page).copied().unwrap_or(0);
     if status == 0 {
         if let Some(file) = &section.file {
             let result = (|| -> Result<(), KernelError> {
                 let mut index = 0usize;
-                while index < added.len() {
-                    let page = added[index];
-                    let frame = frame_of(page);
+                while index < fresh.len() {
+                    let (page, frame) = fresh[index];
                     let mut span = 1u64;
-                    while span < 256 && index + (span as usize) < added.len() && added[index + span as usize] == page + span && frame_of(page + span) == frame + span * PAGE {
+                    while span < 256 && index + (span as usize) < fresh.len() && fresh[index + span as usize] == (page + span, frame + span * PAGE) {
                         span += 1;
                     }
                     if section.is_image {
@@ -605,11 +606,6 @@ pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: b
                             }
                             physical::write_bytes(frame, &data);
                         }
-                        if area.lock().writeback {
-                            for offset in 0..length.div_ceil(PAGE) {
-                                capture_original_file_page(&area, page + offset, frame + offset * PAGE)?;
-                            }
-                        }
                     }
                     index += span as usize;
                 }
@@ -620,6 +616,37 @@ pub fn commit_pages(section: &Arc<Section>, first: u64, count: u64, read_file: b
                 status = status_of(&error, 0xC000_0185);
                 if status & 0x8000_0000 == 0 {
                     status = 0xC000_0185;
+                }
+            }
+        }
+    }
+    let mut added: Vec<u64> = Vec::new();
+    let mut lost: Vec<u64> = Vec::new();
+    if status == 0 {
+        let mut owner = area.lock();
+        for &(page, frame) in &fresh {
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = owner.frames.entry(page) {
+                slot.insert(frame);
+                added.push(page);
+            } else {
+                lost.push(frame);
+            }
+        }
+    } else {
+        lost.extend(fresh.iter().map(|&(_, frame)| frame));
+    }
+    for frame in lost {
+        pfn::free_page(frame);
+    }
+    let frame_of = |page: u64| area.lock().frames.get(&page).copied().unwrap_or(0);
+    if status == 0 && area.lock().writeback {
+        if let Some(file) = section.file.as_ref().filter(|_| !section.is_image) {
+            for &page in &added {
+                if page * PAGE < file.size() {
+                    if let Err(error) = capture_original_file_page(&area, page, frame_of(page)) {
+                        status = status_of(&error, 0xC000_0017);
+                        break;
+                    }
                 }
             }
         }
@@ -891,16 +918,38 @@ pub fn flush_identity(identity: &str) -> Result<(), KernelError> {
 /// A última referência da control area devolve cache, PFNs e cópias; o nome
 /// é removido e o arquivo e a partição retidos são soltos.
 fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
-    let (area, released) = {
-        let state = section.state.lock();
-        (state.area.clone(), state.area_released)
+    // A seção solta a control area uma vez só: a marca é tomada sob a trava
+    // da seção, e uma segunda destruição (de outra CPU) não solta de novo.
+    let area = {
+        let mut state = section.state.lock();
+        let area = state.area.clone().filter(|_| !state.area_released);
+        state.area_released = true;
+        area
     };
-    if let Some(area) = area.filter(|_| !released) {
-        let references = area.lock().references;
-        if references < 1 {
-            return Err(KernelError::new("section area reference underflow"));
-        }
-        if references == 1 {
+    if let Some(area) = area {
+        // A última referência e a saída do nome do arquivo são decididas sob
+        // a trava de FILE_AREAS, a mesma da busca e do incremento do
+        // `create`: com a decisão e o incremento separados, uma seção nova do
+        // mesmo arquivo, criada em outra CPU, reaproveitava a control area
+        // que esta soltava e ficava com páginas já devolvidas ao PFN.
+        let last = {
+            let mut areas = FILE_AREAS.lock();
+            let mut owner = area.lock();
+            if owner.references < 1 {
+                return Err(KernelError::new("section area reference underflow"));
+            }
+            owner.references -= 1;
+            let last = owner.references == 0;
+            if last {
+                if let Some(identity) = owner.identity.clone() {
+                    if areas.get(&identity).is_some_and(|current| Arc::ptr_eq(current, &area)) {
+                        areas.remove(&identity);
+                    }
+                }
+            }
+            last
+        };
+        if last {
             let frames: Vec<(u64, u64)> = area.lock().frames.iter().map(|(&page, &frame)| (page, frame)).collect();
             section_cache::restore(&frames.iter().map(|&(_, frame)| frame).collect::<Vec<u64>>())?;
             let system_paging = area.lock().system_paging.clone();
@@ -919,19 +968,11 @@ fn destroy_section(section: &Arc<Section>) -> Result<(), KernelError> {
             for page in originals {
                 release_original_file_page(&area, page)?;
             }
-            let (identity, image_key) = {
-                let owner = area.lock();
-                (owner.identity.clone(), owner.image_key.clone())
-            };
-            if let Some(identity) = identity {
-                FILE_AREAS.lock().remove(&identity);
-            }
+            let image_key = area.lock().image_key.clone();
             if let Some(key) = image_key {
                 system_image_pages::release_image(&key);
             }
         }
-        area.lock().references -= 1;
-        section.state.lock().area_released = true;
     }
     let node = section.state.lock().node.take();
     if let Some(node) = node {
@@ -1058,14 +1099,23 @@ pub fn create(options: CreateOptions) -> Result<Created, KernelError> {
     }
     let rounded = (size + 4095) & !4095;
     let identity = file.as_ref().and_then(|file| file.identity());
-    let area = identity.as_ref().and_then(|identity| FILE_AREAS.lock().get(identity).cloned()).unwrap_or_else(|| Arc::new(SpinLock::new(Area::new(identity.clone(), page_protect & 0x600))));
-    if area.lock().cache != page_protect & 0x600 {
-        return Ok(Err(0xC000_004E));
-    }
-    area.lock().references += 1;
-    if let Some(identity) = &identity {
-        FILE_AREAS.lock().insert(identity.clone(), area.clone());
-    }
+    // A busca da control area do arquivo e a referência nova são um passo só
+    // sob a trava de FILE_AREAS (a mesma da última referência em
+    // `destroy_section`).
+    let area = {
+        let mut areas = FILE_AREAS.lock();
+        let area = identity.as_ref().and_then(|identity| areas.get(identity).cloned()).unwrap_or_else(|| Arc::new(SpinLock::new(Area::new(identity.clone(), page_protect & 0x600))));
+        let mut owner = area.lock();
+        if owner.cache != page_protect & 0x600 {
+            return Ok(Err(0xC000_004E));
+        }
+        owner.references += 1;
+        drop(owner);
+        if let Some(identity) = &identity {
+            areas.insert(identity.clone(), area.clone());
+        }
+        area
+    };
     let writeback = file.as_ref().filter(|_| writable(page_protect) && !cache).map(|file| file.size());
     let section = new_section(rounded, size, page_protect, attributes, name.clone(), file, false, false, large, permanent, Some(area.clone()));
     if let Some(file_size) = writeback {

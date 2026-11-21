@@ -696,14 +696,20 @@ pub fn is_idle_thread(thread: u64) -> bool {
 }
 
 pub fn register(thread: u64, runtime: u64) -> Result<(), KernelError> {
-    {
-        let mut dispatch = STATE.lock();
-        if dispatch.owners.contains_key(&thread) {
-            return Err(KernelError::new("thread already has scheduler owner"));
-        }
-        dispatch.owners.insert(thread, Owner { runtime, yield_requested: false, yield_execution: false, io_completion_port: None });
-    }
+    register_owner(thread, runtime)?;
     make_ready(thread)
+}
+
+/// [`register`] sem a prontidão: a thread fica Initialized até quem a
+/// registrou decidir, sob o PrcbLock, se ela entra na fila ou espera (a
+/// criada suspensa).
+pub fn register_owner(thread: u64, runtime: u64) -> Result<(), KernelError> {
+    let mut dispatch = STATE.lock();
+    if dispatch.owners.contains_key(&thread) {
+        return Err(KernelError::new("thread already has scheduler owner"));
+    }
+    dispatch.owners.insert(thread, Owner { runtime, yield_requested: false, yield_execution: false, io_completion_port: None });
+    Ok(())
 }
 
 /// O KiReadyThread sob o PrcbLock: `Ok(true)` quando a thread entrou na
@@ -1383,7 +1389,8 @@ pub struct Borrow {
 /// deixa para depois. A CPU corrente já dona (a thread corrente, ou a
 /// reservada por ela) recebe um empréstimo vazio.
 pub fn try_borrow(thread: u64) -> Option<Borrow> {
-    if !concurrent() {
+    // Sem KTHREAD (a thread já liberada), não há o que proteger.
+    if !concurrent() || thread == 0 {
         return Some(Borrow { thread: 0 });
     }
     let cpu = cpu_index();
@@ -1432,12 +1439,33 @@ pub fn release_borrow(borrow: Borrow) {
 /// A CPU que executa, reservou ou tomou emprestada `thread`, se não é a
 /// corrente.
 pub fn owned_elsewhere(thread: u64) -> Option<usize> {
-    if !concurrent() {
+    if !concurrent() || thread == 0 {
         return None;
     }
     let cpu = cpu_index();
     let queues = QUEUES.lock();
     owner_locked(&queues, thread).filter(|&owner| owner != cpu)
+}
+
+/// Para o diagnóstico de parada: o KTHREAD.State, a CPU dona (a que executa,
+/// reservou ou tomou emprestada) e se a thread está numa lista pronta.
+pub fn describe(thread: u64) -> (u8, Option<usize>, bool) {
+    initialize_queues();
+    let queues = QUEUES.lock();
+    let entry = &kthread(thread).wait_list_entry;
+    let head = &processor().dispatcher_ready_list_head[priority(thread) as usize];
+    let mut queued = false;
+    let mut link = head.flink.get();
+    let mut steps = 0;
+    while link != head.address() && link != 0 && steps < 4096 {
+        if link == entry.address() {
+            queued = true;
+            break;
+        }
+        link = list_entry(link).flink.get();
+        steps += 1;
+    }
+    (thread_state(thread), owner_locked(&queues, thread), queued)
 }
 
 // ---- despacho em várias CPUs: as ociosas e o IPI de reescalonamento ---------

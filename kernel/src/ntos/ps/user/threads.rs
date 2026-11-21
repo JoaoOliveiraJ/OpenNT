@@ -724,20 +724,86 @@ fn prepare_main(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntd
     attach_scheduling(thread)
 }
 
+/// A CPU que executa, reservou ou tomou emprestada a thread, se não é a
+/// corrente. O ponteiro da KTHREAD é lido sob a trava da thread e a posse
+/// sob o PrcbLock antes de soltá-la: a liberação da thread morta
+/// (`destroy_thread_if_unused`) zera o ponteiro sob a mesma trava antes de
+/// soltar a KTHREAD, então a consulta nunca lê uma KTHREAD já solta, e a
+/// thread sem KTHREAD não é de ninguém.
+fn owned_elsewhere(thread: &UserThread) -> Option<usize> {
+    if !thread_dispatch::concurrent() {
+        return None;
+    }
+    thread_dispatch::with_queues(|queues| thread.with(|thread| (thread.thread_pointer != 0).then(|| queues.owner_elsewhere(thread.thread_pointer)).flatten()))
+}
+
+/// Diagnóstico de parada (a linha `[perf] ... aps:` com o sistema parado por
+/// 15 s): uma linha `[parada]` por thread de usuário viva, com o estado de
+/// despacho, a CPU dona, a contagem de suspensão e a espera.
+pub fn report_stalled_threads() {
+    let threads: Vec<Arc<UserThread>> = THREADS.lock().clone();
+    crate::debug_print!("[parada] sistema parado ha 15 s: {} threads de usuario", threads.len());
+    for thread in threads {
+        let snapshot = thread.with(|thread| {
+            let wait = thread.wait.as_ref().map(|wait| {
+                let objects = wait.registered.as_ref().map_or_else(|| wait.objects.clone(), |registered| registered.objects.clone());
+                let shape = if wait.registered.is_some() { "registrada" } else if wait.poll.is_some() { "sondada" } else { "simples" };
+                (objects, shape, wait.kernel, wait_reason(wait), wait.deadline)
+            });
+            (thread.thread_pointer, thread.process_pointer, thread.suspend_count, thread.waiting, thread.dead, thread.termination_requested, thread.kernel, thread.deferred_termination, wait)
+        });
+        let (pointer, process_pointer, suspend_count, waiting, dead, termination, kernel, deferred, wait) = snapshot;
+        if pointer == 0 || dead {
+            continue;
+        }
+        let (dispatch_state, owner, queued) = thread_dispatch::describe(pointer);
+        // SAFETY: EPROCESS do processo dono da thread viva.
+        let (pid, name) = if process_pointer != 0 {
+            let eprocess = unsafe { Eprocess::at(process_pointer) };
+            let bytes: Vec<u8> = eprocess.image_file_name.iter().map(|byte| byte.get()).take_while(|&byte| byte != 0).collect();
+            (eprocess.unique_process_id.get(), String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            (0, String::new())
+        };
+        let mut line = alloc::format!("[parada] {} {}:{} estado {} dona {:?} na fila {} suspensa {} espera {} {:?}", name, pid, thread.thread_id, dispatch_state, owner, queued, suspend_count, waiting, kernel);
+        if termination || deferred.is_some() {
+            line.push_str(&alloc::format!(" termino pedido {} adiado {:?}", termination, deferred));
+        }
+        if let Some((objects, shape, kernel_wait, reason, deadline)) = wait {
+            line.push_str(&alloc::format!(" | {} motivo {} kernel {} prazo {:?}:", shape, reason, kernel_wait, deadline));
+            for object in objects {
+                // SAFETY: objeto retido pela espera instalada.
+                let header = unsafe { crate::ntos::inc::types::DispatcherHeader::at(object) };
+                line.push_str(&alloc::format!(" {:#x} (tipo {} sinal {})", object, header.type_.get() & 0x7F, header.signal_state.get()));
+            }
+        }
+        crate::debug_print!("{}", line);
+    }
+}
+
 /// Registra a thread no despacho (USER_RUNTIME | TID), suspensa se o
 /// `suspend_count` pede. Prioridades são vistas dos campos nativos (sem
 /// cópia divergente).
 pub fn attach_scheduling(thread: &Arc<UserThread>) -> Result<(), KernelError> {
     let pointer = thread.pointer();
-    thread_dispatch::register(pointer, thread_dispatch::USER_RUNTIME | thread.thread_id)?;
-    let suspended = thread.with(|thread| {
-        thread.scheduling_registered = true;
-        thread.suspend_count != 0
-    });
-    if suspended {
-        thread_dispatch::suspend(pointer, thread_dispatch::state::WAITING)?;
-    }
-    Ok(())
+    thread_dispatch::register_owner(pointer, thread_dispatch::USER_RUNTIME | thread.thread_id)?;
+    // A decisão sai da contagem de suspensão sob o PrcbLock, como a da
+    // retomada (`adjust_suspend_count`): a criada suspensa vai direto à
+    // espera, sem passar pela fila. Pronta antes e suspensa depois, um AP
+    // ocioso acordado pela prontidão a escolhia no meio e executava o
+    // começo dela no anel 3 antes da retomada (no 19041 a thread criada
+    // suspensa só entrega a APC de suspensão e espera).
+    thread_dispatch::with_queues(|queues| {
+        let suspended = thread.with(|thread| {
+            thread.scheduling_registered = true;
+            thread.suspend_count != 0
+        });
+        if suspended {
+            queues.suspend(pointer, thread_dispatch::state::WAITING)
+        } else {
+            queues.make_ready(pointer)
+        }
+    })
 }
 
 /// Sonda as esperas das threads de usuário de todos os processos que
@@ -1301,7 +1367,7 @@ fn serve_exit_requests(caller: u64) {
 /// intervalo, pelo NtTerminateThread), o que restou dele.
 fn release_finished(process: u64) {
     for finished in of_process(process) {
-        if finished.dead() && !finished.blocked_in_kernel() && thread_dispatch::owned_elsewhere(finished.pointer()).is_none() {
+        if finished.dead() && !finished.blocked_in_kernel() && owned_elsewhere(&finished).is_none() {
             release_execution_resources(&finished);
         }
     }
@@ -1506,7 +1572,7 @@ fn resume_terminated(executor: fn(u64, u64) -> u32, caller: u64) -> Result<(), K
         if !thread.with(|thread| thread.dead && matches!(thread.kernel, KernelState::Blocked { status: Some(_) })) {
             continue;
         }
-        if thread_dispatch::owned_elsewhere(thread.pointer()).is_some() {
+        if owned_elsewhere(&thread).is_some() {
             continue;
         }
         *CURRENT[cpu()].lock() = Some(thread.clone());
@@ -1628,7 +1694,7 @@ pub fn begin_exit(process: u64, status: u32) -> bool {
 /// intervalo em curso nesta CPU, se houver, não é de uma delas.
 pub fn exit_ready(process: u64) -> bool {
     let in_slice = crate::hal::amd64::usermode::in_service() && current().is_some_and(|thread| thread.with(|thread| thread.process_pointer) == process);
-    !in_slice && !of_process(process).iter().any(|thread| thread.blocked_in_kernel() || thread.termination_pending() || thread_dispatch::owned_elsewhere(thread.pointer()).is_some())
+    !in_slice && !of_process(process).iter().any(|thread| thread.blocked_in_kernel() || thread.termination_pending() || owned_elsewhere(thread).is_some())
 }
 
 /// O aviso de um término que segura o fim do processo: onde a thread está,
@@ -2337,7 +2403,7 @@ pub fn release_process(process: u64) {
     for thread in owned {
         // A thread que outra CPU executa, reservou ou sonda só morre: ela é
         // recolhida numa chamada seguinte, já fora da CPU.
-        if thread_dispatch::owned_elsewhere(thread.pointer()).is_some() {
+        if owned_elsewhere(&thread).is_some() {
             thread.with(|thread| {
                 thread.dead = true;
                 thread.deferred_termination = Some(true);
