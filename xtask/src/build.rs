@@ -462,9 +462,11 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // Segundo disco IDE (mestre-escravo primário): o volume NTFS de dados.
     let ntfs_path = build_dir.join("ntfs.img");
     // O volume do `--console-process` leva os programas de modo usuário do
-    // boot do smss (o cmd.exe, o conhost.exe e as DLLs deles); as hives e o
-    // espaço livre seguem os do boot comum.
-    let staged_programs = if options.console_process { "smss" } else { options.initial_process.as_str() };
+    // boot do smss (o cmd.exe, o conhost.exe e as DLLs deles), e o do
+    // `--kernel-test-scope=e-process` também (o kernel32, o kernelbase e o
+    // cfgmgr32 do programa Win32 do teste); as hives e o espaço livre seguem
+    // os do boot comum.
+    let staged_programs = if options.console_process || options.kernel_test_scope == "e-process" { "smss" } else { options.initial_process.as_str() };
     let staged = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
     // A origem daqui de cada arquivo, para o descritor de segurança dele
     // (`host_security::system_nodes`); um arquivo gerado não tem origem.

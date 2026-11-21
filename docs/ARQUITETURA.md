@@ -2569,6 +2569,102 @@ pelo ExFreePool, como no PnpGetRelatedTargetDevice. Com 4 GB de RAM o
 SeaBIOS põe o BAR0 de 64 bits acima de 4 GB, fora do mapa direto que o
 MmMapIoSpace usa; o teste roda com 3 GB, e o BAR fica na janela de 32 bits.
 
+O volume E: do NVMe é um volume PnP completo: o modo usuário o enumera
+pelas mesmas APIs do Explorer e do ShellHWDetection. O teste e-process
+(`ntos/test/volume_enumeration.rs`, `E_VOLUMES_OK`) roda um programa Win32
+gravado no E: (o kernel32 e o cfgmgr32 reais do System32, numa sessão
+nova; o volume desse escopo leva os programas de modo usuário do boot do
+smss) que confere o
+FindFirstVolumeW/FindNextVolumeW com o GetVolumePathNamesForVolumeNameW
+(os IOCTLs do mountmgr.sys), o GetLogicalDrives (o mapa de devices DOS do
+processo) e o CM_Get_Device_Interface_ListW de GUID_DEVINTERFACE_VOLUME (o
+`\CMApi` do PnP manager, a interface que o volmgr.sys registrou no devnode
+STORAGE\Volume).
+
+**O volume do sistema no ntfs.sys (`--volume-sistema=ntfs.sys`, plano).**
+Hoje o C: da cadeia é o NTFS do próprio kernel (`\Device\KernelVolume1`
+sobre o driver ATA interno), sem devnode STORAGE\Volume nem interface de
+volume. O alvo é o C: servido pela pilha real (atapi.sys e ataport.sys,
+disk.sys e classpnp.sys, partmgr.sys, volmgr.sys e volume.sys,
+mountmgr.sys) e pelo ntfs.sys, com o NTFS do kernel no papel do winload:
+ler, antes da árvore de dispositivos, o que o carregador do NT entrega no
+loader block, e nada depois. O NTFS do kernel continua o padrão até a
+cadeia inteira passar com a opção. As decisões:
+
+1. **O disco.** O segundo disco IDE (o `ntfs.img`) passa a ser
+   particionado, como o `nvme.img` (MBR e uma partição NTFS a partir do LBA
+   2048, o volume com o HiddenSectors dela), e a controladora fica com o
+   atapi.sys (`--storage=real`). O winload do NT lê o volume de boot pelo
+   firmware do mesmo disco que o kernel depois serve pelo driver de
+   armazenamento; aqui o driver ATA interno faz o papel do firmware. O NVMe
+   fica como disco de dados: o NTFS do kernel não tem como lê-lo antes da
+   pilha real.
+2. **O NTFS do kernel só lê, e só até a árvore.** Na fase 1 ele monta a
+   partição pelo deslocamento dela, somente leitura nesse modo; dele vêm as
+   hives da máquina (em memória, como as do loader block), as tabelas NLS,
+   o errata.inf, os catálogos e as imagens dos drivers que sobem antes da
+   árvore (acpi.sys, pci.sys, Wdf01000.sys, msisadrv.sys, cng.sys, ci.dll,
+   ksecdd.sys, clfs.sys, clipsp.sys, fltmgr.sys, ntfs.sys). Quando o
+   atapi.sys assume a controladora, o driver ATA interno para de vez e
+   recusa qualquer comando.
+3. **A troca.** No PnpBootDeviceWait do IopInitializeBootDrivers
+   (`io/boot_partition.rs`), o volume da partição de boot recebe
+   DO_SYSTEM_BOOT_PARTITION e o C: pelo IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT;
+   o IopReassignSystemRoot aponta o `\SystemRoot` e o `\Device\BootDevice`
+   para `\Device\HarddiskVolume1\Windows`. Daí em diante todo arquivo do
+   sistema é aberto pelo I/O Manager e servido pelo ntfs.sys, e as seções
+   sobre eles são as de arquivo de file system (`mm/section/fsd_file.rs`,
+   com a CONTROL_AREA no FCB e o writer de páginas mapeadas).
+4. **Nada usa o trait `FileSystem` do volume do kernel depois da troca.**
+   Mudam para FILE_OBJECTs e IRPs: as hives (`cm/hive_file.rs`: o
+   CmpFileRead, CmpFileWrite, o tamanho e o flush por Zw nos handles, com a
+   reassociação das hives carregadas aos arquivos do C:, como o
+   CmpInitializeHiveList), as imagens de kernel (`mm/sysload.rs`, por seção
+   de imagem sobre o arquivo, como o MmLoadSystemImage), a criação de
+   processo e as cópias de sistema da ntdll e do apiset (`ps/create.rs`,
+   `ps/user/loader.rs`, por seção sobre o arquivo do C:), as NLS
+   (`ps/user/nls.rs`, `rtl/*_code_page.rs`, do loader block), o pool
+   paginado e a paginação das imagens (`mm/kernel_pool.rs`,
+   `mm/image_paging.rs`: pelo arquivo de paginação ou desligados nesse
+   modo), `io/reparse.rs`, `em/mod.rs`, `ob/objects/file.rs` e
+   `kd/explore.rs`.
+5. **Os serviços de arquivo do modo usuário sobre arquivos de file
+   system.** Já vão por IRP a leitura e a escrita, as consultas e o set
+   information, as classes de volume, o notify, os locks e o flush. Faltam
+   o NtQueryDirectoryFile(Ex), o NtDeleteFile, renomear e ligar (o
+   IopOpenLinkOrRenameTarget com SL_OPEN_TARGET_DIRECTORY), o STATUS_REPARSE
+   e os EAs no IRP_MJ_CREATE e a ApcRoutine do I/O de dispositivo.
+6. **A segurança dos arquivos.** O ntfs.sys confere o descritor de cada
+   abertura; a imagem precisa dos descritores de uma instalação (herança
+   OI/CI e ALL APPLICATION PACKAGES) antes de a cadeia rodar nele, senão os
+   processos AppContainer não abrem nada.
+7. **O arquivo de paginação** no C: pelo ntfs.sys: o NtCreatePagingFile já
+   segue o MiCreatePagingFile; falta o PpPagePathAssign
+   (DEVICE_USAGE_NOTIFICATION à pilha do volume).
+
+Os marcos, cada um com um teste:
+
+- **S0** (`SYSTEM_VOLUME_NTFS_OK`): com `--volume-sistema=ntfs.sys`, o disco
+  particionado, o NTFS do kernel lendo a partição na fase 1, a pilha IDE
+  real, o volume da partição com o C: pelo BOOT_DL_ASSIGNMENT e o ntfs.sys
+  montado nele; arquivos do `\SystemRoot` lidos pelo ntfs.sys conferem com
+  os do NTFS do kernel.
+- **S1** (`SYSTEM_VOLUME_SWITCHED_OK`): o IopReassignSystemRoot e o fim do
+  NTFS do kernel (item 4), sem nenhum comando ao driver ATA interno depois
+  do atapi.sys.
+- **S2** (`SMSS_CSRSS_OK` com o C: no ntfs.sys): smss, KnownDlls, csrss e
+  wininit; os serviços do item 5.
+- **S3** (`LOGON_SCREEN_OK` e `DESKTOP_OK`): winlogon, services, LSA, a hive
+  do usuário e o explorer; os descritores do item 6.
+- **S4**: barra-de-tarefas, area-de-trabalho, gerenciador-de-tarefas e
+  bloco-de-notas passam com a opção; só então ela pode virar o padrão.
+
+Os riscos conhecidos: o tempo de boot (cada leitura atravessa seis ou sete
+drivers e uma interrupção), o Cc e o ntfs.sys sob a carga da cadeia
+(ordem dos recursos do ntfs.sys contra os callbacks de AcquireForLazyWrite
+e AcquireForModWrite, o estrangulamento do CcCanIWrite, os checkpoints do
+$LogFile de 2 MB) e a depuração do ntfs.sys sem os tipos no PDB público.
+
 Com `--display=basic` (`drivers/video/display_stack.rs`) o adaptador VGA
 recebe o BasicDisplay.sys real. O DriverEntry dele carrega o dxgkrnl.sys
 real (ZwLoadDriver do DXGKrnl) e se registra nele (DxgkInitialize); o

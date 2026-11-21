@@ -156,6 +156,9 @@ pub fn run() {
     if crate::ntos::init::boot_config::kernel_test_scope() == "e-process" {
         super::e_process::run(assert);
         debug_print!("E_PROCESS_OK");
+        // A enumeração de volumes do modo usuário vê o volume E: da pilha PnP.
+        super::volume_enumeration::run(assert);
+        debug_print!("E_VOLUMES_OK");
         return;
     }
     load_options();

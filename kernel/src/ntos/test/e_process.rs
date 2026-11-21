@@ -203,21 +203,22 @@ fn program() -> (Vec<u8>, usize) {
 const NTDLL_IMPORTS: [&str; 6] = ["NtOpenFile", "NtCreateSection", "NtMapViewOfSection", "NtDelayExecution", "NtFlushVirtualMemory", "NtTerminateProcess"];
 const SECTION_RVA: u32 = 0x1000;
 
-fn put16(image: &mut [u8], at: usize, value: u16) {
+pub(super) fn put16(image: &mut [u8], at: usize, value: u16) {
     image[at..at + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-fn put32(image: &mut [u8], at: usize, value: u32) {
+pub(super) fn put32(image: &mut [u8], at: usize, value: u32) {
     image[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn put64(image: &mut [u8], at: usize, value: u64) {
+pub(super) fn put64(image: &mut [u8], at: usize, value: u64) {
     image[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 /// PE x64 de uma seção (código, dados e diretórios em RVA 0x1000, gravável
-/// e executável), com os diretórios dados (índice, RVA, tamanho).
-fn pe_image(image_base: u64, characteristics: u16, entry: u32, content: &[u8], directories: &[(usize, u32, u32)]) -> Vec<u8> {
+/// e executável), do subsistema dado, com os diretórios dados (índice, RVA,
+/// tamanho).
+pub(super) fn pe_image(image_base: u64, characteristics: u16, subsystem: u16, entry: u32, content: &[u8], directories: &[(usize, u32, u32)]) -> Vec<u8> {
     let raw = content.len().div_ceil(0x200) * 0x200;
     let virtual_size = (content.len() as u32).div_ceil(0x1000) * 0x1000;
     let mut image = alloc::vec![0u8; 0x400 + raw];
@@ -240,8 +241,7 @@ fn pe_image(image_base: u64, characteristics: u16, entry: u32, content: &[u8], d
     put16(&mut image, optional + 48, 6);
     put32(&mut image, optional + 56, SECTION_RVA + virtual_size);
     put32(&mut image, optional + 60, 0x400);
-    // IMAGE_SUBSYSTEM_NATIVE: a ntdll não carrega o kernel32 (como no smss).
-    put16(&mut image, optional + 68, 1);
+    put16(&mut image, optional + 68, subsystem);
     put64(&mut image, optional + 72, 0x10_0000);
     put64(&mut image, optional + 80, 0x1000);
     put64(&mut image, optional + 88, 0x10_0000);
@@ -289,7 +289,8 @@ fn dll_image() -> Vec<u8> {
     put32(&mut content, functions, rva(0x10));
     put32(&mut content, names, rva(export_name));
     put16(&mut content, ordinals, 0);
-    pe_image(DLL_BASE, 0x2022, rva(0), &content, &[(0, rva(directory), 0x40)])
+    // IMAGE_SUBSYSTEM_NATIVE: a ntdll não carrega o kernel32 (como no smss).
+    pe_image(DLL_BASE, 0x2022, 1, rva(0), &content, &[(0, rva(directory), 0x40)])
 }
 
 /// Um executável com o programa no papel `role` (1 ou 2): a área de dados
@@ -343,18 +344,18 @@ fn exe_image(role: u32) -> Vec<u8> {
         put32(&mut content, descriptor + 12, rva(name));
         put32(&mut content, descriptor + 16, rva(iat));
     }
-    pe_image(EXE_BASE, 0x0022, rva(0), &content, &[(1, rva(descriptors), 60), (12, rva(data), 0x50)])
+    pe_image(EXE_BASE, 0x0022, 1, rva(0), &content, &[(1, rva(descriptors), 60), (12, rva(data), 0x50)])
 }
 
 /// Blocos do convidado do teste.
-struct Scratch {
+pub(super) struct Scratch {
     block: u64,
     buffer: u64,
     aligned: u64,
 }
 
 impl Scratch {
-    fn new(size: u64) -> Option<Self> {
+    pub(super) fn new(size: u64) -> Option<Self> {
         let block = guest::alloc_bytes(0x800);
         let buffer = guest::alloc_bytes(size);
         let aligned = crate::ntos::mm::independent_pages::allocate(2 * PAGE, 0).unwrap_or(0);
@@ -396,7 +397,7 @@ fn transfer(scratch: &Scratch, handle: u64, write: bool, buffer: u64, length: u6
 }
 
 /// Grava o arquivo inteiro pelo cache do ntfs.sys.
-fn write_file(scratch: &Scratch, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn write_file(scratch: &Scratch, name: &str, bytes: &[u8]) -> Result<(), String> {
     let handle = open(scratch, name, FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT)?;
     guest::write_bytes(scratch.buffer, bytes);
     let written = transfer(scratch, handle, true, scratch.buffer, bytes.len() as u64);
