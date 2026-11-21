@@ -264,7 +264,10 @@ impl ClientView {
         let view = match sections::map(&self.section, &request) {
             Ok(Ok(view)) => view,
             Ok(Err(status)) => return Err(status),
-            Err(error) => return Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+            Err(error) => {
+                crate::debug_print!("[alpc] vista da secao do cliente no servidor falhou: {}", error);
+                return Err(if error.status != 0 { error.status } else { 0xC000_0001 });
+            }
         };
         let mut slot = self.server.lock();
         if let Some(existing) = slot.clone() {
@@ -1075,7 +1078,10 @@ fn capture_reply_view(port: &Arc<Port>, attributes: u64, mode: u8) -> Result<(Op
         Ok(Ok(message_view::Captured::View(carried))) => Ok((Some(carried), unmap)),
         Ok(Ok(message_view::Captured::Empty)) => Ok((None, unmap)),
         Ok(Err(status)) => Err(status),
-        Err(error) => Err(if error.status != 0 { error.status } else { 0xC000_0001 }),
+        Err(error) => {
+            crate::debug_print!("[alpc] captura da vista da mensagem falhou: {}", error);
+            Err(if error.status != 0 { error.status } else { 0xC000_0001 })
+        }
     }
 }
 
