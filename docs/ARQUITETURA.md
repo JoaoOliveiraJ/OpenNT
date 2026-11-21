@@ -2785,9 +2785,39 @@ onde saem os buffers de DMA dos discos, compromete a faixa antes de
 devolvê-la. O commit não volta: o de um QEMU cresce com a RAM que o
 convidado já tocou e pode chegar ao tamanho dela. Sem commit livre, o
 pedido espera até 10 s o arquivo de paginação crescer e depois o QEMU para
-com `cannot commit guest RAM`. O build: as fontes do QEMU 11.1.0 com os
-dois patches de `tools/qemu`, `configure --target-list=x86_64-softmmu
---enable-whpx --enable-tpm --disable-werror --disable-docs` e `ninja
+com `cannot commit guest RAM`.
+
+As instruções de string de I/O (o `rep outsb` da serial, `hal/serial.rs`)
+no QEMU do OpenNT: com o `tools/qemu/whpx-string-io.patch`. No QEMU 11.1 o
+WHPX emula um OUTS/INS com o emulador x86 do próprio QEMU, que decodifica
+os bytes que a saída de I/O traz. O Hyper-V às vezes entrega a saída sem
+eles (InstructionByteCount 0, o buffer zerado), e o QEMU original
+decodificava o comprimento da instrução (2) sobre esse buffer: rodava
+`00 00`, um `add [rax], al`, no lugar do `rep outsb`. Com o RAX do `rdtsc`
+de `send`, um endereço da metade de usuário, a leitura falhava no passeio
+de tabelas do emulador e o convidado recebia um #PF com erro 0x8 e CR2 0 no
+`rep outsb`, com RCX e RSI intactos (o erro 0x8 vinha de outro defeito: o
+emulador testava o resultado da tradução como bits, e PAGE_NOT_MAPPED ganhava
+o bit RSVD; o CR2 0, de a leitura não passar o endereço ao acelerador). Com
+o RAX mapeado, o `add` alteraria aquele byte e o lote da serial sumiria. A
+saída sem bytes aparece quando o host tira a RAM do convidado do working
+set do QEMU. Com o working set do QEMU esvaziado a cada 20 ms
+(EmptyWorkingSet) durante boots do `ata-falha`, chegaram sem bytes quatro
+saídas de string em nove boots, duas em três com o `lazy-ram.patch` e duas
+em seis sem ele. O QEMU sem a correção parou o convidado com esse #PF no
+quinto boot (o binário de antes do `lazy-ram.patch`) e no primeiro (o com
+ele); com a correção, 12 boots do `ata-falha` e a `suite-smp4` passaram
+assim. As duas falhas vistas nas suítes completas vieram com 10 a 16 QEMUs
+ao mesmo tempo no host. O patch passa ao decodificador só os bytes que o
+Hyper-V trouxe (o resto ele lê da memória
+do convidado, como já fazia nas saídas de acesso à memória), dá ao #PF do
+emulador o código de erro certo e o CR2 do endereço lido, e para o OUTS no
+elemento cuja leitura falhou, sem escrever na porta.
+
+O build: as fontes do QEMU 11.1.0 com os três patches de `tools/qemu`
+(`tpm-mssim`, `lazy-ram` e `whpx-string-io`, nessa ordem),
+`configure --target-list=x86_64-softmmu --enable-whpx --enable-tpm
+--enable-sdl --disable-werror --disable-docs` e `ninja
 qemu-system-x86_64.exe` no MSYS2 UCRT64, com TMP e TEMP numa pasta que
 exista.
 

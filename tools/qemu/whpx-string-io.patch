@@ -1,0 +1,69 @@
+diff -ruN a/target/i386/emulate/x86_emu.c b/target/i386/emulate/x86_emu.c
+--- a/target/i386/emulate/x86_emu.c
++++ b/target/i386/emulate/x86_emu.c
+@@ -596,6 +596,10 @@
+ 
+     x86_read_mem(env_cpu(env), env->emu_mmio_buf, addr,
+                        decode->operand_size);
++    if (env->exception_injected) {
++        /* The read faulted: no output, RSI and RCX stay at this element. */
++        return 1;
++    }
+     emul_ops->handle_io(env_cpu(env), DX(env), env->emu_mmio_buf, 1,
+                         decode->operand_size, 1);
+ 
+diff -ruN a/target/i386/emulate/x86_mmu.c b/target/i386/emulate/x86_mmu.c
+--- a/target/i386/emulate/x86_mmu.c
++++ b/target/i386/emulate/x86_mmu.c
+@@ -244,13 +244,18 @@
+     if (is_user) {
+         error_code |= PG_ERROR_U_MASK;
+     }
+-    if (!(res & MMU_TRANSLATE_PAGE_NOT_MAPPED)) {
++    /*
++     * The results are values, not bit flags: PAGE_NOT_MAPPED (1) &
++     * INVALID_PT_FLAGS (3) is not zero, so testing bits gave a not-present
++     * fault the RSVD bit.
++     */
++    if (res != MMU_TRANSLATE_PAGE_NOT_MAPPED) {
+         error_code |= PG_ERROR_P_MASK;
+     }
+     if (is_write) {
+         error_code |= PG_ERROR_W_MASK;
+     }
+-    if (res & MMU_TRANSLATE_INVALID_PT_FLAGS) {
++    if (res == MMU_TRANSLATE_INVALID_PT_FLAGS) {
+         error_code |= PG_ERROR_RSVD_MASK;
+     }
+     return error_code;
+@@ -331,6 +336,9 @@
+         if (translate_res) {
+             int error_code = translate_res_to_error_code(translate_res, false, is_user(cpu));
+             env->cr[2] = gva;
++            /* The accelerator sets CR2 from the payload, as on a write. */
++            env->exception_has_payload = 1;
++            env->exception_payload = gva;
+             x86_emul_raise_exception(env, EXCP0E_PAGE, error_code);
+             return translate_res;
+         }
+diff -ruN a/target/i386/whpx/whpx-all.c b/target/i386/whpx/whpx-all.c
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -1180,7 +1180,16 @@
+         return 0;
+     }
+ 
+-    ret = emulate_instruction(cpu, ctx->InstructionBytes, exit_ctx->VpContext.InstructionLength);
++    /*
++     * Hyper-V may deliver the exit with fewer instruction bytes than the
++     * instruction length, even none: InstructionByteCount 0 and the buffer
++     * zeroed, seen when the host trims guest RAM from the QEMU working set.
++     * Decoding the instruction length from that buffer runs "00 00", an
++     * ADD [rax], al, in place of the string instruction. Hand the decoder
++     * only the bytes Hyper-V fetched; it reads the rest from guest memory.
++     */
++    ret = emulate_instruction(cpu, ctx->InstructionBytes,
++                              ctx->InstructionByteCount);
+     if (ret < 0) {
+         error_report("failed to emulate I/O port access");
+         return -1;
