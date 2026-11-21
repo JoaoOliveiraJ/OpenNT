@@ -721,6 +721,12 @@ fn prepare_main(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntd
     });
     // O cabeçalho do KTHREAD é um objeto de notificação do tipo Thread.
     dispatcher::initialize_event(pointer, 6, false);
+    // O processo é dado como iniciado antes de a thread entrar na fila: um
+    // AP ocioso a escolhe logo, e o `admit` dele devolve à espera a thread
+    // de um processo ainda não iniciado, que só a sondagem do BSP aprontaria.
+    if let Some(state) = process_state::get(process_pointer) {
+        state.started.store(true, Ordering::Release);
+    }
     attach_scheduling(thread)
 }
 
@@ -1052,17 +1058,14 @@ pub fn start(thread: &Arc<UserThread>, rip: u64, rsp: u64, argument: u64, ntdll_
     if EXECUTOR.lock().is_none() {
         return Err(KernelError::new("user-mode execution unavailable"));
     }
-    prepare_main(thread, rip, rsp, argument, ntdll_base)?;
     if !APC_PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         dispatcher::register_completion_pump(drain_kernel_apcs);
     }
-    let process_pointer = thread.with(|thread| thread.process_pointer);
-    if let Some(state) = process_state::get(process_pointer) {
-        state.started.store(true, Ordering::Release);
-    }
-    // O diagnóstico de falha (post-mortem) começa limpo para o processo novo.
+    // O diagnóstico de falha (post-mortem) começa limpo para o processo novo,
+    // antes de a thread poder rodar (num AP, assim que entra na fila).
     crate::hal::amd64::usermode::reset_fault_state();
-    Ok(())
+    // A thread entra na fila no fim, com o processo já dado como iniciado.
+    prepare_main(thread, rip, rsp, argument, ntdll_base)
 }
 
 /// Põe a thread principal no despachante e espera o fim do processo dela
