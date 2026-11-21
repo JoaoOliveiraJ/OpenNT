@@ -895,6 +895,12 @@ fn wait_for_work(handle: u64, out: u64, count: u32, returned: u64, send: &mut Op
     // notificações de retirada rodam depois, fora dela. PacketsReturned só
     // é gravado quando há pacotes (status 0).
     let deliver = Box::new(move |packets: &mut VecDeque<Packet>| {
+        // Sem pacote, nada é retirado e a espera segue: o TppWorkerThread
+        // percorre as entradas a partir de PacketsReturned - 1, e um sucesso
+        // com zero pacotes o fazia ler a entrada -1.
+        if packets.is_empty() {
+            return None;
+        }
         let size = (count as usize).min(packets.len());
         let mut dequeued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
         for index in 0..size {

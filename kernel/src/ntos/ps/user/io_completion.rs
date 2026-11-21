@@ -182,26 +182,37 @@ pub fn remove_entry(entry: Arc<UserHandle>, port: Arc<Port>, timeout: u64, alert
         if poll_port.closed() {
             return Some(0x80); // STATUS_ABANDONED
         }
-        let blocked = poll_port.with(|state| {
-            if state.packets.is_empty() || state.active.len() as u32 >= poll_port.concurrency() {
+        let concurrency = poll_port.concurrency();
+        let blocked = |state: &completion_objects::PortState| {
+            if state.packets.is_empty() || state.active.len() as u32 >= concurrency {
                 return true;
             }
             let last = state.waiters.iter().rev().find(|candidate| candidate.thread.is_none_or(completion_objects::thread_eligible));
             !last.is_some_and(|last| Arc::ptr_eq(last, &poll_waiter))
-        });
-        if blocked {
+        };
+        if poll_port.with(|state| blocked(state)) {
             return None;
         }
         // Outra thread pode ter desmapeado o buffer de um consumidor.
         if !validate() {
             return Some(0xC000_0005);
         }
-        let packet = poll_port.with(|state| deliver(&mut state.packets));
-        if let Some(on_dequeue) = packet.and_then(|packet| packet.on_dequeue) {
+        // A conferência vale de novo na retirada, sob a mesma trava: entre as
+        // duas, um consumidor noutra CPU pode ter levado os pacotes (ou a vaga
+        // de concorrência), e a espera continua em vez de voltar com sucesso
+        // e nenhum pacote. A thread entra nas ativas na mesma trava.
+        let packet = poll_port.with(|state| {
+            if blocked(state) {
+                return None;
+            }
+            let packet = deliver(&mut state.packets)?;
+            if let Some(thread) = poll_waiter.thread {
+                state.active.insert(thread);
+            }
+            Some(packet)
+        })?;
+        if let Some(on_dequeue) = packet.on_dequeue {
             on_dequeue();
-        }
-        if let Some(thread) = poll_waiter.thread {
-            poll_port.with(|state| state.active.insert(thread));
         }
         Some(0)
     };
