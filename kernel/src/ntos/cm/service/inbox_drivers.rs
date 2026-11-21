@@ -11,13 +11,18 @@
 //! uma diferença: Start = 3 (SERVICE_DEMAND_START). Na instalação pcw,
 //! KSecDD, KSecPkg, NDIS, Tcpip e Fs_Rec são de boot (0) e AFD, Null e Beep
 //! de sistema (1); aqui eles
-//! ainda não fazem parte do boot e sobem quando pedidos (o DriverEntry do
-//! pcw.sys ainda não completa). Com o pcw fora do boot, o
-//! ExpPcwDisabledStatus lê Start != 0 e os Pcw* sem extensão devolvem
-//! sucesso com handle nulo, como num Windows com o pcw desligado. No boot
-//! do processo inicial real (`--initial-process=smss`) o DXGKrnl volta ao
-//! Start 1 da instalação: o boot o carrega com os drivers de sistema, antes
-//! de o smss carregar o win32k.sys, que se conecta a \Device\DxgKrnl. As
+//! ainda não fazem parte do boot e sobem quando pedidos. Com o pcw fora do
+//! boot, o ExpPcwDisabledStatus lê Start != 0 e os Pcw* sem extensão
+//! devolvem sucesso com handle nulo, como num Windows com o pcw desligado.
+//! No boot do processo inicial real (`--initial-process=smss`) o DXGKrnl
+//! volta ao Start 1 da instalação: o boot o carrega com os drivers de
+//! sistema, antes de o smss carregar o win32k.sys, que se conecta a
+//! \Device\DxgKrnl. O pcw volta ao Start 0 da instalação no mesmo boot: o
+//! pcw.sys sobe com os drivers de boot, liga a extensão do host do PCW antes
+//! de o dxgmms2.sys registrar os conjuntos de contadores da GPU e cria o
+//! \Device\PcwDrv, por onde o pcwum.dll dos processos (o PcwCreateQuery do
+//! Gerenciador de Tarefas, os provedores de contadores dos serviços) fala
+//! com ele. As
 //! subchaves com dados da máquina (Parameters, Linkage, interfaces) não são
 //! copiadas. O NetIO não tem chave: ele carrega como dependência de import
 //! do NDIS e do Tcpip.
@@ -138,7 +143,7 @@ struct InboxDriver {
 }
 
 const DRIVERS: &[InboxDriver] = &[
-    InboxDriver { name: "pcw", display_name: Some("Performance Counters for Windows Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\pcw.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "System Reserved", tag: None, dwords: &[] },
+    InboxDriver { name: "pcw", display_name: Some("Performance Counters for Windows Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\pcw.sys"), start: SERVICE_DEMAND_START, smss_start: Some(SERVICE_BOOT_START), error_control: 1, group: "System Reserved", tag: None, dwords: &[] },
     InboxDriver { name: "condrv", display_name: Some("Console Driver"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\drivers\\condrv.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Base", tag: None, dwords: &[] },
     InboxDriver { name: "KSecDD", display_name: None, service_type: SERVICE_KERNEL_DRIVER, image_path: Some("System32\\Drivers\\ksecdd.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "Base", tag: Some(1), dwords: &[] },
     InboxDriver { name: "NDIS", display_name: Some("@%SystemRoot%\\system32\\drivers\\ndis.sys,-200"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\ndis.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 3, group: "NDIS Wrapper", tag: None, dwords: &[] },
