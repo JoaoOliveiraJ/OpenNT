@@ -550,7 +550,7 @@ pub fn timer_apc_routine(apc_pointer: u64, _normal_routine: u64, _normal_context
 /// ExpDeleteTimer(Timer): o último ponteiro foi solto.
 pub fn delete_timer(pointer: u64) -> Result<(), KernelError> {
     let body = etimer(pointer);
-    timer::cancel_timer(body.ke_timer.address());
+    timer::cancel_timer_and_wait(body.ke_timer.address());
     // O descritor do DPC interno deixa de ter rotina associada.
     dpc::initialize_dpc(body.timer_dpc.address(), 0, 0);
     Ok(())

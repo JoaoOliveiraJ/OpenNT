@@ -103,7 +103,21 @@ pub fn query_due_time(timer: u64) -> u64 {
     if entry.due >= system_now { uptime_now.saturating_add(entry.due - system_now) } else { uptime_now.saturating_sub(system_now - entry.due) }
 }
 
-/// KeCancelTimer: o corpo continua pertencendo ao chamador.
+/// Os timers que um [`check_timers`] tirou da fila (ou que ficam nela, os
+/// periódicos) e ainda está sinalizando, com a CPU que os sinaliza. O
+/// vencimento sinaliza fora da trava da fila (o sinal acorda esperas, que
+/// cancelam os próprios timers). Com o despacho de usuário nos APs, um
+/// driver (o win32k numa thread de usuário) cancelava e liberava o KTIMER
+/// do pool num AP enquanto o BSP o sinalizava: o KeCancelTimer e a exclusão
+/// do ETIMER ([`cancel_timer_and_wait`]) esperam o vencimento em curso dele
+/// noutra CPU acabar, como o KeCancelTimer do 19041, que toma a trava da
+/// entrada da tabela que o KiTimerExpiration retém enquanto mexe no timer.
+static EXPIRING: SpinLock<Vec<(u64, usize)>> = SpinLock::new(Vec::new());
+
+/// Tira o timer da fila; o corpo continua pertencendo ao chamador. Não
+/// espera um vencimento em curso noutra CPU: o kernel cancela assim, com a
+/// trava das esperas retida, o timer do prazo de uma espera (o
+/// KTHREAD.Timer), que o sinal do vencimento precisa da mesma trava.
 pub fn cancel_timer(timer: u64) -> bool {
     let mut timers = TIMERS.lock();
     match timers.iter().position(|entry| entry.timer == timer) {
@@ -113,6 +127,18 @@ pub fn cancel_timer(timer: u64) -> bool {
         }
         None => false,
     }
+}
+
+/// KeCancelTimer: [`cancel_timer`] e a espera do vencimento em curso do
+/// timer noutra CPU; depois dele o dono pode liberar o KTIMER. O vencimento
+/// na própria CPU (uma espera acordada que cancela o timer) não é esperado.
+pub fn cancel_timer_and_wait(timer: u64) -> bool {
+    let queued = cancel_timer(timer);
+    let cpu = super::context_switch::processor();
+    while EXPIRING.lock().iter().any(|&(expiring, owner)| expiring == timer && owner != cpu) {
+        core::hint::spin_loop();
+    }
+    queued
 }
 
 /// Sinaliza vencidos e enfileira suas DPCs. Periódicos rearmam a partir do
@@ -128,6 +154,7 @@ pub fn check_timers() {
     let system_now = clock::system_time_100ns();
     let uptime_now = clock::uptime_100ns();
     let mut fired = Vec::new();
+    let cpu = super::context_switch::processor();
     {
         let mut timers = TIMERS.lock();
         let mut index = timers.len();
@@ -139,6 +166,7 @@ pub fn check_timers() {
                 continue;
             }
             fired.push((entry.timer, entry.dpc));
+            EXPIRING.lock().push((entry.timer, cpu));
             if entry.period_ms > 0 {
                 let period = entry.period_ms as u64 * 10_000;
                 entry.due = (uptime_now + entry.due + period).saturating_sub(now);
@@ -158,6 +186,10 @@ pub fn check_timers() {
         super::wait::signal(timer);
         if dpc_pointer != 0 {
             dpc::insert_queue_dpc(dpc_pointer, 0, 0);
+        }
+        let mut expiring = EXPIRING.lock();
+        if let Some(index) = expiring.iter().position(|&entry| entry == (timer, cpu)) {
+            expiring.swap_remove(index);
         }
     }
     super::timer2::expire_due();

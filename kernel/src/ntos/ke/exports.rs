@@ -88,7 +88,7 @@ fn set_timer_ex(call: &Call) -> Result<u64, KernelError> {
     Ok(timer::set_timer(call.arg(1), call.arg(2) as i64, call.arg(4), call.arg(3) as u32) as u64)
 }
 fn cancel_timer(call: &Call) -> Result<u64, KernelError> {
-    Ok(timer::cancel_timer(call.arg(1)) as u64)
+    Ok(timer::cancel_timer_and_wait(call.arg(1)) as u64)
 }
 fn read_state_timer(call: &Call) -> Result<u64, KernelError> {
     Ok(timer::read_state(call.arg(1)) as u64)
