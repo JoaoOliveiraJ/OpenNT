@@ -15,7 +15,9 @@
 //! - o winlogon.exe lê os assinantes das notificações de sessão em
 //!   `Control\Winlogon\Notifications`;
 //! - o mpr.dll (o net.exe, o explorer) lê a ordem dos provedores de rede em
-//!   `Control\NetworkProvider`.
+//!   `Control\NetworkProvider`;
+//! - o ResourcePolicyServer.dll que o psmserviceexthost.dll do DcomLaunch
+//!   carrega lê as políticas de recursos em `SYSTEM\ResourcePolicyStore`.
 //!
 //! O `SYSTEM\Setup` que o lsm.dll também lê não vem daqui: o estado de setup
 //! de uma instalação concluída é o mesmo em toda máquina e sai da tabela
@@ -65,6 +67,12 @@ pub fn system_keys(control_set: &str) -> Vec<HostKey> {
         // não inicia (0xC0000142). Os provedores só carregam numa chamada
         // WNet.
         registry::copy(registry::LOCAL_MACHINE, &format!("{host}\\Control\\NetworkProvider"), &format!("{control_set}\\Control\\NetworkProvider"), true, &mut keys);
+        // As políticas de recursos da instalação (ResourceSets e
+        // TierThresholds): o CreatePolicyStore do RmRpsInitialize
+        // (ResourcePolicyServer.dll) abre `ResourcePolicyStore\ResourceSets`;
+        // sem ela o RmRpsInitialize devolve 0x80070002, o RmpStartAllModules
+        // do psmserviceexthost.dll falha e os servidores RPC do HAM não sobem.
+        registry::copy(registry::LOCAL_MACHINE, "SYSTEM\\ResourcePolicyStore", "ResourcePolicyStore", true, &mut keys);
     }
     #[cfg(not(windows))]
     let _ = control_set;

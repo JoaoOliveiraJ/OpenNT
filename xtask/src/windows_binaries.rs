@@ -502,12 +502,19 @@ const SMSS_PROGRAMS: &[&str] = &[
     // O psmserviceexthost.dll importa o RMCLIENT.dll e o wer.dll, e o
     // bisrv.dll o RMCLIENT.dll: sem eles a carga falha, o PsmCrmStart do
     // PsmpInitialize do psmsrv.dll (sem teste de presença) falha e o
-    // BrokerInfrastructure para logo depois de iniciar.
+    // BrokerInfrastructure para logo depois de iniciar. O
+    // ResourcePolicyServer.dll é o anfitrião do conjunto
+    // ext-ms-win-core-resourcepolicyserver-l1-1-1: o RmpRpExtStart do
+    // psmserviceexthost.dll testa a presença do conjunto pelo esquema e chama
+    // o RmRpsInitialize; sem a DLL a carga adiada falha, o
+    // RmpStartAllModules devolve 0xC0000001 e os servidores RPC do HAM não
+    // sobem (o Lifetime Manager do sihost falha no HamConnectToServer).
     "psmserviceexthost.dll",
     "bisrv.dll",
     "RMCLIENT.dll",
     "wer.dll",
     "resourcepolicyclient.dll",
+    "ResourcePolicyServer.dll",
     "CSystemEventsBrokerClient.dll",
     "licensemanagerapi.dll",
     "DAB.dll",
