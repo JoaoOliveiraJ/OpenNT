@@ -85,7 +85,12 @@
 //!
 //! Os drivers de software sem hardware também ficam sob demanda, com os
 //! valores da instalação: o cache de compatibilidade de aplicativos
-//! (ahcache, Start 1 e sem Group na instalação: a chave fica sem Group), o
+//! (ahcache, Start 1 e sem Group na instalação: a chave fica sem Group; no
+//! boot do processo inicial real ele volta ao Start 1 da instalação e sobe
+//! com os drivers de sistema: sem o \Device\ahcache, o NtApphelpCacheControl
+//! responde STATUS_UNSUCCESSFUL às consultas de pacote do kernel32, e o
+//! QuirkIsEnabledForPackage2 das extensões de implantação do AppXSvc falha
+//! com ele), o
 //! IFS do Winsock 2 (ws2ifsl, Start 4), o navegador de rede (bowser, Type 2,
 //! Group Network, Tag 5) e os sockets AF_UNIX (afunix, Start 1). A subchave
 //! Parameters\Winsock do afunix (do modo usuário) não é copiada. Entram do
@@ -196,7 +201,7 @@ const DRIVERS: &[InboxDriver] = &[
         dwords: &[],
     },
     // Drivers de software sem hardware (Group "": a chave da instalação não tem Group).
-    InboxDriver { name: "ahcache", display_name: Some("@%systemroot%\\system32\\drivers\\ahcache.sys,-102"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\DRIVERS\\ahcache.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "", tag: None, dwords: &[] },
+    InboxDriver { name: "ahcache", display_name: Some("@%systemroot%\\system32\\drivers\\ahcache.sys,-102"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\DRIVERS\\ahcache.sys"), start: SERVICE_DEMAND_START, smss_start: Some(SERVICE_SYSTEM_START), error_control: 1, group: "", tag: None, dwords: &[] },
     InboxDriver { name: "ws2ifsl", display_name: Some("@%systemroot%\\System32\\drivers\\ws2ifsl.sys,-1000"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\ws2ifsl.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
     InboxDriver { name: "bowser", display_name: Some("@%systemroot%\\system32\\wkssvc.dll,-2001"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("system32\\DRIVERS\\bowser.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: Some(5), dwords: &[] },
     InboxDriver { name: "afunix", display_name: Some("afunix"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afunix.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
