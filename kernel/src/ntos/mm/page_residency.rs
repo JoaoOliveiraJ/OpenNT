@@ -46,6 +46,22 @@ fn providers() -> Vec<(String, Provider)> {
     STATE.lock().providers.clone()
 }
 
+/// Provedores que o registro aceita (a cópia sem alocação de
+/// [`callbacks`] tem esse tamanho).
+const MAX_PROVIDERS: usize = 16;
+
+/// As rotinas dos provedores, copiadas na pilha, sem os nomes: a falta de
+/// página e a sonda de cada acesso a memória de usuário passam por aqui, e
+/// copiar a lista com os nomes era uma alocação por nome a cada sonda.
+fn callbacks() -> ([Option<Provider>; MAX_PROVIDERS], usize) {
+    let mut list = [None; MAX_PROVIDERS];
+    let state = STATE.lock();
+    for (slot, (_, provider)) in list.iter_mut().zip(state.providers.iter()) {
+        *slot = Some(*provider);
+    }
+    (list, state.providers.len().min(MAX_PROVIDERS))
+}
+
 /// Falta de página no kernel: pergunta aos provedores de residência e devolve
 /// `true` quando um deles resolveu a falta (a instrução pode ser repetida);
 /// `false` para bit reservado, IRQL acima de APC_LEVEL, erro de leitura da
@@ -55,7 +71,8 @@ pub fn fault(address: u64, error: u32) -> bool {
     if error & 8 != 0 || irql::get_irql() > 1 {
         return false;
     }
-    for (_, provider) in providers() {
+    let (list, count) = callbacks();
+    for provider in list[..count].iter().flatten() {
         match (provider.fault)(address, error) {
             FaultResult::Resolved => return true,
             FaultResult::InPageError(status) => {
@@ -69,7 +86,8 @@ pub fn fault(address: u64, error: u32) -> bool {
 }
 
 fn resolve(address: u64) -> Result<Option<u64>, KernelError> {
-    for (_, provider) in providers() {
+    let (list, count) = callbacks();
+    for provider in list[..count].iter().flatten() {
         if let Some((base, top)) = provider.resolve_range {
             if address < base || address >= top {
                 continue;
@@ -136,6 +154,9 @@ pub fn register(name: &str, provider: Provider) -> Result<(), KernelError> {
         let mut state = STATE.lock();
         if state.providers.iter().any(|(existing, _)| existing == name) {
             return Err(KernelError::new(alloc::format!("duplicate residency provider: {name}")));
+        }
+        if state.providers.len() >= MAX_PROVIDERS {
+            return Err(KernelError::new(alloc::format!("too many residency providers: {name}")));
         }
         state.providers.push((String::from(name), provider));
         let first = !state.initialized;
