@@ -2078,6 +2078,10 @@ fn user_threads_in(assert: Assert, test: &TestProcess) {
     assert(basic.base_priority.get() == 0 && basic.priority.get() == thread_priority::query_priority(pointer), "userthreads: ThreadBasicInformation publica o incremento da base, 0 numa thread normal");
     assert(call("NtQueryInformationThread", handle, 9, info, 8) == 0 && guest::read64(info) == block + 0x800 && call("NtQueryInformationThread", handle, 17, info, 1) == 0 && guest::read8(info) == 1, "userthreads: endereco inicial e oculta do depurador");
     assert(call("NtQueryInformationThread", handle, 0, info, 40) == 0xC000_0004 && call("NtQueryInformationThread", handle, 5, info, 8) == 0xC000_0003, "userthreads: tamanho e classe invalidos");
+    // ThreadActualBasePriority (0x5fbbbf): a base absoluta da KTHREAD, ao
+    // contrário do incremento da ThreadBasicInformation; só 4 bytes.
+    let actual = call("NtQueryInformationThread", handle, 25, info, 4) == 0 && guest::read32(info) as i32 == thread_priority::query_base_priority(pointer) && guest::read32(info) as i32 > 0 && guest::read32(info + 0x38) == 4;
+    assert(actual && call("NtQueryInformationThread", handle, 25, info, 8) == 0xC000_0004, "userthreads: ThreadActualBasePriority devolve a base absoluta e exige 4 bytes");
     // O acesso de cada classe (o switch de 0x5fc1ac): só com
     // THREAD_QUERY_LIMITED_INFORMATION, Basic, Times e IsTerminated
     // respondem; Win32StartAddress e IsIoPending pedem

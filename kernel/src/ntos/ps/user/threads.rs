@@ -3067,7 +3067,8 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     }
     // O tamanho exato da classe (STATUS_INFO_LENGTH_MISMATCH) antes do
     // handle, e o acesso de cada classe (o switch de 0x5fc1ac): Basic,
-    // Times, PriorityBoost e IsTerminated com THREAD_QUERY_LIMITED_INFORMATION
+    // Times, PriorityBoost, IsTerminated e ActualBasePriority com
+    // THREAD_QUERY_LIMITED_INFORMATION
     // (0x800); Win32StartAddress, IsIoPending e HideFromDebugger com
     // THREAD_QUERY_INFORMATION (0x40). AmILastThread não usa o handle.
     let (need, access) = match class {
@@ -3081,6 +3082,9 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
         17 => (1, 0x40),
         // ThreadIsTerminated (ULONG).
         20 => (4, 0x800),
+        // ThreadActualBasePriority (LONG): o ramo próprio da classe 25
+        // (0x5fbbbf), com THREAD_QUERY_LIMITED_INFORMATION.
+        25 => (4, 0x800),
         _ => {
             crate::debug_print!("[usermode] NtQueryInformationThread classe {}", class);
             return Ok(0xC000_0003);
@@ -3149,6 +3153,11 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
             }
             // ThreadHideFromDebugger (BOOLEAN).
             17 => guest::try_write::<u8>(out, hidden as u8)?,
+            // ThreadActualBasePriority: a KTHREAD.BasePriority absoluta, com
+            // sinal (0x5fbbfc). O AutoCpuPriority::GetCurrent do
+            // StateRepository lê a prioridade por ela antes de cada
+            // transação do banco.
+            25 => guest::try_write::<i32>(out, thread_priority::query_base_priority(pointer))?,
             // ThreadIsTerminated: o PsIsThreadTerminating (o bit Terminated
             // do CrossThreadFlags, ligado quando o fim é pedido).
             _ => {
