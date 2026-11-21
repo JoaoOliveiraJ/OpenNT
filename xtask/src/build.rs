@@ -260,7 +260,9 @@ impl BuildOptions {
         BuildOptions {
             build_dir: PathBuf::new(),
             user_program: String::from("shell"),
-            kernel_test_scope: String::from("none"),
+            // O `--kernel-test-scope=e-process` também muda o volume NTFS (os
+            // programas do boot do smss para o programa Win32 do teste).
+            kernel_test_scope: if self.kernel_test_scope == "e-process" { self.kernel_test_scope.clone() } else { String::from("none") },
             console_mirror: false,
             start_driver: String::new(),
             trace_driver_api: false,
@@ -272,7 +274,6 @@ impl BuildOptions {
             slow_service_exit: false,
             user_smp: false,
             storage: String::new(),
-            system_volume: String::new(),
             display: String::new(),
             pnp_root: String::new(),
             kd: String::new(),
@@ -281,8 +282,8 @@ impl BuildOptions {
             net: false,
             memory_pressure: false,
             tpm: false,
-            // O `console_process` e o `test_account` ficam: eles também mudam o
-            // volume NTFS.
+            // O `console_process`, o `test_account` e o `system_volume` (o
+            // disco particionado) ficam: eles também mudam o volume NTFS.
             ..self.clone()
         }
     }
@@ -300,6 +301,8 @@ impl BuildOptions {
     pub fn kernel_key(&self) -> String {
         let mut options = self.without_load_options();
         options.initial_process.clear();
+        options.kernel_test_scope = String::from("none");
+        options.system_volume.clear();
         options.console_process = false;
         options.test_account = false;
         options.builtin_accounts_off = false;
@@ -679,6 +682,22 @@ mod tests {
         chain.shutdown_chain = true;
         assert_ne!(account.image_key(), chain.image_key());
         assert_eq!(base.kernel_key(), chain.kernel_key());
+        // O escopo e-process põe os programas do smss no volume e o volume do
+        // sistema é um disco particionado: outras imagens, o mesmo kernel. Os
+        // outros escopos de teste e a pilha de armazenamento só vão nas
+        // opções de carga.
+        let mut scope = options();
+        scope.kernel_test_scope = "all".into();
+        scope.storage = "real".into();
+        assert_eq!(base.image_key(), scope.image_key());
+        let mut e_process = options();
+        e_process.kernel_test_scope = "e-process".into();
+        assert_ne!(base.image_key(), e_process.image_key());
+        assert_eq!(base.kernel_key(), e_process.kernel_key());
+        let mut system_volume = scope.clone();
+        system_volume.system_volume = "ntfs.sys".into();
+        assert_ne!(scope.image_key(), system_volume.image_key());
+        assert_eq!(base.kernel_key(), system_volume.kernel_key());
         let mut release = options();
         release.release = true;
         assert_ne!(base.kernel_key(), release.kernel_key());
