@@ -498,16 +498,10 @@ fn write_hive(keys: &[Key], security: &[Vec<u8>], time: u64, file_name: &str) ->
     base
 }
 
-/// FILETIME de agora (100 ns desde 1601).
 /// O ActiveTimeBias da hive SYSTEM (UTC − hora local, em minutos): o
 /// relógio da máquina virtual guarda a hora local desse fuso.
 pub fn active_time_bias_minutes() -> i32 {
     cm::time_zone_information::ACTIVE_TIME_BIAS
-}
-
-fn now_filetime() -> u64 {
-    let since_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_nanos() / 100).unwrap_or(0) as u64;
-    since_unix + 116_444_736_000_000_000
 }
 
 /// Uma hive com as chaves das tabelas de semente (caminhos relativos à
@@ -538,7 +532,12 @@ fn hive_from_seeds(seeds: Vec<cm::seed::SeedKey>, file_name: &str, security: &Hi
         }
     }
     let descriptors = key_descriptors(&keys, security);
-    write_hive(&keys, &descriptors, now_filetime(), file_name)
+    // A hora da última escrita de toda chave e do cabeçalho é a da
+    // instalação, a mesma dos arquivos do volume: a hive de uma imagem
+    // aplicada traz a hora em que a imagem foi feita, e a hora fixa deixa o
+    // volume igual entre builds (a chave do primeiro logon feito,
+    // `first_logon`, é o hash dele).
+    write_hive(&keys, &descriptors, crate::ntfs_image::INSTALL_TIME, file_name)
 }
 
 /// Uma chave copiada desta máquina como chave de semente.

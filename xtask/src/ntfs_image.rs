@@ -320,8 +320,9 @@ fn standard_information(file_attributes: u32) -> Attribute {
 /// verdade tem horas em todo arquivo, e componentes do Windows as comparam
 /// (o Mm só retém sem uso a control area de imagem de um arquivo cuja
 /// versão, o tamanho e as horas, ele consegue conferir). Uma hora fixa
-/// deixa a imagem igual entre builds e não traz nada do hospedeiro.
-const INSTALL_TIME: u64 = 132_201_504_000_000_000;
+/// deixa a imagem igual entre builds e não traz nada do hospedeiro. As
+/// hives geradas (`hive_image`) usam a mesma hora.
+pub const INSTALL_TIME: u64 = 132_201_504_000_000_000;
 
 /// As quatro horas (criação, escrita, mudança, acesso) a partir de `at`.
 fn put_times(value: &mut [u8], at: usize) {
