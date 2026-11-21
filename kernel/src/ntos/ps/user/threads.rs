@@ -1612,6 +1612,14 @@ fn execute(thread: &Arc<UserThread>, executor: fn(u64, u64) -> u32) -> Result<(u
     };
     SLICE_THREAD[cpu].store(0, Ordering::Release);
     let exit_kind = crate::hal::amd64::usermode::block().exit_kind.get();
+    // A linha da falha de modo usuário (o CR2 e a pilha que o stub publicou),
+    // menos no serviço de depuração, que é uma chamada.
+    if exit_kind == 3 {
+        let block = crate::hal::amd64::usermode::block();
+        if block.fault_vector.get() != 0x2D {
+            crate::debug_print!(" C2={:016X} SP={:016X}", block.fault_cr2.get(), block.fault_rsp.get());
+        }
+    }
     // A captura de chamada e as exceções do intervalo (#DB próprio do usuário
     // ou pendente, a falta de página), tratadas com a thread ainda Running
     // nesta CPU, como o KiDispatchException do 19041 roda no contexto da

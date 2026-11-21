@@ -579,59 +579,14 @@ irq_user_single_step:
 irq_user_fastfail:
     mov edi, 0xC0000409             # fast fail nao continuavel, parametro = RCX
 irq_user_terminate:
-    # Publica a pilha do usuario e o CR2, e os imprime antes de encerrar.
+    # Publica a pilha do usuario e o CR2; a linha deles sai do despachante
+    # (`threads::execute`), com a trava das linhas da serial: escrita aqui
+    # direto na COM1, ela se misturava com as linhas das outras CPUs.
     mov rax, [rsp + r11 + 16]
     mov gs:[{fault_rsp}], rax
     mov rax, cr2
     mov gs:[{fault_cr2}], rax
-    # O servico de depuracao e uma chamada, nao uma falha: sem a linha.
-    cmp r10d, 0x2D
-    je user_terminate_current
-    mov dx, 0x3F8
-    mov al, 0x20
-    out dx, al
-    mov al, 0x43
-    out dx, al
-    mov al, 0x32
-    out dx, al
-    mov al, 0x3D
-    out dx, al
-    mov r10, cr2
-    call irq_hex64
-    mov al, 0x20
-    out dx, al
-    mov al, 0x53
-    out dx, al
-    mov al, 0x50
-    out dx, al
-    mov al, 0x3D
-    out dx, al
-    mov r10, [rsp + r11 + 16]
-    call irq_hex64
-    mov al, 0x0D
-    out dx, al
-    mov al, 0x0A
-    out dx, al
     jmp user_terminate_current
-
-# Imprime r10 em 16 digitos hexadecimais na COM1 (dx = 0x3F8).
-irq_hex64:
-    mov ecx, 16
-irq_hex_digit:
-    rol r10, 4
-    mov eax, r10d
-    and eax, 15
-    cmp eax, 10
-    jb irq_hex_decimal
-    add eax, 0x37
-    jmp irq_hex_emit
-irq_hex_decimal:
-    add eax, 0x30
-irq_hex_emit:
-    out dx, al
-    dec ecx
-    jnz irq_hex_digit
-    ret
 
 irq_kernel_exception:
     # Depurador do kernel ligado: #DB, NMI e #BP do anel 0 vao primeiro a
