@@ -17,7 +17,13 @@
 //! - o mpr.dll (o net.exe, o explorer) lê a ordem dos provedores de rede em
 //!   `Control\NetworkProvider`;
 //! - o ResourcePolicyServer.dll que o psmserviceexthost.dll do DcomLaunch
-//!   carrega lê as políticas de recursos em `SYSTEM\ResourcePolicyStore`.
+//!   carrega lê as políticas de recursos em `SYSTEM\ResourcePolicyStore`;
+//! - o bisrv.dll do BrokerInfrastructure lê a configuração do modelo de
+//!   segundo plano em `Windows NT\CurrentVersion\BackgroundModel`: o
+//!   BipGlobalTriggerConfigGetRegistryOverrides do BipMain abre
+//!   `BackgroundModel\EventSettings` e, sem ela, o PsmBiExtInitialize
+//!   devolve 0xC0070002, o servidor RPC do BI (8bfc3be1) não sobe e o
+//!   BiNotifyNewSession do sihost dá EPT_S_NOT_REGISTERED.
 //!
 //! O `SYSTEM\Setup` que o lsm.dll também lê não vem daqui: o estado de setup
 //! de uma instalação concluída é o mesmo em toda máquina e sai da tabela
@@ -93,6 +99,7 @@ pub fn software_keys() -> Vec<HostKey> {
             "Microsoft\\Windows NT\\CurrentVersion\\Containers",
             "Microsoft\\Windows\\CurrentVersion\\NetworkServiceTriggers",
             "Microsoft\\Windows\\CurrentVersion\\SharedPC",
+            "Microsoft\\Windows NT\\CurrentVersion\\BackgroundModel",
         ] {
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{path}"), path, true, &mut keys);
         }
