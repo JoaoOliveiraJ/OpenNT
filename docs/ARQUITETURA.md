@@ -524,10 +524,17 @@ entrega as APCs de kernel antes do intervalo seguinte. Uma PTE presente que
 muda numa VA de usuário invalida as outras CPUs com a raiz carregada
 (`smp::flush_root`, o KeFlushTb do espaço de endereçamento: o registro da
 raiz de cada CPU é publicado antes da carga do CR3), e uma da metade de
-sistema invalida todas (`smp::flush_kernel_page`; as desmontagens de várias
-páginas invalidam uma vez no fim do lote, `MapOptions::batch_remote`); o
-BSP atende a NMI de shootdown pela confirmação dele na mailbox, e dois
-shootdowns ao mesmo tempo esperam a vez. A escolha de uma faixa livre de VA
+sistema invalida todas menos as ociosas no HLT, que descartam a TLB ao
+acordar, como o KiFlushTb do 19041 (`smp::flush_kernel_page`; as
+desmontagens de várias páginas invalidam uma vez no fim do lote,
+`MapOptions::batch_remote`); o BSP atende a NMI de shootdown pela
+confirmação dele na mailbox, dois shootdowns ao mesmo tempo esperam a vez,
+e a espera manda de novo, a cada 20 ms, a NMI a quem não confirmou (sob o
+WHPX, o QEMU injeta a NMI com a CPU ainda dentro do tratador da anterior e
+ela se perde; o BSP conta as repetidas e as descarta). A exceção, a falta
+de página e a captura de chamada de um intervalo são tratadas com a thread
+ainda Running na CPU dela, antes do fim da execução (o KiDispatchException
+roda no contexto da thread). A escolha de uma faixa livre de VA
 de usuário e o registro dela no VAD são um passo só, sob a
 AddressCreationLock do processo (`memory::address_creation`). Um pulso (ou
 o sinal seguido do reset) que outra CPU dá entre a instalação de uma espera
