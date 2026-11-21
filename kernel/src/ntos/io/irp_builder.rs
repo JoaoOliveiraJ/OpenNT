@@ -152,6 +152,7 @@ pub fn allocate_irp(stack_size: i8) -> u64 {
     if address == 0 {
         return 0;
     }
+    crate::ntos::io::io_manager::forget_completed(address);
     // SAFETY: alocação zerada de `size` bytes.
     initialize_header(unsafe { Irp::at(address) }, size as u16, count as u8);
     address
@@ -160,6 +161,7 @@ pub fn allocate_irp(stack_size: i8) -> u64 {
 /// IoFreeIrp: a extensão pertence ao IRP e não sobrevive ao reuso.
 pub fn free_irp(packet: u64) {
     crate::ntos::kd::irp_trace::freed(packet);
+    crate::ntos::io::io_manager::forget_completed(packet);
     let _ = crate::ntos::io::extensions::free_irp_extension(packet);
     irp_extension::release(packet);
     guest::free_bytes(packet);
@@ -167,6 +169,7 @@ pub fn free_irp(packet: u64) {
 
 /// IoReuseIrp: reinicializa mantendo o tamanho e a pilha alocados.
 pub fn reuse_irp(packet: u64, status: u32) {
+    crate::ntos::io::io_manager::forget_completed(packet);
     // SAFETY: `packet` é um IRP vivo do chamador.
     let irp = unsafe { Irp::at(packet) };
     let count = irp.stack_count.get() as u8;
@@ -183,6 +186,7 @@ pub fn reuse_irp(packet: u64, status: u32) {
 
 /// IoInitializeIrp: a forma do IopAllocateIrp, sem a alocação.
 pub fn initialize_irp(packet: u64, size: u16, count: u8) {
+    crate::ntos::io::io_manager::forget_completed(packet);
     guest::write_bytes(packet, &alloc::vec![0u8; size as usize]);
     // SAFETY: `packet` aponta para `size` bytes do chamador.
     initialize_header(unsafe { Irp::at(packet) }, size, count);

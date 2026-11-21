@@ -219,7 +219,40 @@ fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce(
 /// o IRP sobe um nível antes de cada chamada e MORE_PROCESSING_REQUIRED
 /// interrompe. Depois finaliza o IRP síncrono (UserIosb, UserBuffer,
 /// UserEvent, buffer do I/O Manager).
+/// Diagnóstico: os IRPs concluídos até o fim (o retorno do driver que
+/// concluiu e a thread), até serem soltos ou reiniciados. Um IRP concluído
+/// de novo sem isso é um uso depois da conclusão (o SystemBuffer solto duas
+/// vezes): a linha `[irp]` nomeia as duas conclusões.
+static COMPLETED: SpinLock<crate::rtl::PtrMap<(u64, u64)>> = SpinLock::new(crate::rtl::PtrMap::new());
+
+/// O IRP volta a uso (alocado, reiniciado ou solto): sai do diagnóstico.
+pub fn forget_completed(packet: u64) {
+    let mut completed = COMPLETED.lock();
+    if !completed.is_empty() {
+        completed.remove(&packet);
+    }
+}
+
+/// O export IofCompleteRequest, com o retorno do driver que chamou.
+pub fn iof_complete_request_from(packet: u64, caller: u64) -> i32 {
+    let previous = COMPLETED.lock().get(&packet).copied();
+    if let Some((first, first_tid)) = previous {
+        let mut line = alloc::format!("[irp] IRP {:#x} concluido de novo: antes por ", packet);
+        crate::ntos::ke::bugcheck_trace::describe(&mut line, first, 0x4000);
+        line.push_str(&alloc::format!(" (tid {}), agora por ", first_tid));
+        crate::ntos::ke::bugcheck_trace::describe(&mut line, caller, 0x4000);
+        line.push_str(&alloc::format!(" (tid {})", process::get_current_thread_id()));
+        crate::debug_print!("{}", line);
+    }
+    let status = complete_request(packet, caller);
+    status
+}
+
 pub fn iof_complete_request(packet: u64) -> i32 {
+    complete_request(packet, 0)
+}
+
+fn complete_request(packet: u64, caller: u64) -> i32 {
     crate::ntos::ke::dispatcher::note_wake();
     // Com IoRegisterIoTracking ativo, o tempo do IRP vai aos rastreadores.
     super::io_perf::on_complete_request(packet);
@@ -270,6 +303,7 @@ pub fn iof_complete_request(packet: u64) -> i32 {
     if crate::ntos::io::paging_io::complete_paging_request(packet) {
         return 0;
     }
+    COMPLETED.lock().insert(packet, (caller, process::get_current_thread_id()));
     let (final_status, information) = builder::read_io_status(packet);
     // O lock sai antes da callback: o dono da conclusão pode esquecer ou
     // registrar outras conclusões dentro dela.

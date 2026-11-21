@@ -49,7 +49,7 @@ fn io_free_irp(call: &Call) -> Result<u64, KernelError> {
     Ok(0)
 }
 fn io_complete_request(call: &Call) -> Result<u64, KernelError> {
-    Ok(io_manager::iof_complete_request(call.arg(1)) as i64 as u64)
+    Ok(io_manager::iof_complete_request_from(call.arg(1), call.return_address) as i64 as u64)
 }
 fn io_allocate_work_item(call: &Call) -> Result<u64, KernelError> {
     Ok(work_items::allocate_work_item(call.arg(1)))
