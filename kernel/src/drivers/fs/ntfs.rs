@@ -351,6 +351,11 @@ static VOLUME_RESOURCES: [SharedLock; 2] = [SharedLock::new(), SharedLock::new()
 /// Volume NTFS montado.
 pub struct Ntfs {
     pub drive: u8,
+    /// O primeiro setor do volume no disco: 0 num disco sem partições, o
+    /// começo da partição NTFS num disco com MBR (o `--volume-sistema`). Os
+    /// LBAs do volume (os dos runs, os das escritas pendentes) são relativos
+    /// a ele; só a E/S ao disco soma o começo.
+    pub base: u64,
     pub geometry: Geometry,
     boot: Vec<u8>,
     pub pending: SpinLock<Vec<PendingWrite>>,
@@ -367,9 +372,34 @@ fn ascii(bytes: &[u8], offset: usize, length: usize) -> String {
     bytes[offset..offset + length].iter().map(|&byte| byte as char).collect()
 }
 
-/// Monta o volume do drive ATA indicado.
+/// MBR: a assinatura 0xAA55 e as quatro entradas de partição.
+const MBR_SIGNATURE_OFFSET: usize = 510;
+const MBR_PARTITIONS: usize = 0x1BE;
+/// Tipo de partição MBR do NTFS (PARTITION_IFS).
+const PARTITION_IFS: u8 = 0x07;
+
+/// O começo da primeira partição NTFS de um setor 0 com MBR (None se o
+/// setor não é um MBR ou não tem partição NTFS).
+fn ntfs_partition(sector: &[u8]) -> Option<u64> {
+    if sector.len() < 512 || sector[MBR_SIGNATURE_OFFSET] != 0x55 || sector[MBR_SIGNATURE_OFFSET + 1] != 0xAA {
+        return None;
+    }
+    (0..4).map(|index| MBR_PARTITIONS + index * 16).find(|&entry| sector[entry + 4] == PARTITION_IFS).map(|entry| u32::from_le_bytes([sector[entry + 8], sector[entry + 9], sector[entry + 10], sector[entry + 11]]) as u64).filter(|&start| start != 0)
+}
+
+/// Monta o volume do drive ATA indicado: o NTFS desde o setor 0 ou, num
+/// disco com MBR, o da partição NTFS (o papel do winload, que lê o volume de
+/// boot pela partição).
 pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
-    let boot = ata_pio::read_sectors(0, 1, drive)?;
+    let first = ata_pio::read_sectors(0, 1, drive)?;
+    let (base, boot) = if ascii(&first, 3, 8) == "NTFS    " {
+        (0, first)
+    } else {
+        match ntfs_partition(&first) {
+            Some(start) => (start, ata_pio::read_sectors(start, 1, drive)?),
+            None => (0, first),
+        }
+    };
     let oem = ascii(&boot, 3, 8);
     if oem != "NTFS    " {
         return Err(KernelError::new(alloc::format!("NTFS: assinatura ausente ({oem})")));
@@ -394,7 +424,7 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
     // O anel das mudanças do drive nasce com a montagem, com a capacidade
     // inteira: as transações depois dela não alocam por ele.
     let generation = CHANGES.lock().entry(drive).or_insert_with(DriveChanges::new).generation;
-    Ok(Arc::new(Ntfs { drive, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer(), secure_cache: SpinLock::new(BTreeMap::new()) }))
+    Ok(Arc::new(Ntfs { drive, base, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer(), secure_cache: SpinLock::new(BTreeMap::new()) }))
 }
 
 /// Índice do dispositivo do volume (`\Device\KernelVolume1`, o D:).
@@ -457,10 +487,11 @@ impl super::volume::FileSystem for Ntfs {
     }
 
     /// O NTFS que o xtask grava ocupa o disco ATA inteiro desde o setor 0
-    /// (as mesmas respostas que `storage/ata_volume.rs` dá para esse disco).
+    /// (as mesmas respostas que `storage/ata_volume.rs` dá para esse disco),
+    /// ou a partição dele.
     fn disk_extent(&self) -> Option<super::volume::DiskExtent> {
         let sectors = crate::drivers::storage::ata_pio::capacity_sectors(self.drive).ok()?;
-        Some(super::volume::DiskExtent { disk_number: self.drive as u32, starting_offset: 0, length: sectors * self.geometry.sector_size })
+        Some(super::volume::DiskExtent { disk_number: self.drive as u32, starting_offset: self.base * self.geometry.sector_size, length: sectors.saturating_sub(self.base) * self.geometry.sector_size })
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -706,7 +737,7 @@ impl Ntfs {
     /// Lê setores com as escritas pendentes sobrepostas.
     pub fn read_sectors(&self, lba: u64, count: u64) -> Result<Vec<u8>, KernelError> {
         let _shared = self.resource().acquire_shared();
-        let bytes = ata_pio::read_sectors(lba, count as u32, self.drive)?;
+        let bytes = ata_pio::read_sectors(self.base + lba, count as u32, self.drive)?;
         Ok(self.overlay_pending(lba, count, bytes))
     }
 
@@ -715,7 +746,7 @@ impl Ntfs {
     /// sobrepostas como em [`Self::read_sectors`].
     pub fn read_metadata_sectors(&self, lba: u64, count: u64) -> Result<Vec<u8>, KernelError> {
         let _shared = self.resource().acquire_shared();
-        let bytes = sector_cache::read(lba, count, self.drive, self.geometry.total_sectors)?;
+        let bytes = sector_cache::read(self.base + lba, count, self.drive, self.base + self.geometry.total_sectors)?;
         Ok(self.overlay_pending(lba, count, bytes))
     }
 
@@ -1353,7 +1384,7 @@ impl Ntfs {
                 // setor é lido inteiro (cabe na página dele: o destino tem
                 // páginas inteiras).
                 let take = (end - cursor).min(run_end - cursor);
-                ata_pio::read_sectors_dma_to_pages(run.lba + (cursor - run_start) / 512, take.div_ceil(512) as u32, self.drive, pages, cursor - offset)?;
+                ata_pio::read_sectors_dma_to_pages(self.base + run.lba + (cursor - run_start) / 512, take.div_ceil(512) as u32, self.drive, pages, cursor - offset)?;
                 cursor += take;
             }
             run_start = run_end;
@@ -1402,10 +1433,10 @@ impl Ntfs {
                 let lba = run.lba + in_run / 512;
                 let take = if sector_offset == 0 && available >= 512 && target % 2 == 0 {
                     let take = available / 512 * 512;
-                    ata_pio::read_sectors_dma_to_physical(lba, (take / 512) as u32, self.drive, target)?;
+                    ata_pio::read_sectors_dma_to_physical(self.base + lba, (take / 512) as u32, self.drive, target)?;
                     take
                 } else {
-                    let sector = ata_pio::read_sectors(lba, 1, self.drive)?;
+                    let sector = ata_pio::read_sectors(self.base + lba, 1, self.drive)?;
                     let take = (512 - sector_offset).min(available);
                     physical::write_bytes(target, &sector[sector_offset as usize..(sector_offset + take) as usize]);
                     take
@@ -1455,7 +1486,7 @@ impl Ntfs {
             }
             let take = (length - done).min(run_end - cursor);
             let lba = run.lba + (cursor - run_start) / 512;
-            ata_pio::write_sectors(lba, &bytes[done as usize..(done + take) as usize], self.drive)?;
+            ata_pio::write_sectors(self.base + lba, &bytes[done as usize..(done + take) as usize], self.drive)?;
             cursor += take;
             done += take;
             if done == length {

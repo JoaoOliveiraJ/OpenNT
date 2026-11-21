@@ -253,6 +253,13 @@ pub fn query_native(file: u64, class: u32, length: u32, buffer: u64, return_leng
 /// SystemBuffer e o modo de erro grave da thread desligado durante o
 /// pedido. Devolve o NTSTATUS (o do envio, se for falha).
 pub fn set_size(file: u64, size: u64) -> Result<u32, KernelError> {
+    set_end_of_file(file, size, true)
+}
+
+/// IRP_MJ_SET_INFORMATION FileEndOfFileInformation ao file system do
+/// arquivo: o de paginação do FsRtlSetFileSize (`paging`) ou o comum do
+/// ZwSetInformationFile de modo kernel (sem as flags de paginação).
+pub fn set_end_of_file(file: u64, size: u64, paging: bool) -> Result<u32, KernelError> {
     let device = related_device(file)?;
     if device == 0 {
         return Ok(0xC000_0010);
@@ -278,7 +285,7 @@ pub fn set_size(file: u64, size: u64) -> Result<u32, KernelError> {
     // SAFETY: IRP recém-construído e o slot do topo dele.
     let (irp, stack) = unsafe { (Irp::at(packet), IoStackLocation::at(irp_builder::first_stack_location(packet, count))) };
     stack.parameters.set_file.file_information_class.set(crate::ntos::inc::types::FileInformationClass(20));
-    irp.flags.set(0x42);
+    irp.flags.set(if paging { 0x42 } else { 0 });
     let old_hard_error = thread_io::set_hard_error_mode(0);
     let status = io_manager::iof_call_driver(device, packet);
     if status == 0x103 {

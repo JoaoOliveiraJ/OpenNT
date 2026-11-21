@@ -57,6 +57,9 @@ pub const INITIAL_PROCESS: &str = "INITIALPROCESS";
 /// `real`: a pilha de armazenamento do Windows sobe pelo PnP na controladora
 /// IDE; `nvme`: o storport.sys com o stornvme.sys no controlador NVMe.
 pub const STORAGE: &str = "STORAGE";
+/// `ntfs.sys`: o volume do sistema é a partição do segundo disco IDE, servida
+/// pela pilha de armazenamento real e pelo ntfs.sys (com `STORAGE=real`).
+pub const SYSTEM_VOLUME: &str = "SYSTEMVOLUME";
 /// `basic`: o BasicDisplay.sys real no adaptador VGA.
 pub const DISPLAY: &str = "DISPLAY";
 /// A raiz da árvore de dispositivos: `acpi` (o acpi.sys real, o padrão) ou

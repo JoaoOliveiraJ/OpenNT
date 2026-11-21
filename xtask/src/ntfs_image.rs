@@ -742,6 +742,20 @@ const DISK_SIGNATURE: u32 = 0x4F4E_5654;
 /// partição em HiddenSectors, como o formatador grava. Devolve o tamanho.
 pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
     let volume = volume_image(extras, &[], None, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+    write_partitioned(output, &volume)
+}
+
+/// O volume do sistema (o de [`build`], com os nós e o descritor da raiz)
+/// num disco particionado como o de [`build_partitioned`]: o
+/// `--volume-sistema=ntfs.sys`, em que a pilha de armazenamento real acha a
+/// partição e o ntfs.sys monta o volume dela.
+pub fn build_system_disk(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let volume = volume_image(extras, nodes, root, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+    write_partitioned(output, &volume)
+}
+
+/// O MBR com a partição do volume e o volume a partir do LBA 2048.
+fn write_partitioned(output: &Path, volume: &[u8]) -> Result<usize, String> {
     let volume_sectors = volume.len() / SECTOR;
     let mut disk = vec![0u8; (PARTITION_START_LBA + volume_sectors) * SECTOR];
     put32(&mut disk, 0x1B8, DISK_SIGNATURE);
@@ -755,7 +769,7 @@ pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space
     put32(&mut disk, entry + 12, volume_sectors as u32);
     disk[510] = 0x55;
     disk[511] = 0xAA;
-    disk[PARTITION_START_LBA * SECTOR..].copy_from_slice(&volume);
+    disk[PARTITION_START_LBA * SECTOR..].copy_from_slice(volume);
     write(output, &disk)?;
     Ok(disk.len())
 }

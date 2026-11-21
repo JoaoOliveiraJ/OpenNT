@@ -206,6 +206,14 @@ pub fn real_storage() -> bool {
     value(name::STORAGE) == Some("real")
 }
 
+/// `SYSTEMVOLUME=ntfs.sys` (`--volume-sistema=ntfs.sys`): o segundo disco IDE
+/// é particionado, a pilha IDE real e o ntfs.sys servem o volume da
+/// partição, e o NTFS do kernel só o lê antes da árvore de dispositivos (o
+/// papel do winload).
+pub fn system_volume_ntfs() -> bool {
+    value(name::SYSTEM_VOLUME) == Some("ntfs.sys")
+}
+
 /// `STORAGE=nvme` (`--storage=nvme`): o storport.sys com o stornvme.sys sobem
 /// pelo PnP no controlador NVMe do QEMU.
 pub fn nvme_storage() -> bool {

@@ -21,6 +21,13 @@
 //! interno continua servindo o volume D: (montado antes); a pilha real só
 //! começa depois de ele ler o que o boot precisa, e as duas não disputam a
 //! controladora durante o teste.
+//!
+//! Com `--volume-sistema=ntfs.sys` o segundo disco é particionado (MBR e a
+//! partição NTFS no LBA 2048): a referência é o setor de boot da partição,
+//! o volmgr.sys cria o volume dela, o mountmgr.sys o recebe marcado
+//! DO_SYSTEM_BOOT_PARTITION (`io/boot_partition.rs`) e dá a ele o C: pelo
+//! IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT no PnpBootDeviceWait desse modo, e o
+//! ntfs.sys o monta (`ntos/test/system_volume.rs`, `SYSTEM_VOLUME_NTFS_OK`).
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -44,6 +51,15 @@ const SECTORS: u32 = 8;
 const SECTOR_SIZE: usize = 512;
 /// Disco do volume NTFS (mestre-escravo primário: o segundo disco).
 const DATA_DRIVE: u8 = 1;
+/// O começo da partição do volume do sistema no disco particionado do
+/// `--volume-sistema=ntfs.sys`.
+const SYSTEM_PARTITION_LBA: u64 = 2048;
+
+/// O primeiro setor do volume NTFS no disco 1: o da partição no disco
+/// particionado, o 0 no disco sem partições.
+fn volume_lba() -> u64 {
+    if crate::ntos::init::boot_config::system_volume_ntfs() { SYSTEM_PARTITION_LBA } else { 0 }
+}
 
 /// O que a instalação do Windows deixa no Registro para as pilhas de disco
 /// e que o OpenNT ainda não tem: os serviços de boot partmgr e volmgr e as
@@ -144,13 +160,18 @@ fn log_published_objects() {
 /// a pilha não sobe).
 pub fn before_tree() -> Option<Vec<u8>> {
     debug_print!("[storage] pilha de armazenamento real pelo PnP");
-    let reference = match crate::drivers::storage::ata_pio::read_sectors(0, SECTORS, DATA_DRIVE) {
+    let reference = match crate::drivers::storage::ata_pio::read_sectors(volume_lba(), SECTORS, DATA_DRIVE) {
         Ok(bytes) => bytes,
         Err(error) => {
             debug_print!("[storage] leitura de referencia falhou: {}", error);
             return None;
         }
     };
+    // Com `--volume-sistema=ntfs.sys`, os arquivos que o ntfs.sys vai servir
+    // depois, pelo NTFS do kernel (`test/system_volume`).
+    if crate::ntos::init::boot_config::system_volume_ntfs() {
+        crate::ntos::test::system_volume::capture_reference();
+    }
     // Daqui em diante o atapi.sys programa a controladora: as escritas dele
     // não passam pelo driver interno, o cache de metadados se esvazia e o
     // driver interno esquece o que os registradores do canal guardavam.
@@ -179,7 +200,7 @@ pub fn check(reference: &[u8]) {
         debug_print!("[storage] \\Device\\Harddisk1\\DR1 nao existe: o disco 1 nao chegou ao disk.sys");
         return;
     };
-    match read_through_stack(disk, 0, SECTORS) {
+    match read_through_stack(disk, volume_lba(), SECTORS) {
         Ok(mut bytes) if signature_only_difference(&bytes, reference) => {
             // O partmgr.sys dá uma assinatura de disco MBR (offset 0x1B8 do
             // setor 0) a um disco que não tem nenhuma, como no Windows: o

@@ -149,6 +149,25 @@ pub fn init() {
     // dos drivers entra com `cm::service::driver`.
     crate::ntos::cm::service::driver::init();
     let loaded = crate::ntos::cm::service::system_drivers::start_boot_drivers();
+    // `--volume-sistema=ntfs.sys`: a pilha de armazenamento do volume do
+    // sistema sobe como no IopInitializeBootDrivers do NT, com os drivers de
+    // boot, antes das rotinas de reinicialização deles e do PnpBootDeviceWait:
+    // o cng.sys, a CI e a árvore de dispositivos vêm agora, o mountmgr.sys
+    // recebe o volume da partição de boot ainda sem a atribuição automática
+    // de letras (que a MountMgrDriverReinitialization liga) e dá a ele o C:.
+    let system_volume = crate::ntos::init::boot_config::system_volume_ntfs();
+    if system_volume {
+        load_cng();
+        crate::ntos::io::pnp_notify::hold_volume_interface_changes();
+        build_device_tree();
+        // O ntfs.sys é driver de boot (grupo "Boot File System"): registrado
+        // antes do PnpBootDeviceWait, monta o volume de boot na abertura do
+        // IopMarkBootPartition.
+        if let Err(error) = crate::ntos::cm::service::driver::start("Ntfs") {
+            debug_print!("[boot] servico Ntfs: {} ({})", error.message, error.win32);
+        }
+        crate::ntos::io::boot_partition::system_volume_boot_device_wait();
+    }
     // IopCallBootDriverReinitializationRoutines: depois do último driver de boot.
     crate::ntos::io::lifecycle::run_boot_driver_reinitialization_routines();
     // PnpBootDeviceWait(IopMarkBootPartition) do IopInitializeBootDrivers: o
@@ -158,20 +177,41 @@ pub fn init() {
     crate::ntos::io::boot_partition::boot_device_wait();
     crate::ntos::io::pnp::mark_boot_drivers_initialized();
     debug_print!("[boot] servicos carregados: {}", loaded);
-    // Catálogo CNG publicado antes de qualquer processo de usuário. O cng.sys
-    // é o binário real do Windows no volume: o OpenNT não o distribui.
-    crate::ntos::cm::cng_defaults::initialize().unwrap_or_else(|error| panic!("CNG: {error}"));
+    if !system_volume {
+        load_cng();
+    }
     // Control\Nsi da instalação, o repositório persistente do netio.sys.
     crate::ntos::cm::network_defaults::initialize().unwrap_or_else(|error| panic!("Nsi: {error}"));
-    // O cng.sys real do volume, antes de qualquer processo de usuário: imagem,
-    // imports e DriverEntry completos, publicando \Device\CNG.
+    // Rotinas de IoRegisterDriverReinitialization, como no NT.
+    crate::ntos::io::lifecycle::run_reinitialization_routines();
+    if !system_volume {
+        build_device_tree();
+    } else {
+        // O volume do sistema com o C:, servido pelo ntfs.sys (o marco S0).
+        crate::ntos::test::system_volume::check();
+    }
+    // `--usb`: a pilha USB 3 e HID real, que a árvore instalou na
+    // controladora xHCI, enumera as portas; os marcos saem dela.
+    if crate::drivers::bus::usb_stack::enabled() {
+        crate::drivers::bus::usb_stack::initialize();
+    }
+}
+
+/// O catálogo CNG e o cng.sys real do volume, antes de qualquer processo de
+/// usuário. O cng.sys é o binário real do Windows no volume: o OpenNT não o
+/// distribui.
+fn load_cng() {
+    crate::ntos::cm::cng_defaults::initialize().unwrap_or_else(|error| panic!("CNG: {error}"));
+    // Imagem, imports e DriverEntry completos, publicando \Device\CNG.
     match crate::ntos::mm::sysload::load("cng.sys") {
         Ok(_) if crate::ntos::ob::object_manager::lookup("\\Device\\CNG").is_some() => debug_print!("[boot] cng.sys carregado; \\Device\\CNG publicado"),
         Ok(_) => debug_print!("[boot] cng.sys carregado sem publicar \\Device\\CNG"),
         Err(error) => debug_print!("[boot] cng.sys falhou: {}", error),
     }
-    // Rotinas de IoRegisterDriverReinitialization, como no NT.
-    crate::ntos::io::lifecycle::run_reinitialization_routines();
+}
+
+/// A Code Integrity e a árvore de dispositivos do PnP, uma vez.
+fn build_device_tree() {
     // A árvore de dispositivos do PnP, uma vez: a raiz é o acpi.sys real
     // sobre o dispositivo ACPI da HAL, com o pci.sys no barramento PCI (o
     // padrão; `--pnp-root=internal` volta ao barramento PCI interno), com as
@@ -204,10 +244,5 @@ pub fn init() {
         || crate::drivers::net::net_stack::enabled()
     {
         crate::drivers::bus::device_tree::build();
-    }
-    // `--usb`: a pilha USB 3 e HID real, que a árvore instalou na
-    // controladora xHCI, enumera as portas; os marcos saem dela.
-    if crate::drivers::bus::usb_stack::enabled() {
-        crate::drivers::bus::usb_stack::initialize();
     }
 }

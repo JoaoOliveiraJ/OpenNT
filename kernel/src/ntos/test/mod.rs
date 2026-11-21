@@ -29,6 +29,7 @@ pub mod file_system_mount;
 pub mod fsd_sections;
 pub mod fsd_mapped;
 pub mod volume_enumeration;
+pub mod system_volume;
 pub mod e_process;
 pub mod minifilters;
 pub mod minifilter_support;

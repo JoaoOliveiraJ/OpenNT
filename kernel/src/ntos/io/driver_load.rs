@@ -19,7 +19,8 @@
 //!   está), chama o IopLoadDriver, troca STATUS_FAILED_DRIVER_ENTRY pelo
 //!   status do DriverEntry e STATUS_DRIVER_FAILED_PRIOR_UNLOAD por
 //!   STATUS_OBJECT_NAME_NOT_FOUND, roda as rotinas de reinicialização dos
-//!   drivers (IopCallDriverReinitializationRoutines) e sinaliza o evento.
+//!   drivers (IopCallDriverReinitializationRoutines, que só roda a fila
+//!   depois do IoInitSystem) e sinaliza o evento.
 //! - IopLoadDriver (0x73cc28): o caminho da imagem (IopBuildFullDriverPath:
 //!   o ImagePath com pelo menos um caractere, como está quando começa com
 //!   `\`, senão sob `\SystemRoot\`; sem ele,
@@ -304,7 +305,7 @@ fn load_unload_driver(_device: u64, block: u64) {
             Err(status) => status,
             Ok(handle) => {
                 let status = load_driver(handle);
-                lifecycle::run_reinitialization_routines();
+                lifecycle::run_reinitialization_routines_after_load();
                 status
             }
         }

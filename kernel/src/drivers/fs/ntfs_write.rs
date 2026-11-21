@@ -668,7 +668,7 @@ impl Tx<'_> {
                         Some(bytes) => bytes[index as usize * sector..(index + count) as usize * sector].to_vec(),
                         None => alloc::vec![0u8; count as usize * sector],
                     };
-                    if let Err(error) = ata_pio::write_sectors(operation.lba + index, &bytes, self.volume.drive) {
+                    if let Err(error) = ata_pio::write_sectors(self.volume.base + operation.lba + index, &bytes, self.volume.drive) {
                         // A primeira falha de E/S do commit, antes de o volume
                         // ser marcado para remontagem.
                         crate::debug_print!("[ntfs] commit: escrita de {} setores no LBA {:#x} do disco {} falhou com {:#x}: {}", count, operation.lba + index, self.volume.drive, error.status, error.message);

@@ -18,7 +18,6 @@ use crate::ntos::mm::guest_memory as guest;
 pub const STRUCT_SIZE: u64 = <Eresource as NtStruct>::SIZE;
 /// Flag.ResourceOwnedExclusive.
 const EXCLUSIVE_OWNER_FLAG: u16 = 0x80;
-const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
 
 /// Bloco de espera publicado em SharedWaiters/ExclusiveWaiters: vínculo
@@ -144,10 +143,6 @@ pub fn initialize(resource: u64) -> Result<u32, KernelError> {
     Ok(0)
 }
 
-fn has_owners_or_waiters(resource: &Eresource) -> bool {
-    resource.active_entries.get() != 0 || resource.number_of_shared_waiters.get() != 0 || resource.number_of_exclusive_waiters.get() != 0
-}
-
 /// Vetor de OWNER_ENTRY apontado por OwnerTable; a entrada 0 é o cabeçalho
 /// cujo TableSize é a capacidade.
 fn owner_table(resource: &Eresource) -> Option<&'static [OwnerEntry]> {
@@ -160,23 +155,28 @@ fn owner_table(resource: &Eresource) -> Option<&'static [OwnerEntry]> {
     Some(unsafe { OwnerEntry::array_at(table, header.table_size.get().max(1) as usize) })
 }
 
-/// ExReinitializeResourceLite: exige recurso ocioso; conserva a tabela, os
-/// vínculos globais e o SpinLock.
+/// ExReinitializeResourceLite (ntoskrnl 19041 rva 0x277fa0): devolve sempre
+/// STATUS_SUCCESS e esquece a posse que o recurso ainda tiver. Zera as
+/// entradas da tabela de donos (a 0, com o TableSize, fica) e os campos de
+/// ActiveCount a NumberOfExclusiveWaiters (contagens, Flag, SharedWaiters,
+/// ExclusiveWaiters e a entrada embutida); conserva os vínculos globais, a
+/// tabela, Reserved2, Address e o SpinLock. O ntfs.sys reinicializa o
+/// ERESOURCE de um FCB que ele libera com o recurso ainda adquirido
+/// (NtfsFreeEresource) e o reaproveita no FCB seguinte: um recurso que
+/// guardasse o dono antigo deixaria a próxima aquisição esperando para
+/// sempre.
 pub fn reinitialize(resource: u64) -> Result<u32, KernelError> {
     require_irql(2)?;
     let body = resource_at(resource);
     with_lock(&body.spin_lock, || {
-        if has_owners_or_waiters(body) {
-            return Ok(STATUS_INVALID_PARAMETER);
-        }
         if let Some(table) = owner_table(body) {
             let capacity = table[0].table_size.get();
-            clear(table[0].address(), capacity as u64 * OwnerEntry::SIZE);
-            table[0].table_size.set(capacity);
+            if capacity > 1 {
+                clear(table[1].address(), (capacity as u64 - 1) * OwnerEntry::SIZE);
+            }
         }
-        // ActiveCount..Reserved2: tudo menos os vínculos, Address e SpinLock.
         let start = body.active_count.address();
-        clear(start, body.address.address() - start);
+        clear(start, body.reserved2.address() - start);
         Ok(0)
     })
 }

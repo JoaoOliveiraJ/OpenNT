@@ -35,6 +35,7 @@
 //! dispositivos por sessão, e esse id é sempre -1 (todos recebem).
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::hal::amd64::native_call;
@@ -191,8 +192,43 @@ fn notify_interface(registrations: &[PlugPlayRegistration], event: &[u8; 16], cl
     }
 }
 
+/// GUID_DEVINTERFACE_VOLUME {53F5630D-B6BF-11D0-94F2-00A0C91EFB8B}.
+const GUID_DEVINTERFACE_VOLUME: [u8; 16] = [0x0D, 0x63, 0xF5, 0x53, 0xBF, 0xB6, 0xD0, 0x11, 0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B];
+
+/// As mudanças de interface de volume retidas (None = entregues na hora).
+static HELD_VOLUME_CHANGES: SpinLock<Option<Vec<(bool, [u8; 16], String)>>> = SpinLock::new(None);
+
+/// `--volume-sistema=ntfs.sys`: retém as mudanças de interface de volume
+/// enquanto a árvore dos drivers de boot sobe. No NT o
+/// IoSetDeviceInterfaceState põe a mudança na fila de eventos do PnP
+/// (PnpSetDeviceClassChange), entregue depois pelo worker dela, e o
+/// IopMarkBootPartition marca o volume de boot antes de o mountmgr.sys
+/// receber a chegada; aqui a entrega é síncrona, e a retenção dá a mesma
+/// ordem.
+pub fn hold_volume_interface_changes() {
+    let mut held = HELD_VOLUME_CHANGES.lock();
+    if held.is_none() {
+        *held = Some(Vec::new());
+    }
+}
+
+/// Entrega, na ordem, as mudanças de interface de volume retidas e volta à
+/// entrega na hora.
+pub fn release_volume_interface_changes() {
+    let held = HELD_VOLUME_CHANGES.lock().take().unwrap_or_default();
+    for (arrival, class, link) in held {
+        notify_interface_change(arrival, &class, &link);
+    }
+}
+
 /// Chegada (`arrival`) ou remoção de uma interface para os registros da classe.
 pub fn notify_interface_change(arrival: bool, class: &[u8; 16], link: &str) {
+    if *class == GUID_DEVINTERFACE_VOLUME {
+        if let Some(held) = HELD_VOLUME_CHANGES.lock().as_mut() {
+            held.push((arrival, *class, String::from(link)));
+            return;
+        }
+    }
     let registrations = PLUG_PLAY_REGISTRATIONS.lock().clone();
     notify_interface(&registrations, if arrival { &INTERFACE_ARRIVAL } else { &INTERFACE_REMOVAL }, class, link);
 }

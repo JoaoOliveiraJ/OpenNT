@@ -95,6 +95,10 @@ pub struct BuildOptions {
     /// na controladora IDE. `--storage=nvme`: o QEMU ganha um controlador
     /// NVMe com o `nvme.img` e o storport.sys com o stornvme.sys sobem nele.
     pub storage: String,
+    /// `--volume-sistema=ntfs.sys`: o `ntfs.img` vira um disco particionado
+    /// (MBR e a partição no LBA 2048), servido pela pilha IDE real
+    /// (`--storage=real`) e pelo ntfs.sys como o volume do sistema.
+    pub system_volume: String,
     /// `--display=basic`: o PnP instala o BasicDisplay.sys real no adaptador
     /// VGA e o inicia sobre o dxgkrnl.sys real.
     pub display: String,
@@ -169,6 +173,7 @@ impl BuildOptions {
             (name::START_DRIVER, self.start_driver.as_str()),
             (name::INITIAL_PROCESS, self.initial_process.as_str()),
             (name::STORAGE, self.storage.as_str()),
+            (name::SYSTEM_VOLUME, self.system_volume.as_str()),
             (name::DISPLAY, self.display.as_str()),
             (name::PNP_ROOT, self.pnp_root.as_str()),
             (name::SHUTDOWN_TEST, self.shutdown_test.as_str()),
@@ -267,6 +272,7 @@ impl BuildOptions {
             slow_service_exit: false,
             user_smp: false,
             storage: String::new(),
+            system_volume: String::new(),
             display: String::new(),
             pnp_root: String::new(),
             kd: String::new(),
@@ -521,7 +527,13 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // 256 MB em D:): o volume dele tem espaço livre para o arquivo crescer
     // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
-    let ntfs_bytes = crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?;
+    // `--volume-sistema=ntfs.sys`: o mesmo volume numa partição do disco,
+    // como o volume do sistema de uma instalação.
+    let ntfs_bytes = if options.system_volume.is_empty() {
+        crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?
+    } else {
+        crate::ntfs_image::build_system_disk(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?
+    };
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
     // próprio: montado em todo build (a opção de carga `--storage=nvme`
     // não muda as imagens), ligado só às máquinas com a opção.
@@ -564,6 +576,7 @@ mod tests {
             user_smp: false,
             initial_process: String::new(),
             storage: String::new(),
+            system_volume: String::new(),
             display: String::new(),
             windows_dir: None,
             pnp_root: String::new(),

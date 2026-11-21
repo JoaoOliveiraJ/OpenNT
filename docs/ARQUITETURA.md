@@ -2659,6 +2659,38 @@ Os marcos, cada um com um teste:
 - **S4**: barra-de-tarefas, area-de-trabalho, gerenciador-de-tarefas e
   bloco-de-notas passam com a opção; só então ela pode virar o padrão.
 
+O que já existe do S0 (teste `volume-sistema`, `SYSTEM_VOLUME_NTFS_OK`):
+o xtask grava o volume do sistema numa partição do segundo disco
+(`ntfs_image::build_system_disk`) e liga `--storage=real`; o NTFS do kernel
+acha a partição NTFS pelo MBR e soma o começo dela só na E/S ao disco (o
+campo `base` de `drivers/fs/ntfs.rs`; os LBAs dos runs e das escritas
+pendentes continuam relativos ao volume); a fase 1 sobe o cng.sys, a CI e a
+árvore de dispositivos logo depois dos drivers de boot, antes das rotinas
+de reinicialização deles, e inicia o ntfs.sys (driver de boot do grupo
+"Boot File System"); as mudanças de interface de volume ficam retidas
+durante essa árvore (`io/pnp_notify.rs`, o papel da fila de eventos do PnP
+do NT, em que o IoSetDeviceInterfaceState só enfileira a mudança), e o
+PnpBootDeviceWait desse modo (`io/boot_partition.rs`) abre o volume cuja
+primeira extensão (IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS) é a partição de
+boot, o que monta o ntfs.sys nele, marca DO_SYSTEM_BOOT_PARTITION o
+dispositivo da abertura, o do file system montado e as bases deles (o
+mountmgr.sys lê a base do dispositivo da abertura dele), entrega as
+chegadas ao mountmgr.sys e pede a letra pelo
+IOCTL_MOUNTMGR_BOOT_DL_ASSIGNMENT: o C: e o NtSystemRoot. Como no 19041, o
+ZwLoadDriver dos drivers que a árvore carrega não roda as rotinas de
+reinicialização da fila antes do IoInitSystem
+(`io/lifecycle.rs::run_reinitialization_routines_after_load`, o
+IopInitSystemCompletedEnoughForReInitRoutines): a
+MountMgrDriverReinitialization, que liga a atribuição automática de
+letras, fica para o fim dos drivers, e o volume de boot não recebe a
+primeira letra livre antes do BOOT_DL. O ExReinitializeResourceLite segue
+o 19041 (devolve sempre STATUS_SUCCESS e esquece a posse): o ntfs.sys
+reinicializa o ERESOURCE de um FCB que ele libera ainda adquirido e o
+reaproveita no FCB seguinte, e sem isso a primeira abertura no volume do
+sistema esperava para sempre. O `\SystemRoot` ainda leva ao
+volume do kernel, e o driver ATA interno continua servindo o NTFS do
+kernel depois do atapi.sys (o que o S1 tira).
+
 Os riscos conhecidos: o tempo de boot (cada leitura atravessa seis ou sete
 drivers e uma interrupção), o Cc e o ntfs.sys sob a carga da cadeia
 (ordem dos recursos do ntfs.sys contra os callbacks de AcquireForLazyWrite

@@ -776,7 +776,7 @@ pub fn set_information_file(handle: u64, io_status: u64, input: u64, class: u32)
             }
             // SAFETY: FILE_END_OF_FILE_INFORMATION (um LARGE_INTEGER) do chamador Zw.
             let size = unsafe { Field::<u64>::at(input) }.get();
-            let status = super::information::set_size(entry.file_object, size)?;
+            let status = super::information::set_end_of_file(entry.file_object, size, false)?;
             write_io_status(io_status, status, 0);
             return Ok(status);
         }

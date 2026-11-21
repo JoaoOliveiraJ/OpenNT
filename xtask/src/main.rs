@@ -131,6 +131,8 @@ const USAGE: &str = "uso: cargo xtask <build|run|test-boot|test-all|capturas|deb
 opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --kernel-test-scope=none|all|disk-stress|e-process --console-mirror --start-driver=NOME[,NOME...]
                    --trace-driver-api --initial-process=smss --storage=real|nvme --display=basic
+                   --volume-sistema=ntfs.sys (o volume do sistema numa particao do disco IDE,
+                   pela pilha de armazenamento real e pelo ntfs.sys; implica --storage=real)
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)
                    --heap-census (censo do heap do kernel na serial a cada 4 MB a mais de uso)
@@ -301,6 +303,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             user_smp: false,
             initial_process: String::new(),
             storage: String::new(),
+            system_volume: String::new(),
             display: String::new(),
             windows_dir: None,
             pnp_root: String::new(),
@@ -385,6 +388,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--desligar-contas-embutidas" => parsed.build.builtin_accounts_off = true,
             "--initial-process" => parsed.build.initial_process = required()?,
             "--storage" => parsed.build.storage = required()?,
+            "--volume-sistema" => parsed.build.system_volume = required()?,
             "--display" => parsed.build.display = required()?,
             "--windows-dir" => parsed.build.windows_dir = Some(PathBuf::from(required()?)),
             "--pnp-root" => parsed.build.pnp_root = required()?,
@@ -463,6 +467,17 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     }
     if !matches!(parsed.build.storage.as_str(), "" | "real" | "nvme") {
         return Err(format!("--storage aceita real ou nvme ({} recebido)", parsed.build.storage));
+    }
+    if !matches!(parsed.build.system_volume.as_str(), "" | "ntfs.sys") {
+        return Err(format!("--volume-sistema aceita apenas ntfs.sys ({} recebido)", parsed.build.system_volume));
+    }
+    // O volume do sistema no ntfs.sys é a partição do disco IDE, na pilha
+    // de armazenamento real.
+    if !parsed.build.system_volume.is_empty() {
+        if parsed.build.storage == "nvme" {
+            return Err(String::from("--volume-sistema=ntfs.sys usa a pilha IDE real (--storage=real), nao o NVMe"));
+        }
+        parsed.build.storage = String::from("real");
     }
     if !matches!(parsed.build.pnp_root.as_str(), "" | "acpi" | "internal") {
         return Err(format!("--pnp-root aceita acpi ou internal ({} recebido)", parsed.build.pnp_root));

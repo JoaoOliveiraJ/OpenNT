@@ -139,8 +139,31 @@ pub fn driver_object_extension(driver: u64, tag: u64) -> u64 {
     DRIVER_EXTENSIONS.lock().get(&(driver, tag)).copied().unwrap_or(0)
 }
 
-/// Chamado pelo Service Control ao fim da carga dos drivers de boot.
+/// IopInitSystemCompletedEnoughForReInitRoutines: o IoInitSystem já rodou as
+/// rotinas de reinicialização dos drivers do boot.
+static REINITIALIZATION_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// O IopCallDriverReinitializationRoutines(TRUE) do IoInitSystem: chamado
+/// pelo Service Control ao fim da carga dos drivers; daí em diante a carga
+/// de um driver também roda as rotinas da fila.
 pub fn run_reinitialization_routines() {
+    REINITIALIZATION_READY.store(true, core::sync::atomic::Ordering::Release);
+    drain_reinitialization_routines();
+}
+
+/// O IopCallDriverReinitializationRoutines(FALSE) do IopLoadUnloadDriver
+/// (ntoskrnl 19041 0x7806b0 -> 0x7716b4): a fila só roda depois do
+/// IoInitSystem (o IopInitSystemCompletedEnoughForReInitRoutines); antes
+/// dele, um driver carregado pelo ZwLoadDriver no meio dos drivers de boot
+/// não adianta as rotinas dos outros (a MountMgrDriverReinitialization, que
+/// liga a atribuição automática de letras, fica para o fim dos drivers).
+pub fn run_reinitialization_routines_after_load() {
+    if REINITIALIZATION_READY.load(core::sync::atomic::Ordering::Acquire) {
+        drain_reinitialization_routines();
+    }
+}
+
+fn drain_reinitialization_routines() {
     loop {
         let entry = {
             let mut routines = REINITIALIZATION.lock();

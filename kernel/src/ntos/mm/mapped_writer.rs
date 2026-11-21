@@ -30,8 +30,9 @@ use crate::ntos::mm::section::fsd_file;
 use crate::rtl::KernelError;
 
 pub const STATUS_CANT_WAIT: u32 = fs_filter::STATUS_CANT_WAIT;
-/// FSRTL_MOD_WRITE_TOP_LEVEL_IRP.
-const FSRTL_MOD_WRITE_TOP_LEVEL_IRP: u64 = 2;
+/// FSRTL_MOD_WRITE_TOP_LEVEL_IRP (o 2 é o FSRTL_CACHE_TOP_LEVEL_IRP do lazy
+/// writer, que o ntfs.sys trata de outro jeito).
+const FSRTL_MOD_WRITE_TOP_LEVEL_IRP: u64 = 3;
 const PAGE: u64 = 0x1000;
 /// O intervalo entre as passadas (5 s).
 const PERIOD_100NS: u64 = 50_000_000;
