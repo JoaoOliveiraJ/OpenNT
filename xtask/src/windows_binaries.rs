@@ -894,7 +894,18 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// ExecModelClient.dll, que o servidor CoreUI do CoreUIComponents.dll no
 /// sihost carrega pelo nome (g_dllExecModelClient, DllName::Import): sem ele
 /// o Cn::Throw::DllNotFoundException leva o CoreUIHost ao fail fast
-/// (0xC0000602); os imports estáticos deles que faltavam (AppXDeploymentClient.dll,
+/// (0xC0000602); o Windows.System.Launcher.dll, servidor em processo da
+/// classe WinRT Windows.System.Internal.Launch.LauncherQueryInfo que um
+/// componente do sihost ativa ao subir (sem a classe, REGDB_E_CLASSNOTREG
+/// e falha crítica 0x80270234); o OneCoreCommonProxyStub.dll, a DLL de
+/// proxies das interfaces COM do OneCore (a classe PSFactoryBuffer
+/// {A6FF50C0-56C0-71CA-5732-BED303A59628}): o PublishServices do Search
+/// Lifetime Manager (mssrch.dll, um objeto ATL sem o marshaler livre)
+/// oferece o IServiceProvider dele pelo ProfferService do
+/// AgileProfferServiceImpl, que pede uma referência ágil
+/// (RoGetAgileReference); sem o proxy do IServiceProvider o empacotamento
+/// devolve REGDB_E_IIDNOTREG (0x80040155) e o sihost para na falha crítica;
+/// os imports estáticos deles que faltavam (AppXDeploymentClient.dll,
 /// fltLib.dll, container.dll, tquery.dll e esent.dll); e as cargas
 /// atrasadas de primeiro nível deles com o fecho estático de cada uma: o
 /// sihost trata como falha crítica (fail fast) qualquer HRESULT de erro de
@@ -956,6 +967,8 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "NPSM.dll",
     "fcon.dll",
     "ExecModelClient.dll",
+    "Windows.System.Launcher.dll",
+    "OneCoreCommonProxyStub.dll",
     // Os imports estáticos dos componentes.
     "AppXDeploymentClient.dll",
     "fltLib.dll",
