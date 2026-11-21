@@ -1111,6 +1111,64 @@ impl Ntfs {
         self.copy_range_to_physical_with(path, offset, destination, length, false)
     }
 
+    /// `[offset, offset+length)` do $DATA para as páginas `pages` (frames de
+    /// 4 KB), em ordem: cada trecho contíguo no disco num comando de DMA com
+    /// um PRD por página, em vez de um comando por página; acima do
+    /// ValidDataLength, zeros, como em [`Ntfs::copy_range_to_physical`]. Um
+    /// `offset` fora da página, clusters menores que a página ou um frame
+    /// acima de 4 GB vão página a página por aquela.
+    pub fn copy_range_to_pages(&self, path: &str, offset: u64, pages: &[u64], length: u64) -> Result<(), KernelError> {
+        const PAGE: u64 = 4096;
+        let _shared = self.resource().acquire_shared();
+        if length.div_ceil(PAGE) > pages.len() as u64 {
+            return Err(error("NTFS: paginas de destino insuficientes"));
+        }
+        let layout = self.file_layout(path)?.filter(|layout| offset + length <= layout.size).ok_or_else(|| error("NTFS: faixa de copia invalida"))?;
+        let direct = layout.runs.is_some() && offset % PAGE == 0 && self.geometry.cluster_size % PAGE == 0 && pages.iter().all(|&page| page % PAGE == 0 && page + PAGE <= 0x1_0000_0000);
+        let Some(runs) = layout.runs.filter(|_| direct) else {
+            let mut done = 0;
+            for &page in pages {
+                if done >= length {
+                    break;
+                }
+                let take = PAGE.min(length - done);
+                self.copy_range_to_physical(path, offset + done, page, take)?;
+                done += take;
+            }
+            return Ok(());
+        };
+        let readable = length.min(layout.valid.saturating_sub(offset));
+        let (end, mut cursor, mut run_start) = (offset + readable, offset, 0u64);
+        for run in runs {
+            if cursor >= end {
+                break;
+            }
+            let run_end = run_start + run.sectors * 512;
+            if cursor < run_end {
+                // Os runs começam em fronteira de cluster, múltiplo da página:
+                // cada trecho começa numa página inteira do destino. O último
+                // setor é lido inteiro (cabe na página dele).
+                let take = (end - cursor).min(run_end - cursor);
+                let first = ((cursor - offset) / PAGE) as usize;
+                ata_pio::read_sectors_dma_to_pages(run.lba + (cursor - run_start) / 512, take.div_ceil(512) as u32, self.drive, &pages[first..])?;
+                cursor += take;
+            }
+            run_start = run_end;
+        }
+        if cursor < end {
+            return Err(error("NTFS: runlist menor que o tamanho do arquivo"));
+        }
+        // Do ValidDataLength ao fim pedido (e o resto do último setor lido),
+        // zeros.
+        let mut at = readable;
+        while at < length {
+            let take = (PAGE - at % PAGE).min(length - at);
+            physical::zero(pages[(at / PAGE) as usize] + at % PAGE, take as usize);
+            at += take;
+        }
+        Ok(())
+    }
+
     /// [`Ntfs::copy_range_to_physical`] da E/S de paginação do arquivo de
     /// paginação: os clusters crus, sem o ValidDataLength (o MiCreatePagingFile
     /// do 19041 só põe o EndOfFile, e o Mm só lê o que gravou).

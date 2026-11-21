@@ -36,20 +36,18 @@ struct CacheBlock {
 }
 
 impl CacheBlock {
-    /// Lê `[offset, offset + length)` do arquivo direto para frames novos.
+    /// Lê `[offset, offset + length)` do arquivo direto para frames novos,
+    /// todos de uma vez (um comando de DMA por trecho contíguo no disco).
     fn read(volume: &Ntfs, path: &str, offset: u64, length: u64) -> Result<CacheBlock, KernelError> {
         let mut block = CacheBlock { frames: Vec::with_capacity(length.div_ceil(PAGE) as usize), length };
-        let mut done = 0;
-        while done < length {
+        for _ in 0..length.div_ceil(PAGE) {
             let frame = pfn::alloc_page();
             if frame == 0 {
                 return Err(KernelError::with_status("volume read cache: PFN esgotado", 0xC000_009A));
             }
             block.frames.push(frame);
-            let take = PAGE.min(length - done);
-            volume.copy_range_to_physical(path, offset + done, frame, take)?;
-            done += take;
         }
+        volume.copy_range_to_pages(path, offset, &block.frames, length)?;
         Ok(block)
     }
 

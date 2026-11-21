@@ -390,21 +390,65 @@ impl Channel {
             return Err(error("ATA DMA: destino invalido"));
         }
         let (bmide, table) = self.bus_master()?;
-        let command = if write { Command::WriteDma } else { Command::ReadDma };
         let mut done = 0u32;
         while done < count {
             let chunk = (count - done).min(256);
-            let sector = lba + done as u64;
             write_prd_table(table, destination + done as u64 * 512, chunk);
-            let started = cpu::rdtsc();
-            let result = self.run(command, sector, chunk, drive, |timeout| dma_attempt(bmide, table, sector, chunk, drive, write, timeout));
-            DMA_TSC.fetch_add(cpu::rdtsc().wrapping_sub(started), Ordering::Relaxed);
-            DMA_COMMANDS.fetch_add(1, Ordering::Relaxed);
-            DMA_SECTORS.fetch_add(chunk as u64, Ordering::Relaxed);
-            result?;
+            self.dma_command(bmide, table, lba + done as u64, chunk, drive, write)?;
             done += chunk;
         }
         Ok(())
+    }
+
+    /// READ DMA para uma lista de páginas físicas, como a lista de
+    /// dispersão que o ataport monta do MDL de uma leitura: os setores enchem
+    /// as páginas em ordem, até 256 setores por comando, um PRD por página.
+    fn transfer_dma_pages(&mut self, lba: u64, count: u32, drive: u8, pages: &[u64]) -> Result<(), KernelError> {
+        validate_range(lba, count as u64, drive)?;
+        if (count as u64 * 512).div_ceil(PAGE_BYTES) > pages.len() as u64 || pages.iter().any(|&page| page % PAGE_BYTES != 0 || page + PAGE_BYTES > 0x1_0000_0000) {
+            return Err(error("ATA DMA: paginas de destino invalidas"));
+        }
+        let (bmide, table) = self.bus_master()?;
+        let mut done = 0u32;
+        while done < count {
+            let chunk = (count - done).min(256);
+            write_prd_pages(table, pages, done as u64 * 512, chunk);
+            self.dma_command(bmide, table, lba + done as u64, chunk, drive, false)?;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// Um comando de DMA já descrito na tabela PRD, com o tratamento de erro
+    /// de `run` e a contagem da linha `[perf]`.
+    fn dma_command(&mut self, bmide: u16, table: DmaBuffer, sector: u64, chunk: u32, drive: u8, write: bool) -> Result<(), KernelError> {
+        let command = if write { Command::WriteDma } else { Command::ReadDma };
+        let started = cpu::rdtsc();
+        let result = self.run(command, sector, chunk, drive, |timeout| dma_attempt(bmide, table, sector, chunk, drive, write, timeout));
+        DMA_TSC.fetch_add(cpu::rdtsc().wrapping_sub(started), Ordering::Relaxed);
+        DMA_COMMANDS.fetch_add(1, Ordering::Relaxed);
+        DMA_SECTORS.fetch_add(chunk as u64, Ordering::Relaxed);
+        result
+    }
+}
+
+const PAGE_BYTES: u64 = 4096;
+
+/// Tabela PRD de `count` setores a partir do byte `start` da lista de
+/// páginas: uma região por página (nenhuma cruza 64 KiB), a última com o bit
+/// de fim.
+fn write_prd_pages(table: DmaBuffer, pages: &[u64], start: u64, count: u32) {
+    let end = start + count as u64 * 512;
+    let (mut at, mut entries) = (start, 0u64);
+    while at < end {
+        let offset = at % PAGE_BYTES;
+        let length = (PAGE_BYTES - offset).min(end - at);
+        let prd = table.address + entries * 8;
+        guest::write32(prd, (pages[(at / PAGE_BYTES) as usize] + offset) as u32);
+        guest::write16(prd + 4, length as u16);
+        guest::write16(prd + 6, if at + length >= end { 0x8000 } else { 0 });
+        entries += 1;
+        at += length;
     }
 }
 
@@ -592,6 +636,13 @@ fn task_file(lba: u64, count: u32) {
 /// READ DMA real para memória física (endereço físico do destino).
 pub fn read_sectors_dma_to_physical(lba: u64, count: u32, drive: u8, destination: u64) -> Result<(), KernelError> {
     CHANNEL.lock().transfer_dma(lba, count, drive, destination, false)
+}
+
+/// READ DMA de `count` setores para as páginas `pages` (frames de 4 KB
+/// abaixo de 4 GB), em ordem: um comando por até 256 setores, em vez de um
+/// por página.
+pub fn read_sectors_dma_to_pages(lba: u64, count: u32, drive: u8, pages: &[u64]) -> Result<(), KernelError> {
+    CHANNEL.lock().transfer_dma_pages(lba, count, drive, pages)
 }
 
 /// Lê `count` setores a partir do LBA (drive 0 = mestre, 1 = escravo). Só
