@@ -166,27 +166,35 @@ fn file_system_id(file_system: &Arc<dyn LifetimeFileSystem>) -> usize {
 
 /// Cada volume tem suas identidades; registros NTFS reutilizados se
 /// distinguem pela sequência e os provedores sem inode usam o caminho.
-fn state_for(file_system: &Arc<dyn LifetimeFileSystem>, path: &str) -> u64 {
+/// A chave do estado do arquivo (o stat, fora da trava do registro).
+fn state_key(file_system: &Arc<dyn LifetimeFileSystem>, path: &str) -> (usize, String) {
     let metadata = file_system.stat(path);
     let identity = match metadata.and_then(|stat| stat.reference) {
         Some(reference) => alloc::format!("{reference}:{}", metadata.map_or(0, |stat| stat.sequence)),
         None => path.to_uppercase(),
     };
-    let key = (file_system_id(file_system), identity);
-    with(|registry| {
-        if let Some(&id) = registry.keys.get(&key) {
-            let state = registry.states.get_mut(&id).expect("estado registrado");
-            if !state.removed {
-                state.path = String::from(path);
-            }
-            return id;
+    (file_system_id(file_system), identity)
+}
+
+/// O estado da chave, criado se falta, com a trava do registro tomada.
+fn state_locked(registry: &mut Registry, file_system: &Arc<dyn LifetimeFileSystem>, key: (usize, String), path: &str) -> u64 {
+    if let Some(&id) = registry.keys.get(&key) {
+        let state = registry.states.get_mut(&id).expect("estado registrado");
+        if !state.removed {
+            state.path = String::from(path);
         }
-        registry.next += 1;
-        let id = registry.next;
-        registry.keys.insert(key.clone(), id);
-        registry.states.insert(id, State { file_system: file_system.clone(), key, path: String::from(path), descriptions: Vec::new(), sections: Vec::new(), pending: false, removed: false, orphan_bytes: None, section_object_pointers: 0 });
-        id
-    })
+        return id;
+    }
+    registry.next += 1;
+    let id = registry.next;
+    registry.keys.insert(key.clone(), id);
+    registry.states.insert(id, State { file_system: file_system.clone(), key, path: String::from(path), descriptions: Vec::new(), sections: Vec::new(), pending: false, removed: false, orphan_bytes: None, section_object_pointers: 0 });
+    id
+}
+
+fn state_for(file_system: &Arc<dyn LifetimeFileSystem>, path: &str) -> u64 {
+    let key = state_key(file_system, path);
+    with(|registry| state_locked(registry, file_system, key, path))
 }
 
 /// Consultas sem descrições vivas não acumulam entradas; o
@@ -328,8 +336,12 @@ pub fn bind(entry: Entry, file_system: &Arc<dyn LifetimeFileSystem>, path: &str)
     if candidate == 0 {
         return Err(KernelError::with_status("SECTION_OBJECT_POINTERS allocation failed", 0xC000_009A));
     }
-    let state = state_for(file_system, path);
-    let (description, section_object_pointers) = with(|registry| {
+    // O estado é achado (ou criado) na mesma trava em que a descrição entra
+    // nele: com a trava solta no meio, o `collect` de outra CPU tirava o
+    // estado ainda sem descrições e o registro não o achava mais.
+    let key = state_key(file_system, path);
+    let (state, description, section_object_pointers) = with(|registry| {
+        let state = state_locked(registry, file_system, key, path);
         registry.next += 1;
         let id = registry.next;
         registry.descriptions.insert(id, Description { state, entry, cleaned: false });
@@ -339,7 +351,7 @@ pub fn bind(entry: Entry, file_system: &Arc<dyn LifetimeFileSystem>, path: &str)
         if found.section_object_pointers == 0 {
             found.section_object_pointers = candidate;
         }
-        (id, found.section_object_pointers)
+        (state, id, found.section_object_pointers)
     });
     if section_object_pointers != candidate {
         guest::free_bytes(candidate);
@@ -382,8 +394,9 @@ pub fn bind(entry: Entry, file_system: &Arc<dyn LifetimeFileSystem>, path: &str)
 /// A seção informa se protege uma imagem executável: dados permitem retirar
 /// o nome; imagem impede DELETE_ON_CLOSE com CANNOT_DELETE.
 pub fn retain_section(file_system: &Arc<dyn LifetimeFileSystem>, path: &str, image: bool) -> u64 {
-    let state = state_for(file_system, path);
+    let key = state_key(file_system, path);
     with(|registry| {
+        let state = state_locked(registry, file_system, key, path);
         registry.next += 1;
         let id = registry.next;
         registry.sections.insert(id, Section { state, image });
