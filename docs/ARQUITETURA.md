@@ -5643,7 +5643,21 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   a subchave `Svchost\appmodel`, o `PackageRepositoryRoot` e o
   `PackageRoot` de `Microsoft\Windows\CurrentVersion\Appx` e a pasta vazia
   `\ProgramData\Microsoft\Windows\AppRepository` dos bancos, nunca os
-  bancos desta máquina), as
+  bancos desta máquina), o registro dos pacotes da caixa no primeiro logon
+  (`xtask/src/inbox_packages.rs`: as pastas do
+  Microsoft.Windows.StartMenuExperienceHost e do ShellExperienceHost em
+  `\Windows\SystemApps`, sem a `microsoft.system.package.metadata` que o
+  AppXSvc gera; os serviços AppReadiness e AppXSvc com as DLLs deles; as
+  chaves de uma instalação nova: os valores de configuração do AppX, o
+  volume de pacotes padrão de `Appx\PackageVolumes`, as extensões de
+  implantação da caixa, as filas vazias do AppXSvc, a chave `Applications`
+  vazia do AppxAllUserStore, as entradas dos dois pacotes em
+  `AppxAllUserStore\InboxApplications` e `Config`, a classe COM e o AppID
+  do AppReadiness, os SIPs do AppxSip.dll, o provedor
+  WINTRUST_ACTION_GENERIC_VERIFY_V2 e as raízes públicas da Microsoft;
+  o registro é dos serviços reais no convidado, e os bancos do
+  StateRepository, os identificadores e o estado por usuário são todos
+  feitos lá), as
   fontes de `\SystemRoot\Fonts` com o GRE_Initialize, o FontSubstitutes, o
   FontLink e a chave Fonts, e na SYSTEM o `Control\IDConfigDB` e os perfis
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
@@ -5660,8 +5674,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   coordenador de rollout do DesktopShellExt ativa, os
   componentes que ele cria em processo, os imports estáticos deles e as
   cargas atrasadas de primeiro nível, porque um componente que falha
-  derruba o sihost: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`; o shell
-  imersivo do twinui fica fora), o papel de parede
+  derruba o sihost: `USER_LOGON_PROGRAMS` e `WINDOWS_PROGRAMS`; com eles o
+  shell imersivo do twinui que o explorer sobe, com as DLLs dos
+  componentes dele e das classes que eles ativam, porque um componente que
+  falha também derruba o explorer), o papel de parede
   padrão do perfil Default (as imagens img0 de
   `\Windows\Web\Wallpaper\Windows` e de `\Windows\Web\4K\Wallpaper\Windows`,
   `WALLPAPER_FOLDERS`), as

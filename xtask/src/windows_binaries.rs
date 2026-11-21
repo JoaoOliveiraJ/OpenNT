@@ -918,7 +918,11 @@ const LOGON_SCREEN_PROGRAMS: &[&str] = &[
 /// desktop não tem). O shell imersivo (twinui.dll, twinui.pcshell.dll e
 /// windows.immersiveshell.serviceprovider.dll), que roda os componentes
 /// dele no explorer com o mesmo tratamento de falha crítica e sem
-/// reinício, o AppResolver.dll e o stobject.dll também ficam fora.
+/// reinício, vai com as DLLs de cada componente da tabela
+/// `s_rgShellComponent` do twinui.pcshell e as das classes que eles ativam
+/// ao subir (o botão Iniciar abre o menu pelo SID_ImmersiveLauncher dele);
+/// e o AppReadiness e o AppXSvc do registro dos pacotes da caixa
+/// (`inbox_packages`).
 const USER_LOGON_PROGRAMS: &[&str] = &[
     // O userinit.
     "userinit.exe",
@@ -948,6 +952,88 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "stobject.dll",
     "wmiclnt.dll",
     "batmeter.dll",
+    // O shell imersivo no explorer.
+    "twinui.dll",
+    "twinui.pcshell.dll",
+    "windows.immersiveshell.serviceprovider.dll",
+    "ApplicationFrame.dll",
+    "AppResolver.dll",
+    "StartTileData.dll",
+    "netapi32.dll",
+    "Windows.CloudStore.dll",
+    "NotificationController.dll",
+    "NotificationControllerPS.dll",
+    "Windows.StateRepositoryPS.dll",
+    "Windows.StateRepositoryBroker.dll",
+    "Windows.StateRepositoryClient.dll",
+    "TileDataRepository.dll",
+    "ActivationClient.dll",
+    "CoreShellAPI.dll",
+    "thumbcache.dll",
+    "AboveLockAppHost.dll",
+    "lockcontroller.dll",
+    "LockHostingFramework.dll",
+    "Windows.Shell.BlueLightReduction.dll",
+    "Windows.Internal.Shell.Broker.dll",
+    "Windows.Internal.Signals.dll",
+    "Windows.UI.AppDefaults.dll",
+    "TaskFlowDataEngine.dll",
+    "SwitcherDataModel.dll",
+    "DesktopSwitcherDataModel.dll",
+    "WindowsInternal.ComposableShell.DesktopHosting.dll",
+    "Windows.Internal.UI.Shell.WindowTabManager.dll",
+    "Windows.Devices.Enumeration.dll",
+    "Windows.Energy.dll",
+    "Windows.Storage.ApplicationData.dll",
+    "WindowsUdk.ShellCommon.dll",
+    // O Windows.ApplicationModel.AppExtensions.AppExtensionCatalog e o
+    // Windows.Internal.System.Profile.RegionPolicyEvaluator, que o
+    // IntegratedServicesGeographicRegionPolicies do WindowsUdk.ShellCommon
+    // ativa no XamlLauncher::InitializeCortanaExperienceManager do
+    // twinui.pcshell: sem as classes, o winrt::check_hresult lança
+    // REGDB_E_CLASSNOTREG na thread dos componentes e o explorer cai.
+    "AppExtension.dll",
+    "SystemSettings.DataModel.dll",
+    "DictationManager.dll",
+    "Windows.ApplicationModel.DataTransfer.dll",
+    "coml2.dll",
+    "wpnapps.dll",
+    "CapabilityAccessManagerClient.dll",
+    // O msxml6.dll com a DLL de recursos dele (o msxml6r.dll e o `.mui`):
+    // o Resources::classInit do DllMain carrega os textos dela, e sem ela o
+    // DllMain falha (ERROR_DLL_INIT_FAILED no CreateManifestReader do
+    // AppxPackaging, que lê os manifestos dos pacotes pelo MSXML).
+    "msxml6.dll",
+    "msxml6r.dll",
+    "StructuredQuery.dll",
+    "taskschd.dll",
+    "AssignedAccessManager.dll",
+    "AssignedAccessRuntime.dll",
+    "AssignedAccessShellProxy.dll",
+    // O registro dos pacotes da caixa no primeiro logon
+    // (`inbox_packages`): o AppReadiness e o AppXSvc com as extensões de
+    // implantação, o empacotamento e o SIP dos pacotes, os imports estáticos
+    // deles e as cargas atrasadas do caminho do registro.
+    "AppReadiness.dll",
+    "AppXDeploymentServer.dll",
+    "AppXDeploymentExtensions.onecore.dll",
+    "AppXDeploymentExtensions.desktop.dll",
+    "AppxPackaging.dll",
+    "AppxSip.dll",
+    "MrmDeploy.dll",
+    "OpcServices.dll",
+    "appxapplicabilityblob.dll",
+    "clipc.dll",
+    "apisethost.appexecutionalias.dll",
+    "userdataplatformhelperutil.dll",
+    "cryptxml.dll",
+    "webservices.dll",
+    "imagehlp.dll",
+    // A classe WinRT Windows.Networking.Connectivity.NetworkInformation, que
+    // o AppReadiness ativa ao subir (sem ela, REGDB_E_CLASSNOTREG e o
+    // serviço para), com a carga atrasada do uso de dados.
+    "Windows.Networking.Connectivity.dll",
+    "dusmapi.dll",
     // O sihost e os componentes dele.
     "sihost.exe",
     "Windows.Shell.ServiceHostBuilder.dll",
@@ -1147,17 +1233,26 @@ fn entries(directory: &Path) -> Vec<String> {
     fs::read_dir(directory).map(|entries| entries.filter_map(|entry| entry.ok()).filter_map(|entry| entry.file_name().into_string().ok()).collect()).unwrap_or_default()
 }
 
+/// Os pacotes de recursos de `\Windows\SystemResources` que não têm o nome
+/// de um módulo: o `ShellComponents`, que o XamlExplorerHost::s_LoadResources
+/// do twinui.pcshell (0x35ec60) abre pelo
+/// `%SystemRoot%\SystemResources\ShellComponents\ShellComponents.pri` ao
+/// criar o componente do shell imersivo; sem o arquivo o componente falha
+/// (ERROR_FILE_NOT_FOUND) e o explorer para na falha crítica.
+const RESOURCE_PACKAGES: &[&str] = &["ShellComponents"];
+
 /// Os recursos de `\Windows\SystemResources` dos programas de
-/// [`user_programs`]: o `<nome>.mun` e, para um módulo com pasta própria, o
-/// `<módulo>.pri` e o `pris\<módulo>.<idioma>.pri` dos idiomas de interface
-/// (ou do primeiro idioma de fallback que o tiver). (caminho no volume,
-/// arquivo de origem), com os nomes desta máquina.
+/// [`user_programs`] e dos pacotes de [`RESOURCE_PACKAGES`]: o `<nome>.mun`
+/// e, para um módulo com pasta própria, o `<módulo>.pri` e o
+/// `pris\<módulo>.<idioma>.pri` dos idiomas de interface (ou do primeiro
+/// idioma de fallback que o tiver). (caminho no volume, arquivo de origem),
+/// com os nomes desta máquina.
 fn system_resource_files(windows: &Path, languages: &[String], fallbacks: &[String]) -> Vec<(String, PathBuf)> {
     let directory = windows.join("SystemResources");
     let listing = entries(&directory);
     let find = |names: &[String], wanted: &str| names.iter().find(|name| name.eq_ignore_ascii_case(wanted)).cloned();
     let mut files = Vec::new();
-    for program in user_programs() {
+    for program in user_programs().chain(RESOURCE_PACKAGES.iter().copied()) {
         if let Some(name) = find(&listing, &format!("{program}.mun")).filter(|name| directory.join(name).is_file()) {
             files.push((format!("SystemResources/{name}"), directory.join(name)));
         }
@@ -1586,6 +1681,16 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("papel de parede padrao no volume NTFS: {wallpapers} imagens");
+        // Os pacotes AppX da caixa que o primeiro logon registra
+        // (`inbox_packages`), em `\Windows\SystemApps`.
+        let mut packaged = 0;
+        for (path, source) in crate::inbox_packages::files(&windows) {
+            if let Ok(bytes) = fs::read(&source) {
+                files.push(Staged::copied(path, bytes, &source));
+                packaged += 1;
+            }
+        }
+        println!("arquivos dos pacotes da caixa no volume NTFS: {packaged}");
         // Os cursores do esquema padrão (`DEFAULT_CURSORS`) e a animação do
         // primeiro logon (`FIRST_LOGON_ANIMATION`), com os `.mui` dela.
         let mut session = 0;

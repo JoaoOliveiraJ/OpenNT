@@ -109,7 +109,7 @@ const APPX_DIRECTORIES: &[(&str, &str)] = &[("PackageRepositoryRoot", "C:\\Progr
 const STATE_REPOSITORY: &str = "Microsoft\\Windows\\CurrentVersion\\AppModel\\StateRepository";
 
 /// UTF-16LE terminado em NUL, como o Registro guarda um REG_SZ.
-fn registry_string(text: &str) -> Vec<u8> {
+pub(crate) fn registry_string(text: &str) -> Vec<u8> {
     text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
 }
 
