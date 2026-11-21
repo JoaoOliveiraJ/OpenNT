@@ -40,16 +40,17 @@
 //! `EXPLORER_STARTED` quando o winlogon.exe cria o userinit.exe e o
 //! userinit.exe cria o explorer.exe com o token dele. Depois dele, o
 //! `SHELL_TRAY_CREATED` ([`win32k_window_created`]) quando o explorer.exe
-//! cria a janela da barra de tarefas (Shell_TrayWnd) e o
-//! `STARTMENU_HOST_STARTED` quando o StartMenuExperienceHost.exe nasce com o
-//! token LowBox do usuário. Os do UserManager também: o `USERMGR_STARTED`
+//! cria a janela da barra de tarefas (Shell_TrayWnd), o `SHELL_RESTARTED`
+//! quando o explorer.exe que o winlogon.exe recria depois de o shell sair
+//! ([`shell_recreated`]) cria a dele, e o `STARTMENU_HOST_STARTED` quando o
+//! StartMenuExperienceHost.exe nasce com o token LowBox do usuário. Os do UserManager também: o `USERMGR_STARTED`
 //! ([`image_mapped`]) quando um svchost.exe mapeia o usermgr.dll, e o
 //! `UMGR_USER_LOGIN` e o `SIHOST_READY` ([`wnf_updated`]) quando esse svchost
 //! publica o aviso do logon e o do sihost.exe pronto.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::ntos::inc::field::NtStruct;
 use crate::ntos::inc::types::Eprocess;
@@ -159,6 +160,8 @@ fn logon_process_created(creation: &Creation, child_pointer: u64) {
             crate::debug_print!("LOGONUI_STARTED");
         } else if child.eq_ignore_ascii_case("userinit.exe") {
             user_process_created(creation, child_pointer, &USERINIT_STARTED, "USERINIT_STARTED");
+        } else if child.eq_ignore_ascii_case("explorer.exe") {
+            shell_recreated(creation, child_pointer);
         }
     } else if creator.eq_ignore_ascii_case("userinit.exe") && child.eq_ignore_ascii_case("explorer.exe") {
         user_process_created(creation, child_pointer, &EXPLORER_STARTED, "EXPLORER_STARTED");
@@ -265,6 +268,10 @@ pub fn win32k_service_returned(service_number: u32, result: u64) {
 /// o stub não foi achado).
 static CREATE_WINDOW_SERVICE: AtomicU32 = AtomicU32::new(0);
 static SHELL_TRAY_CREATED: AtomicBool = AtomicBool::new(false);
+/// O PID do explorer.exe que o winlogon recriou ([`shell_recreated`]; 0
+/// antes dele) e o `SHELL_RESTARTED`, quando ele cria a barra de tarefas.
+static RESTARTED_SHELL: AtomicU64 = AtomicU64::new(0);
+static SHELL_RESTARTED: AtomicBool = AtomicBool::new(false);
 /// A classe da janela da barra de tarefas do explorer.exe.
 const SHELL_TRAY_CLASS: &str = "Shell_TrayWnd";
 
@@ -275,11 +282,18 @@ const SHELL_TRAY_CLASS: &str = "Shell_TrayWnd";
 /// da classe Shell_TrayWnd: o CreateWindowExW do CTray::_CreateTrayWindow
 /// (explorer 19041, 0x2e2d8). O user32 passa o nome da classe no segundo
 /// argumento, um [`LargeString`](crate::ntos::inc::types::extra_usermode::LargeString)
-/// (VerNtUserCreateWindowEx, 0x7766); um átomo de classe não é o nome.
+/// (VerNtUserCreateWindowEx, 0x7766); um átomo de classe não é o nome. A
+/// mesma janela criada pelo explorer.exe que o winlogon recriou
+/// ([`shell_recreated`]) dá o `SHELL_RESTARTED`.
 pub fn win32k_window_created(service_number: u32, arguments: &[u64], result: u64) {
     use crate::ntos::inc::types::extra_usermode::LargeString;
     use crate::ntos::ps::user::state;
-    if !boot_config::smss_boot() || result == 0 || arguments.len() < 2 || !USER_LOGON_OK.load(Ordering::Acquire) || SHELL_TRAY_CREATED.load(Ordering::Acquire) {
+    if !boot_config::smss_boot() || result == 0 || arguments.len() < 2 || !USER_LOGON_OK.load(Ordering::Acquire) {
+        return;
+    }
+    let restarted = RESTARTED_SHELL.load(Ordering::Acquire);
+    let restart = restarted != 0 && !SHELL_RESTARTED.load(Ordering::Acquire) && process::get_current_process_id() == restarted;
+    if !restart && SHELL_TRAY_CREATED.load(Ordering::Acquire) {
         return;
     }
     let current = process::get_current_process();
@@ -299,8 +313,17 @@ pub fn win32k_window_created(service_number: u32, arguments: &[u64], result: u64
     if buffer < 0x1_0000 || length as usize != SHELL_TRAY_CLASS.len() * 2 {
         return;
     }
-    let named = state::try_read_user_wide_string(buffer, u64::from(length / 2)).is_ok_and(|name| name.eq_ignore_ascii_case(SHELL_TRAY_CLASS));
-    if !named || SHELL_TRAY_CREATED.swap(true, Ordering::AcqRel) {
+    if !state::try_read_user_wide_string(buffer, u64::from(length / 2)).is_ok_and(|name| name.eq_ignore_ascii_case(SHELL_TRAY_CLASS)) {
+        return;
+    }
+    if restart {
+        if !SHELL_RESTARTED.swap(true, Ordering::AcqRel) {
+            crate::debug_print!("[init] explorer.exe (pid {}) recriado pelo winlogon: janela {} criada (hwnd {:#x})", restarted, SHELL_TRAY_CLASS, result);
+            crate::debug_print!("SHELL_RESTARTED");
+        }
+        return;
+    }
+    if SHELL_TRAY_CREATED.swap(true, Ordering::AcqRel) {
         return;
     }
     crate::debug_print!("[init] explorer.exe (pid {}): janela {} criada (hwnd {:#x})", process::get_current_process_id(), SHELL_TRAY_CLASS, result);
@@ -652,6 +675,32 @@ fn user_process_created(creation: &Creation, child_pointer: u64, done: &AtomicBo
     }
     crate::debug_print!("[init] {} (pid {}) criou {} (pid {}) com o token de {}", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id, user);
     crate::debug_print!("{}", marker);
+}
+
+/// O winlogon.exe da sessão 1 criou um explorer.exe com o token do usuário
+/// do `USER_LOGON_OK` depois do `EXPLORER_STARTED`: o shell recriado pelo
+/// WLGeneric_ShellRestart_Enter (winlogon 19041, 0x7d6a0), que lê o
+/// AutoRestartShell (1 sem o valor) e o Shell da chave Winlogon e chama o
+/// CUser::CreateProcessW na Winsta0\Default. O sinal vem do win32kbase: o
+/// DestroyProcessInfo (0x46f60), no callout de saída do processo, vê que o
+/// processo que saiu é o shell da Desktop de entrada (o ppiShellProcess do
+/// DESKTOPINFO, posto pelo SetShellWindow) e, com o código de saída
+/// diferente de 1 e de 0xff (um fim pedido pelo próprio explorer, que não
+/// se recria), chama o PostWinlogonMessage(0x401, código); o RPC do kernel
+/// (msrpc.sys) o leva ao WMsgKMessageHandler do winlogon pelo endpoint
+/// `WMsgKRpc*`, que liga o sinal Winsrv_ShellRestart (0xa) da máquina de
+/// estados. Só uma linha no log; o `SHELL_RESTARTED` sai quando esse
+/// explorer.exe cria a barra de tarefas ([`win32k_window_created`]).
+fn shell_recreated(creation: &Creation, child_pointer: u64) {
+    if !EXPLORER_STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(user) = LOGGED_ON_USER.lock().clone() else { return };
+    let owner = process::get_primary_token(child_pointer).and_then(|token| crate::ntos::se::token::tokens::with(token, |token| account_sid_text(&token.user))).flatten();
+    if owner.as_deref() != Some(user.as_str()) || RESTARTED_SHELL.compare_exchange(0, creation.child_id, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    crate::debug_print!("[init] {} (pid {}) recriou o shell: {} (pid {}) com o token de {}", creation.creator_name, creation.creator_id, creation.child_name, creation.child_id, user);
 }
 
 static STARTMENU_HOST_STARTED: AtomicBool = AtomicBool::new(false);
