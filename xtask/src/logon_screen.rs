@@ -235,6 +235,14 @@ pub fn software_keys() -> Vec<HostKey> {
                 servers.insert(class.to_ascii_lowercase());
             }
         }
+        // O nome `clsid` do moniker de classe ({0000031A-...}, o ClassMoniker
+        // do combase): `Classes\CLSID\CLSID`, sem InprocServer32, com o CLSID
+        // dele. O MkParseDisplayName acha por ele o moniker de um nome
+        // `clsid:{...}`; sem a chave, o "Session:N!clsid:{...}" do AppXSvc
+        // (o moniker de sessão do sessionutilities.cpp) volta MK_E_SYNTAX.
+        if servers.contains("{0000031a-0000-0000-c000-000000000046}") {
+            registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{objects}\\CLSID"), &format!("{objects}\\CLSID"), false, &mut keys);
+        }
         // Os objetos de serviço do shell de início automático: o
         // CShellServiceObjectMgr::LoadObjects do stobject.dll (0x2740) abre
         // `Explorer\ShellServiceObjects` da HKLM e cria cada CLSID com o

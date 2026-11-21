@@ -1029,6 +1029,14 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "cryptxml.dll",
     "webservices.dll",
     "imagehlp.dll",
+    // A API de políticas de restrição de software (SRP/AppLocker) que o OSIM
+    // do AppXSvc carrega no registro de cada pacote, e o fwbase.dll, carga
+    // atrasada do FirewallAPI.dll (imports do AppXDeploymentExtensions.onecore):
+    // o DllMain do FirewallAPI cria a seção crítica dele pelo
+    // FwCriticalSectionCreate e, sem o fwbase, devolve FALSE e a extensão não
+    // carrega (ERROR_DLL_INIT_FAILED no host do OSIM).
+    "srpapi.dll",
+    "fwbase.dll",
     // A classe WinRT Windows.Networking.Connectivity.NetworkInformation, que
     // o AppReadiness ativa ao subir (sem ela, REGDB_E_CLASSNOTREG e o
     // serviço para), com a carga atrasada do uso de dados.
@@ -1720,6 +1728,16 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             }
         }
         println!("cursores e animacao do primeiro logon no volume NTFS: {session}");
+        // O banco de compatibilidade principal que o ahcache.sys lê de
+        // `\SystemRoot\AppPatch`: dele sai a tabela de quirks que o
+        // NtApphelpCacheControl(MapQuirks) mapeia nos processos (o
+        // CompatCacheMapQuirksTable do kernel32, pedido pelo
+        // QuirkIsEnabledForPackage2 das extensões de implantação do AppXSvc).
+        let sysmain = windows.join("AppPatch/sysmain.sdb");
+        match fs::read(&sysmain) {
+            Ok(bytes) => files.push(Staged::copied(String::from("AppPatch/sysmain.sdb"), bytes, &sysmain)),
+            Err(_) => println!("AVISO: {} ausente no Windows desta maquina", sysmain.display()),
+        }
         // O diretório dos logs do serviço do log de eventos, vazio como numa
         // instalação nova: o wevtsvc.dll cria nele os `.evtx` dos canais
         // (`%SystemRoot%\System32\winevt\Logs`). Um nome terminado em '/' é
