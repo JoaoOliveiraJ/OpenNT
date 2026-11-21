@@ -575,6 +575,25 @@ impl Mapping {
         (0..length as u64).map(|index| physical::read8(self.to_phys(offset + index))).collect()
     }
 
+    /// Zera a imagem fora das faixas `covered` (início, fim), que as cópias
+    /// do arquivo preenchem por inteiro: o BSS, o resto das páginas e os
+    /// vãos entre as seções. Cada byte da imagem sai do arquivo ou é zero,
+    /// sem passar duas vezes pela mesma página.
+    fn zero_outside(&self, covered: &mut [(u64, u64)]) {
+        covered.sort_unstable();
+        let total = self.frames.len() as u64 * 0x1000;
+        let mut at = 0u64;
+        for &(start, end) in covered.iter().chain(core::iter::once(&(total, total))) {
+            let start = start.min(total);
+            while at < start {
+                let length = (0x1000 - at % 0x1000).min(start - at);
+                physical::zero(self.to_phys(at), length as usize);
+                at += length;
+            }
+            at = at.max(end.min(total));
+        }
+    }
+
     /// Um campo que cruza a página passa byte a byte (frames não contíguos).
     fn read32(&self, offset: u64) -> u32 {
         if offset % 0x1000 > 0x1000 - 4 {
@@ -748,17 +767,17 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         let mapping = Mapping { frames: owned.frames.clone() };
         let rva_to_file_offset = |rva: u64| section_file_offset(&metadata, section_table, section_count, size_of_headers, rva);
         debug_print!("[pe] base={:#x} (fisico {:#x}) imagem={} bytes, {} secoes", image_base, physical_base, size_of_image, section_count);
-        // Zera a imagem (BSS) e copia cabeçalhos e seções. A imagem plana é
-        // o arquivo inteiro a partir do offset zero, até o fim da última
-        // página (os bytes fora das seções também).
-        for &frame in &owned.frames {
-            physical::zero(frame, 0x1000);
-        }
+        // Copia cabeçalhos e seções e zera o resto da imagem (o BSS). A
+        // imagem plana é o arquivo inteiro a partir do offset zero, até o fim
+        // da última página (os bytes fora das seções também).
         let mut copies = Vec::new();
+        let mut covered = Vec::new();
         if flat {
             copies.push((0u64, 0u64, source.size().min(owned.frames.len() as u64 * 0x1000)));
         } else {
-            mapping.write(0, &source.read_bytes(0, size_of_headers)?);
+            let headers = source.read_bytes(0, size_of_headers)?;
+            mapping.write(0, &headers);
+            covered.push((0, headers.len() as u64));
             for index in 0..section_count {
                 let header = section_table + index * 40;
                 let virtual_address = metadata.read_u32(header + 12)? as u64;
@@ -773,6 +792,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 copies.push((virtual_address, raw_pointer, raw_size));
             }
         }
+        covered.extend(copies.iter().map(|&(virtual_address, _, raw_size)| (virtual_address, virtual_address + raw_size)));
+        mapping.zero_outside(&mut covered);
         for (virtual_address, raw_pointer, raw_size) in copies {
             if source.supports_copy_to_physical() && raw_size >= 0x1000 {
                 // Agrupa frames fisicamente contíguos; nunca cruza um salto.
@@ -795,7 +816,12 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
             while copied < raw_size {
                 let rva = virtual_address + copied;
                 let chunk = (raw_size - copied).min(0x1000 - rva % 0x1000);
-                mapping.write(rva, &source.read_bytes(raw_pointer + copied, chunk)?);
+                let bytes = source.read_bytes(raw_pointer + copied, chunk)?;
+                mapping.write(rva, &bytes);
+                // Uma leitura curta deixa o resto da faixa em zeros.
+                if (bytes.len() as u64) < chunk {
+                    physical::zero(mapping.to_phys(rva + bytes.len() as u64), (chunk - bytes.len() as u64) as usize);
+                }
                 copied += chunk;
             }
         }
