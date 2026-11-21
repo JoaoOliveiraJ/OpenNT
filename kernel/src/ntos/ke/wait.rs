@@ -540,9 +540,17 @@ fn switch_waiting(waiter: Waiter) {
     if waiter.user {
         let serial = {
             let mut lock = lock();
-            lock.table().waits.get(&thread).map_or(0, |wait| wait.serial)
+            lock.table().waits.get(&thread).map(|wait| wait.serial)
         };
-        context_switch::block_registered(serial);
+        // A espera que outra CPU já desfez entre o registro e aqui (o sinal
+        // que a satisfez) não deixa a CPU: o status está em
+        // KTHREAD.WaitStatus. Com o número 0, a espera instalada na thread
+        // parecia ainda não ligada, o fim do intervalo a ligava de novo sem
+        // objeto nem prazo e a thread ficava parada para sempre (o dono de
+        // um ERESOURCE já concedido, preso no EnterCrit do win32k).
+        if let Some(serial) = serial {
+            context_switch::block_registered(serial);
+        }
     } else {
         context_switch::switch_out(SwitchReason::Wait);
     }
