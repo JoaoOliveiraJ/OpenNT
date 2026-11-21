@@ -219,17 +219,25 @@ fn complete_in_requester(irp: &Irp, addresses: [u64; 2], copy_back: impl FnOnce(
 /// o IRP sobe um nível antes de cada chamada e MORE_PROCESSING_REQUIRED
 /// interrompe. Depois finaliza o IRP síncrono (UserIosb, UserBuffer,
 /// UserEvent, buffer do I/O Manager).
-/// Diagnóstico: os IRPs concluídos até o fim (o retorno do driver que
-/// concluiu e a thread), até serem soltos ou reiniciados. Um IRP concluído
-/// de novo sem isso é um uso depois da conclusão (o SystemBuffer solto duas
-/// vezes): a linha `[irp]` nomeia as duas conclusões.
+/// Diagnóstico (só com o despacho de usuário em várias CPUs): os IRPs
+/// concluídos até o fim (o retorno do driver que concluiu e a thread), até a
+/// memória deles voltar ao pool ou eles serem reiniciados. Um IRP concluído
+/// de novo antes disso é um uso depois da conclusão (o SystemBuffer solto
+/// duas vezes): a linha `[irp]` nomeia as duas conclusões.
 static COMPLETED: SpinLock<crate::rtl::PtrMap<(u64, u64)>> = SpinLock::new(crate::rtl::PtrMap::new());
+/// Há entradas em [`COMPLETED`] (a liberação de memória só olha o mapa então).
+static COMPLETED_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// O IRP volta a uso (alocado, reiniciado ou solto): sai do diagnóstico.
+/// O IRP (ou qualquer bloco do pool em `packet`) volta a uso: sai do
+/// diagnóstico.
 pub fn forget_completed(packet: u64) {
+    if !COMPLETED_ANY.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut completed = COMPLETED.lock();
-    if !completed.is_empty() {
-        completed.remove(&packet);
+    completed.remove(&packet);
+    if completed.is_empty() {
+        COMPLETED_ANY.store(false, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -303,7 +311,10 @@ fn complete_request(packet: u64, caller: u64) -> i32 {
     if crate::ntos::io::paging_io::complete_paging_request(packet) {
         return 0;
     }
-    COMPLETED.lock().insert(packet, (caller, process::get_current_thread_id()));
+    if crate::ntos::ke::thread_dispatch::concurrent() {
+        COMPLETED.lock().insert(packet, (caller, process::get_current_thread_id()));
+        COMPLETED_ANY.store(true, core::sync::atomic::Ordering::Release);
+    }
     let (final_status, information) = builder::read_io_status(packet);
     // O lock sai antes da callback: o dono da conclusão pode esquecer ou
     // registrar outras conclusões dentro dela.

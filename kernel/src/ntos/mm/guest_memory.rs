@@ -912,6 +912,7 @@ pub fn alloc_raw(size: u64) -> u64 {
 
 #[track_caller]
 pub fn free_bytes(pointer: u64) {
+    crate::ntos::io::io_manager::forget_completed(pointer);
     let caller = core::panic::Location::caller();
     with_pool_lock(|| HEAP.lock().free_bytes(pointer, caller))
 }

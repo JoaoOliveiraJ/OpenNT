@@ -581,6 +581,9 @@ pub fn pump_kernel() {
     pump_kernel_work();
     // Numa espera de driver, threads de sistema podem produzir o evento.
     pump_scheduler();
+    // Com o despacho em várias CPUs, a espera que gira no BSP dentro do
+    // próprio despacho também sonda as esperas de usuário.
+    crate::ntos::ps::user::threads::poll_while_spinning();
 }
 
 /// O trabalho do despachante sem o tick do escalonador: interrupções de

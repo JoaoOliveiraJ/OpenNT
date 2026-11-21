@@ -1185,6 +1185,23 @@ pub fn dispatch_one() -> Result<Dispatched, KernelError> {
 /// espera pode ter sido produzida por quem acabou de parar (um pedido ALPC
 /// posto na IOCP do servidor por um cliente que em seguida espera a
 /// resposta). Mesmas condições do despacho; um despacho em curso já sonda.
+/// Uma espera que gira no BSP dentro do despacho (o fim de um processo que,
+/// no callout do win32k, disputa a trava do user): com o despacho em várias
+/// CPUs, as esperas das threads de usuário são sondadas mesmo assim. A dona
+/// da trava pode estar parada numa espera que só a sondagem do BSP conclui,
+/// e pronta ela roda num AP; sem a sondagem, o BSP girava para sempre (a
+/// guarda do despacho em curso barra o `refresh_waiting`).
+pub fn poll_while_spinning() {
+    static POLLING: AtomicBool = AtomicBool::new(false);
+    if !thread_dispatch::concurrent() || cpu() != 0 || !DISPATCHING[0].load(Ordering::Acquire) || POLLING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let caller = process::get_current_thread();
+    poll_user_waits();
+    process::set_current_thread(caller);
+    POLLING.store(false, Ordering::Release);
+}
+
 pub fn refresh_waiting() {
     if !can_dispatch() || DISPATCHING[0].swap(true, Ordering::AcqRel) {
         return;
