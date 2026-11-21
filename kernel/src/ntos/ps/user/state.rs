@@ -485,6 +485,14 @@ pub fn stack_arg32(user_rsp: u64, index: u64) -> u32 {
     guest::try_read::<u32>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0)
 }
 
+/// Um BOOLEAN na pilha: só o byte baixo da posição. O compilador grava o
+/// BOOLEAN com um `mov byte`, e o resto da posição é o que já estava na
+/// pilha; o serviço do NT só testa o byte.
+#[track_caller]
+pub fn stack_boolean(user_rsp: u64, index: u64) -> bool {
+    guest::try_read::<u8>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0) != 0
+}
+
 /// O despachante nativo sonda a pilha antes de copiá-la; os handlers
 /// validam aqui a extensão de argumentos de que precisam.
 pub fn probe_syscall_stack(rsp: u64, bytes: u64) -> bool {

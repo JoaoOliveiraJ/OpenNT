@@ -1425,7 +1425,9 @@ fn query_directory(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64
         }
         let class = state::stack_arg32(rsp, 8);
         let name_pointer = state::stack_arg(rsp, 10);
-        let flags = if extended { state::stack_arg32(rsp, 9) } else { (if state::stack_arg32(rsp, 9) != 0 { 2 } else { 0 }) | (if state::stack_arg32(rsp, 11) != 0 { 1 } else { 0 }) };
+        // NtQueryDirectoryFile: ReturnSingleEntry e RestartScan são BOOLEAN
+        // (só o byte baixo da posição); o QueryFlags do Ex é um ULONG.
+        let flags = if extended { state::stack_arg32(rsp, 9) } else { (if state::stack_boolean(rsp, 9) { 2 } else { 0 }) | (if state::stack_boolean(rsp, 11) { 1 } else { 0 }) };
         if flags & !0x1B != 0 {
             return fail(0xC000_00BB);
         }
