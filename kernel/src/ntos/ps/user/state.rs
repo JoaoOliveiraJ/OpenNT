@@ -1068,6 +1068,10 @@ pub fn close_user_handle_in(table: &ProcessState, value: u64, release: bool, for
     if !force && entry.attributes() & 1 != 0 {
         return Ok(STATUS_HANDLE_NOT_CLOSABLE);
     }
+    // Quem fecha um handle de processo vigiado pelo alarme das esperas
+    // satisfeitas em processos (`ob::wait`); só observa.
+    let from_user_mode = crate::ntos::ps::previous_mode::get().is_ok_and(|mode| mode != 0);
+    crate::ntos::ob::wait::note_handle_closed(table.process, value, from_user_mode);
     let binding = table.handles.lock().bindings.get(&handle).copied();
     let last = Cell::new(false);
     let mut detach = || {

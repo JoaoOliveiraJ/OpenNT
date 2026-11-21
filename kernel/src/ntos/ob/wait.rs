@@ -207,6 +207,9 @@ fn wait_object(handle: u64, previous_mode: u8) -> Result<(WaitTarget, Held), u32
 pub struct WaitObjects {
     /// Os ponteiros na ordem dos handles (o vetor do KeWaitForMultipleObjects).
     pub objects: Vec<u64>,
+    /// Os valores dos handles, na mesma ordem (o alarme de
+    /// [`check_satisfied`]).
+    pub handles: Vec<u64>,
     held: Vec<Held>,
 }
 
@@ -226,7 +229,7 @@ impl WaitObjects {
 /// (o KeWaitForMultipleObjects devolve o primeiro índice satisfeito). Count e
 /// WaitType ficam com quem chama.
 pub fn reference_objects(handles: &[u64], previous_mode: u8, wait_type: u32) -> Result<WaitObjects, u32> {
-    let mut set = WaitObjects { objects: Vec::with_capacity(handles.len()), held: Vec::with_capacity(handles.len()) };
+    let mut set = WaitObjects { objects: Vec::with_capacity(handles.len()), handles: handles.to_vec(), held: Vec::with_capacity(handles.len()) };
     for &handle in handles {
         let (target, held) = match wait_object(handle, previous_mode) {
             Ok(resolved) => resolved,
@@ -413,4 +416,143 @@ pub fn check_multiple_wait(count: u32, wait_type: u32) -> Result<(), u32> {
         return Err(STATUS_INVALID_PARAMETER_3);
     }
     Ok(())
+}
+
+// ---- alarme das esperas satisfeitas em processos ---------------------------
+
+/// Um handle de processo que um processo recebeu do NtCreateUserProcess
+/// ([`track_process_handle`]): o EPROCESS e o pid do alvo, o pid do dono (um
+/// EPROCESS reaproveitado não herda o registro) e quem fechou o valor.
+#[derive(Clone, Copy)]
+struct TrackedHandle {
+    owner_pid: u64,
+    target: u64,
+    target_pid: u64,
+    /// (pid, tid, de modo kernel) do NtClose que fechou o valor.
+    closed_by: Option<(u64, u64, bool)>,
+}
+
+/// Os handles de processo vigiados, por (EPROCESS do dono, valor do handle).
+static TRACKED: crate::rtl::SpinLock<alloc::collections::BTreeMap<(u64, u64), TrackedHandle>> = crate::rtl::SpinLock::new(alloc::collections::BTreeMap::new());
+/// Registros no máximo; além disso sai o de menor chave.
+const TRACKED_MAX: usize = 1024;
+
+/// O DISPATCHER_HEADER.Type de um KPROCESS (ProcessObject).
+const PROCESS_OBJECT: u8 = 3;
+
+/// Quem esperou (capturado no começo da espera: a conclusão pode rodar no
+/// contexto de outra thread).
+pub struct Waiter {
+    pub process: u64,
+    pub pid: u64,
+    pub tid: u64,
+}
+
+impl Waiter {
+    /// A thread corrente.
+    pub fn current() -> Self {
+        let process = crate::ntos::ps::process::get_current_process();
+        Self { process, pid: crate::ntos::ps::process::get_current_process_id(), tid: crate::ntos::ps::process::get_current_thread_id() }
+    }
+}
+
+/// O processo `pointer` ainda não começou a terminar (o fim pedido marca o
+/// registro antes de o KPROCESS ficar sinalizado).
+fn process_alive(pointer: u64) -> bool {
+    crate::ntos::ps::process::with_record(pointer, |record| !record.terminated && !record.exiting).unwrap_or(false)
+}
+
+/// O tipo e, num processo, o pid e as threads ativas do objeto de espera
+/// `object`, para a linha do alarme.
+fn describe_wait_object(object: u64) -> alloc::string::String {
+    // SAFETY: um objeto de espera retido pela espera que acabou de concluir.
+    let header_type = unsafe { crate::ntos::inc::types::DispatcherHeader::at(object) }.type_.get() & 0x7F;
+    let name = open_pointer::describe(object).map_or_else(|| alloc::format!("tipo de despacho {header_type}"), |described| described.object_type.name.clone());
+    if header_type == PROCESS_OBJECT && crate::ntos::ps::process::is_process(object) {
+        // SAFETY: EPROCESS vivo (registrado no Process Manager).
+        let eprocess = unsafe { crate::ntos::inc::types::Eprocess::at(object) };
+        let state = if process_alive(object) { "sem fim pedido" } else { "terminando ou terminado" };
+        return alloc::format!("{name} {object:#x} (pid {}, {} threads ativas, {state})", eprocess.unique_process_id.get(), eprocess.active_threads.get());
+    }
+    alloc::format!("{name} {object:#x}")
+}
+
+/// O NtCreateUserProcess publicou em `owner` o handle `handle` do processo
+/// novo `target`: as esperas satisfeitas nesse valor passam a ser conferidas
+/// ([`check_satisfied`]). Só observa.
+pub fn track_process_handle(owner: u64, handle: u64, target: u64) {
+    // SAFETY: EPROCESS do dono (o corrente) e do processo recém-criado.
+    let (owner_pid, target_pid) = unsafe { (crate::ntos::inc::types::Eprocess::at(owner).unique_process_id.get(), crate::ntos::inc::types::Eprocess::at(target).unique_process_id.get()) };
+    let mut tracked = TRACKED.lock();
+    if tracked.len() >= TRACKED_MAX {
+        if let Some(&oldest) = tracked.keys().next() {
+            tracked.remove(&oldest);
+        }
+    }
+    tracked.insert((owner, handle & !3), TrackedHandle { owner_pid, target, target_pid, closed_by: None });
+}
+
+/// O NtClose do valor `handle` na tabela de `owner` (`ob/close.rs`): o
+/// registro vigiado anota quem fechou. Só observa.
+pub fn note_handle_closed(owner: u64, handle: u64, from_user_mode: bool) {
+    let mut tracked = TRACKED.lock();
+    if tracked.is_empty() {
+        return;
+    }
+    if let Some(record) = tracked.get_mut(&(owner, handle & !3)) {
+        record.closed_by.get_or_insert((crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), !from_user_mode));
+    }
+}
+
+/// O alarme de uma espera de modo usuário que concluiu com `status` nos
+/// `handles` (com os objetos de espera `objects`, na mesma ordem): uma linha
+/// `[diag] espera satisfeita` quando o objeto satisfeito é um processo que
+/// não começou a terminar, ou quando o valor era de um handle de processo
+/// vigiado e hoje resolve para outro objeto sem que o dono o tenha fechado
+/// em modo usuário (o valor fechado por outro caminho e reaproveitado). Só
+/// observa: a espera e o resultado não mudam.
+pub fn check_satisfied(waiter: &Waiter, handles: &[u64], objects: &[u64], wait_type: u32, status: u32) {
+    let satisfied = match status {
+        0 if wait_type == WAIT_ALL => 0..objects.len(),
+        index if (index as usize) < objects.len() => index as usize..index as usize + 1,
+        abandoned if (0x80..0xC0).contains(&abandoned) && ((abandoned - 0x80) as usize) < objects.len() => (abandoned - 0x80) as usize..(abandoned - 0x80) as usize + 1,
+        _ => return,
+    };
+    for index in satisfied {
+        let (Some(&handle), Some(&object)) = (handles.get(index), objects.get(index)) else { continue };
+        // SAFETY: um objeto de espera retido pela espera que acabou de concluir.
+        let header_type = unsafe { crate::ntos::inc::types::DispatcherHeader::at(object) }.type_.get() & 0x7F;
+        if header_type == PROCESS_OBJECT && crate::ntos::ps::process::is_process(object) && process_alive(object) {
+            crate::debug_print!("[diag] espera satisfeita num processo vivo: espera de {}:{} no handle {:#x} -> {}", waiter.pid, waiter.tid, handle, describe_wait_object(object));
+        }
+        let tracked = {
+            let tracked = TRACKED.lock();
+            if tracked.is_empty() {
+                continue;
+            }
+            tracked.get(&(waiter.process, handle & !3)).copied()
+        };
+        let Some(record) = tracked else { continue };
+        if record.owner_pid != waiter.pid {
+            TRACKED.lock().remove(&(waiter.process, handle & !3));
+            continue;
+        }
+        let closed_by_owner = record.closed_by.is_some_and(|(pid, _, kernel)| pid == record.owner_pid && !kernel);
+        if record.target != object && !closed_by_owner {
+            let closed = record.closed_by.map_or_else(|| alloc::string::String::from("nunca fechado pelo NtClose"), |(pid, tid, kernel)| alloc::format!("fechado por {pid}:{tid} em modo {}", if kernel { "kernel" } else { "usuário" }));
+            crate::debug_print!("[diag] espera satisfeita num handle de processo reaproveitado: espera de {}:{} no handle {:#x}, criado para o pid {} (Process {:#x}), {}; agora -> {}", waiter.pid, waiter.tid, handle, record.target_pid, record.target, closed, describe_wait_object(object));
+        }
+    }
+}
+
+/// O alarme do pacote de espera (`ps/user/wait_packets.rs`, o
+/// RtlRegisterWait e as esperas do threadpool) que vai para a IOCP pelo
+/// objeto `object`: a mesma linha quando ele é um processo que não começou
+/// a terminar. Só observa.
+pub fn check_packet_delivery(object: u64) {
+    // SAFETY: o objeto de espera retido pela associação que acabou de concluir.
+    let header_type = unsafe { crate::ntos::inc::types::DispatcherHeader::at(object) }.type_.get() & 0x7F;
+    if header_type == PROCESS_OBJECT && crate::ntos::ps::process::is_process(object) && process_alive(object) {
+        crate::debug_print!("[diag] espera satisfeita num processo vivo: pacote de espera entregue à IOCP -> {}", describe_wait_object(object));
+    }
 }

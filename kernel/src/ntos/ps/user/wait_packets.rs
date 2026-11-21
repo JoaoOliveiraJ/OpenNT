@@ -121,6 +121,9 @@ fn poll(packet: &Arc<WaitPacket>) -> bool {
         packet.set_queued(Some(Queued { port: association.port.clone() }));
         association
     };
+    // O alarme das esperas satisfeitas em processos (`ob::wait`), com o alvo
+    // ainda retido pela associação; só observa.
+    ob_wait::check_packet_delivery(association.target_pointer);
     let pointer = packet.pointer;
     let _ = dispatcher_objects::reference(pointer);
     forget(packet);

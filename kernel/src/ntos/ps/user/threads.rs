@@ -2032,7 +2032,14 @@ pub fn wait_custom(mut wait: Wait, timeout: u64, timeout_ms: Option<Option<u64>>
 pub fn wait_referenced(set: crate::ntos::ob::wait::WaitObjects, wait_type: u32, timeout: Option<i64>, alertable: bool) -> u32 {
     let objects = set.objects.clone();
     let registered = Registered::objects(current_pointer(), objects.clone(), wait_type as u8, service_deadline(timeout), alertable);
-    let wait = Wait { objects, wait_type, alertable: Some(alertable), cleanup: Some(Box::new(move |_status| set.release())), reason: Some(crate::ntos::ke::wait::reason::USER_REQUEST), registered: Some(registered), ..Wait::default() };
+    // O alarme das esperas satisfeitas em processos (`ob::wait`), com os
+    // objetos ainda retidos; só observa.
+    let waiter = crate::ntos::ob::wait::Waiter::current();
+    let cleanup = move |status: u32| {
+        crate::ntos::ob::wait::check_satisfied(&waiter, &set.handles, &set.objects, wait_type, status);
+        set.release();
+    };
+    let wait = Wait { objects, wait_type, alertable: Some(alertable), cleanup: Some(Box::new(cleanup)), reason: Some(crate::ntos::ke::wait::reason::USER_REQUEST), registered: Some(registered), ..Wait::default() };
     wait_registered(wait)
 }
 

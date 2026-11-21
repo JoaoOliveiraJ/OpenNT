@@ -956,6 +956,11 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
             return Err(status);
         }
     };
+    // O handle de usuário do processo novo entra no alarme das esperas
+    // satisfeitas em processos (`ob::wait`); só observa.
+    if !kernel_handles {
+        crate::ntos::ob::wait::track_process_handle(crate::ntos::ps::process::get_current_process(), process_handle, process);
+    }
     let thread_handle = if kernel_handles {
         kernel_handle(main.pointer(), thread_handle_attributes | OBJ_KERNEL_HANDLE, thread_access, object_types::thread_type().pointer)
     } else {
