@@ -5,14 +5,17 @@
 //! as seções do PE no layout virtual, zerados no resto, sem relocação, sem
 //! imports e sem cookie de segurança (a ntdll de cada processo faz isso na
 //! própria vista). Todas as seções do mesmo arquivo usam a mesma control
-//! area, como o ImageSectionObject dos SECTION_OBJECT_POINTERS: a chave é a
-//! identidade do arquivo (`SectionFile::identity`) e, sem ela, o próprio
-//! objeto seção. A seção retém a control area enquanto existe, e cada vista
-//! também; a de um arquivo segue, sem uso, na lista das control areas sem
-//! uso (a MmUnusedSegmentList, [`RETAINED`]) até a pressão de memória ou o
-//! limite dela devolverem os frames ao PFN, ou até o arquivo mudar. A imagem plana
-//! (SectionAlignment menor que a página, `image_header`) é o arquivo inteiro
-//! a partir do offset zero, com todas as páginas graváveis por cópia.
+//! area, como o ImageSectionObject dos SECTION_OBJECT_POINTERS: a chave é o
+//! arquivo do volume pelo registro do MFT (`SectionFile::file_id`, igual em
+//! toda abertura, também nas do modo usuário, que têm cada uma o seu
+//! FILE_OBJECT), senão a identidade do arquivo (`SectionFile::identity`) e,
+//! sem ela, o próprio objeto seção. A seção retém a control area enquanto
+//! existe, e cada vista também; a de um arquivo segue, sem uso, na lista
+//! das control areas sem uso (a MmUnusedSegmentList, [`RETAINED`]) até a
+//! pressão de memória ou o limite dela devolverem os frames ao PFN, ou até o
+//! arquivo mudar. A imagem plana (SectionAlignment menor que a página,
+//! `image_header`) é o arquivo inteiro a partir do offset zero, com todas
+//! as páginas graváveis por cópia.
 //!
 //! Uma vista ([`map_view`]) mapeia as páginas de código e somente leitura
 //! sobre os frames protótipo, compartilhados entre os processos e sem
@@ -244,8 +247,20 @@ impl ImageSource for SegmentSource {
     }
 }
 
+/// A chave da control area de um arquivo: o arquivo do volume pelo
+/// registro do MFT e a sequência (`SectionFile::file_id`), a mesma em toda
+/// abertura, pelo ZwCreateFile ou pelo modo usuário, como o
+/// SECTION_OBJECT_POINTERS do FCB no NT; sem ele, a identidade do arquivo.
+/// As páginas protótipo de uma seção SEC_IMAGE_NO_EXECUTE (a carga só de
+/// recursos) saem todas PAGE_READONLY, sem as cópias graváveis do .data:
+/// elas formam outra control area do mesmo arquivo.
+fn file_key(file: &dyn SectionFile, no_execute: bool) -> Option<SegmentKey> {
+    let key = file.file_id().or_else(|| file.identity())?;
+    Some(SegmentKey::File(if no_execute { alloc::format!("{key}:noexecute") } else { key }))
+}
+
 fn key_of(section: &Section) -> SegmentKey {
-    section.file.as_ref().and_then(|file| file.identity()).map_or(SegmentKey::Section(section.pointer()), SegmentKey::File)
+    section.file.as_deref().and_then(|file| file_key(file, section.no_execute)).unwrap_or(SegmentKey::Section(section.pointer()))
 }
 
 /// A control area da seção: a que ela já retém, a viva do mesmo arquivo ou
@@ -476,8 +491,8 @@ pub fn are_mapped_files_the_same(image_address: u64, file_address: u64) -> u32 {
     };
     let (Some((image_section, image_segment)), Some((file_section, file_view_segment))) = (view_at(image_address), view_at(file_address)) else { return STATUS_CONFLICTING_ADDRESSES };
     let (Some(image_file), Some(file)) = (image_section.file.as_ref(), file_section.file.as_ref()) else { return STATUS_CONFLICTING_ADDRESSES };
-    let file_segment = match file.identity() {
-        Some(identity) => SEGMENTS.lock().get(&SegmentKey::File(identity)).and_then(Weak::upgrade),
+    let file_segment = match file_key(file.as_ref(), image_section.no_execute) {
+        Some(key) => SEGMENTS.lock().get(&key).and_then(Weak::upgrade),
         None => file_view_segment.or_else(|| file_section.state.lock().image_segment.clone()),
     };
     let same_file = image_file.file_id().is_some_and(|id| file.file_id().as_ref() == Some(&id));

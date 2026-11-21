@@ -1712,8 +1712,14 @@ além da KUSER_SHARED_DATA:
   seções do PE no layout virtual (o `pe_loader` com `prototype`: sem VA,
   sem relocação, sem imports, sem cookie e sem a tabela de exports; a carga
   entrega a lista de frames à control area, que os devolve ao PFN). Todas
-  as seções do mesmo arquivo usam a mesma control area (a identidade do
-  arquivo, o papel do ImageSectionObject); a seção e cada vista a retêm.
+  as seções do mesmo arquivo usam a mesma control area (o papel do
+  ImageSectionObject): a chave é o arquivo do volume pelo registro do MFT e
+  a sequência (`SectionFile::file_id`), igual em toda abertura, também nas
+  do modo usuário, em que cada abertura tem o seu FILE_OBJECT (o LdrLoadDll
+  de cada processo); sem ele, a identidade do arquivo. Uma seção
+  SEC_IMAGE_NO_EXECUTE (a carga só de recursos) tem a sua control area do
+  arquivo, com as páginas todas somente leitura. A seção e cada vista a
+  retêm.
   Sem seção nem vista, a control area de um arquivo segue na lista das sem
   uso (a MmUnusedSegmentList do 19041, em que o MiCheckControlArea a põe
   com as páginas protótipo em standby): a seção seguinte do mesmo arquivo

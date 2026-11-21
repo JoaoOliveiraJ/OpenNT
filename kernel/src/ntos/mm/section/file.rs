@@ -187,10 +187,14 @@ impl SectionFile for CapturedFile {
 
     /// O tamanho e as horas de escrita e de mudança do
     /// $STANDARD_INFORMATION (+8..+24), que toda escrita no arquivo
-    /// atualiza; só nos arquivos de um volume que as tem.
+    /// atualiza; só nos arquivos de um volume que as tem, abertos pelo
+    /// ZwCreateFile ou pelo modo usuário (a fonte do FILE_OBJECT).
     fn version(&self) -> Option<Vec<u8>> {
-        let (volume, path) = self.backing.as_ref()?;
-        let stat = volume.stat(path)?;
+        let stat = match (&self.backing, &self.source) {
+            (Some((volume, path)), _) => volume.stat(path)?,
+            (None, Some(source)) if source.volume().is_some() => source.stat()?,
+            _ => return None,
+        };
         let times = stat.times.get(8..24).filter(|times| times.iter().any(|&byte| byte != 0))?;
         let mut version = stat.size.to_le_bytes().to_vec();
         version.extend_from_slice(times);
