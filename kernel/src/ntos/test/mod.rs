@@ -93,6 +93,7 @@ pub mod volume_notify_locks;
 pub mod file_security;
 pub mod user_lowbox;
 pub mod conditional_aces;
+pub mod token_trust;
 pub mod system_policy;
 pub mod user_copy_chunk;
 pub mod dos_device_maps;

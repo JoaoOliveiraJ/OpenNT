@@ -217,6 +217,10 @@ pub struct Token {
     /// O LowboxHandlesEntry (TOKEN+0x440): a entrada de handles guardados da
     /// sessão de logon e do pacote que o token referencia.
     pub lowbox_handles: Option<super::lowbox::HandlesKey>,
+    /// O TrustLevelSid (TOKEN+0x450): o SID de confiança do PS_PROTECTION do
+    /// processo dono (`se/token/trust.rs`); nenhum fora de um processo
+    /// protegido.
+    pub trust_level_sid: Option<Sid>,
     pub server_silo: u64,
     pub network_access_flags: u32,
     /// DACL do objeto token (controla a abertura deste token).
@@ -492,6 +496,10 @@ pub fn create(parent: Option<u64>, initialize: Option<&dyn Fn(&mut Token)>) -> R
         // origem (o SepDuplicateToken incrementa as duas entradas).
         lowbox_number: parent.as_ref().and_then(|parent| parent.lowbox_number),
         lowbox_handles: parent.as_ref().and_then(|parent| parent.lowbox_handles.clone()),
+        // A cópia conserva o SID de confiança (o SepDuplicateToken, o
+        // SepFilterToken e o SeCopyClientToken o copiam); o SeSubProcessToken
+        // o troca pelo do processo novo.
+        trust_level_sid: parent.as_ref().and_then(|parent| parent.trust_level_sid.clone()),
         server_silo: parent.as_ref().map_or(0, |parent| parent.server_silo),
         network_access_flags: parent.as_ref().map_or(0, |parent| parent.network_access_flags),
         security: SecurityPolicy { owner: user.clone(), dacl: Some(alloc::vec![Ace::allow(user.clone(), 0x1F01FF)]), ..Default::default() },

@@ -26,7 +26,7 @@ use crate::ntos::ob::object_manager::{self, ObjectData, ObjectHooks};
 use crate::ntos::ob::{object_access, object_types};
 use crate::ntos::ob::handles::process as process_handles;
 use crate::ntos::se::model::SecurityPolicy;
-use crate::ntos::se::token::{thread as thread_tokens, tokens};
+use crate::ntos::se::token::{thread as thread_tokens, tokens, trust};
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::inc::field::{Field, NtStruct};
@@ -299,6 +299,11 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
             return Err(error);
         }
     };
+    // O token do System é o do SeMakeSystemToken, que o SepCreateTokenEx
+    // cria com o SID de confiança WinTcb (SeProcTrustWinTcbSid).
+    if parent_token.is_none() {
+        trust::set_system_token(primary_token);
+    }
     let image = match executable {
         Some(executable) => {
             let created = match provider {
@@ -1171,10 +1176,13 @@ pub fn get_primary_token(process: u64) -> Option<u64> {
 
 /// O processo novo, ainda sem threads, troca o token primário pela cópia de
 /// `source` com o SessionId dado (o SeSubProcessToken do token do
-/// PS_ATTRIBUTE_TOKEN, `explicit`, ou do primário do pai); o token anterior
-/// volta.
+/// PS_ATTRIBUTE_TOKEN, `explicit`, ou do primário do pai), com o SID de
+/// confiança do PS_PROTECTION do processo; o token anterior volta.
 pub fn replace_primary_token(process: u64, source: u64, session_id: u32, explicit: bool) -> Result<(), KernelError> {
     let copy = tokens::sub_process_token(source, session_id, explicit)?;
+    // SeSubProcessToken: o SepSetTrustLevelForProcessToken põe no token o SID
+    // de confiança do PS_PROTECTION do processo novo (ou tira o da origem).
+    trust::set_for_process_token(copy, process);
     let previous = STATE.lock().primary_tokens.insert(process, copy);
     eprocess(process).token.object.set(copy);
     // Com o token do PS_ATTRIBUTE_TOKEN, o descritor do processo sai do

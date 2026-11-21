@@ -3,11 +3,12 @@
 //! thread o token de um cliente.
 //!
 //! Lê os registros de token do `token/tokens.rs` (não os offsets nativos).
-//! Lacunas honestas do modelo, nenhuma das quais concede permissão: sem
-//! TrustLevelSid (RtlSidDominatesForTrust sempre domina e nunca pede token
-//! ajustado), sem sessões de logon/elevação (o bloco UAC não tem o que
-//! comparar) e sem SepIsImpersonationAllowedDueToCapability (capacidade de
-//! impersonação não dá atalho).
+//! Lacunas honestas do modelo: quando o primário não domina o TrustLevelSid
+//! do cliente (o RtlSidDominatesForTrust), o 19041 marca que a thread deve
+//! receber uma cópia ajustada do token do cliente, e o OpenNT ainda
+//! impersona o próprio cliente; sem sessões de logon/elevação (o bloco UAC
+//! não tem o que comparar) e sem SepIsImpersonationAllowedDueToCapability
+//! (capacidade de impersonação não dá atalho).
 
 use crate::ntos::rtl::security::{is_parent_of_child_app_container, sid_dominates};
 use crate::ntos::se::model::equal_sids;

@@ -1182,10 +1182,11 @@ fn token_access_information(assert: Assert) {
     let mut privileges: Vec<(u64, u32)> = record.privileges.iter().filter(|privilege| privilege.id < 37).map(|privilege| (privilege.id, privilege.attributes & 3)).collect();
     privileges.sort_unstable_by_key(|&(id, _)| id);
     // 0x58 do TOKEN_ACCESS_INFORMATION + três SID_AND_ATTRIBUTES_HASH de 0x110,
-    // os SIDs alinhados a 8, o conjunto vazio de atributos (0x30) e o
-    // TOKEN_PRIVILEGES.
+    // os SIDs alinhados a 8, o TrustLevelSid do token do System (o
+    // SeProcTrustWinTcbSid, 16 bytes), o conjunto vazio de atributos (0x30) e
+    // o TOKEN_PRIVILEGES.
     let groups_size = groups.len() * 16 + groups.iter().map(|(sid, _)| (sid.len() + 7) & !7).sum::<usize>();
-    let expected = (0x388 + groups_size + 0x30 + 4 + privileges.len() * 12) as u32;
+    let expected = (0x388 + groups_size + 0x10 + 0x30 + 4 + privileges.len() * 12) as u32;
     guest::write_bytes(output, &[0xCC; 0x1000]);
     let short = matches!(query_token::query(handle, 22, output, expected - 1, returned, 0), Ok(0xC000_0023)) && guest::read32(returned) == expected && guest::read_bytes(output, 0x1000).iter().all(|&byte| byte == 0xCC);
     assert(short, "token-access: buffer curto devolve o tamanho sem gravar no buffer");
@@ -1210,13 +1211,15 @@ fn token_access_information(assert: Assert) {
     assert(sids_ok, "token-access: UserAndGroups com os SIDs colados e o hash do RtlSidHashInitialize");
     let restricted = array + groups_size as u64;
     let capabilities = restricted + 0x110;
-    let attributes = capabilities + 0x110;
+    let trust = capabilities + 0x110;
+    let attributes = trust + 0x10;
     let empty_hash = |at: u64| unsafe { SidAndAttributesHash::at(at) }.sid_count.get() == 0 && unsafe { SidAndAttributesHash::at(at) }.sid_attr.get() == at + 0x110;
-    let regions = info.restricted_sid_hash.get() == restricted && empty_hash(restricted) && info.capabilities_hash.get() == capabilities && empty_hash(capabilities) && info.package_sid.get() == 0 && info.trust_level_sid.get() == 0;
+    let wintcb = crate::ntos::se::model::sid(19, &[0x400, 0x2000]);
+    let regions = info.restricted_sid_hash.get() == restricted && empty_hash(restricted) && info.capabilities_hash.get() == capabilities && empty_hash(capabilities) && info.package_sid.get() == 0 && info.trust_level_sid.get() == trust && guest::read_bytes(trust, 16) == wintcb;
     // AUTHZBASEP_SECURITY_ATTRIBUTES_INFORMATION vazio: contagens zero e
     // as duas listas apontando para si mesmas.
     let attributes_ok = info.security_attributes.get() == attributes && guest::read32(attributes) == 0 && guest::read64(attributes + 8) == attributes + 8 && guest::read64(attributes + 0x10) == attributes + 8 && guest::read32(attributes + 0x18) == 0 && guest::read64(attributes + 0x20) == attributes + 0x20 && guest::read64(attributes + 0x28) == attributes + 0x20;
-    assert(regions && attributes_ok, "token-access: hashes vazios, sem pacote nem nivel de confianca, atributos internos vazios");
+    assert(regions && attributes_ok, "token-access: hashes vazios, sem pacote, o nivel de confianca WinTcb do System e atributos internos vazios");
     let privileges_at = attributes + 0x30;
     let token_privileges = unsafe { TokenPrivileges::at(privileges_at) };
     let listed = unsafe { LuidAndAttributes::array_at(token_privileges.privileges[0].address(), privileges.len()) };

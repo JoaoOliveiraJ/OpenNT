@@ -9,8 +9,8 @@
 //! - o nível de integridade de P precisa dominar o de T (o RtlSidDominates:
 //!   mesma autoridade, as subautoridades iguais menos a última, e a última
 //!   de P maior ou igual) e o TrustLevelSid de P, o de T (o
-//!   RtlSidDominatesForTrust; os tokens do OpenNT não têm TrustLevelSid, e
-//!   sem ele dos dois lados a dominância vale);
+//!   RtlSidDominatesForTrust, `trust::dominates`: sem SID dos dois lados a
+//!   dominância vale; um SID inválido não é atribuível);
 //! - T é atribuível quando é filho de P (o SepIsChildTokenByPointer:
 //!   ParentTokenId de T igual ao TokenId de P, o caso do token filtrado) ou
 //!   irmão (o SepIsSiblingTokenByPointer: o mesmo ParentTokenId e o mesmo
@@ -69,6 +69,9 @@ pub fn is_assignable_to_process(token: u64) -> Result<bool, u32> {
         return Err(STATUS_BAD_IMPERSONATION_LEVEL);
     }
     if !sid_dominates(&caller.integrity, &requested.integrity) {
+        return Ok(false);
+    }
+    if !super::trust::dominates(caller.trust_level_sid.as_deref(), requested.trust_level_sid.as_deref()).unwrap_or(false) {
         return Ok(false);
     }
     Ok(requested.parent_token_id == caller.id || is_sibling(&caller, &requested))

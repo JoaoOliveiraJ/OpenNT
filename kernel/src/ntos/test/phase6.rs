@@ -16389,6 +16389,7 @@ pub fn run(assert: Assert) {
     rtl_acl_trust_label_exports(assert);
     se_access_check_ex_exports(assert);
     super::conditional_aces::run(assert);
+    super::token_trust::run(assert);
     se_audit_alarms_exports(assert);
     se_set_security_exports(assert);
     hvi_hardware_exports(assert);

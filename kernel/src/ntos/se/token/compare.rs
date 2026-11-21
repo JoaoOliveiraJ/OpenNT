@@ -29,8 +29,8 @@
 //!
 //! O token do OpenNT guarda o rótulo de integridade fora da lista de grupos
 //! (o NT o guarda em UserAndGroups); ele entra na comparação como mais um
-//! grupo. O OpenNT não tem TrustLevelSid nem claims de usuário ou
-//! dispositivo nos tokens: os dois lados ficam ausentes e iguais.
+//! grupo. O OpenNT não tem claims de usuário ou dispositivo nos tokens: os
+//! dois lados ficam ausentes e iguais.
 
 use alloc::vec::Vec;
 
@@ -139,6 +139,10 @@ pub fn equivalent(first: &Token, second: &Token) -> bool {
         return false;
     }
     if first.app_container.is_some() && (!sids_equal(&first.app_container, &second.app_container) || !compare_sid_and_attribute_arrays(&first.capabilities, &second.capabilities)) {
+        return false;
+    }
+    // A presença do TrustLevelSid e, com os dois, o SID.
+    if !sids_equal(&first.trust_level_sid, &second.trust_level_sid) {
         return false;
     }
     if restricted(first) != restricted(second) {

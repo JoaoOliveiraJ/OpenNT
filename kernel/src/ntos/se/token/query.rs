@@ -378,9 +378,15 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
                 layout.append_sid(0, container);
             }
         }
-        // Sem pacote nem SID de confiança do processo.
+        // TokenProcessTrustLevel (o TOKEN_PROCESS_TRUST_LEVEL do
+        // NtQueryInformationToken 19041): o ponteiro e o SID logo depois
+        // (0x10 + 4 por subautoridade); sem SID de confiança, só o ponteiro
+        // nulo.
         41 => {
             layout.reserve(8);
+            if let Some(trust) = &token.trust_level_sid {
+                layout.append_sid(0, trust);
+            }
         }
         39 => return security_attributes::encode(&token.security_attributes, base),
         // Versão 1, atributos de segurança vazios.
@@ -426,9 +432,9 @@ pub fn encode(token_pointer: u64, class: u32, base: u64) -> Result<Vec<u8>, u32>
 // primeiros SIDs, o bit i em Hash[b & 0xF] e Hash[16 + (b >> 4)], com b o
 // byte baixo da última subautoridade (RtlSidHashInitialize). Os privilégios
 // saem na ordem do LUID (o bitmap Present do token, LUIDs 0 a 36), com
-// SE_PRIVILEGE_ENABLED e SE_PRIVILEGE_ENABLED_BY_DEFAULT. O OpenNT não tem
-// processos protegidos: TrustLevelSid nulo. O AppContainerNumber é o número
-// LowBox do token (0 sem ele).
+// SE_PRIVILEGE_ENABLED e SE_PRIVILEGE_ENABLED_BY_DEFAULT. O TrustLevelSid é
+// o do processo protegido dono do token (nulo sem ele). O AppContainerNumber
+// é o número LowBox do token (0 sem ele).
 
 const TAI_SIZE: usize = TokenAccessInformation::SIZE as usize;
 const HASH_SIZE: usize = SidAndAttributesHash::SIZE as usize;
@@ -515,8 +521,9 @@ fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
     let restricted_hash = sid_hash + HASH_SIZE + sid_region(&groups);
     let capabilities_hash = restricted_hash + HASH_SIZE + sid_region(&restricted);
     let package = capabilities_hash + HASH_SIZE + sid_region(&capabilities);
-    // Sem TrustLevelSid, os atributos seguem o PackageSid.
-    let attributes = package + package_size;
+    let trust = package + package_size;
+    let trust_size = token.trust_level_sid.as_ref().map_or(0, |sid| align8(sid.len()));
+    let attributes = trust + trust_size;
     let privileges_at = attributes + attributes_size;
     let total = privileges_at + privileges_size;
     if total > u32::MAX as usize {
@@ -556,7 +563,14 @@ fn access_information(token: &Token, base: u64) -> Result<Vec<u8>, u32> {
     image.put32(offset_of!(TokenAccessInformation, app_container_number), token.lowbox_number.map_or(0, |(_, number)| number));
     image.put64(offset_of!(TokenAccessInformation, package_sid), package_sid);
     image.put64(offset_of!(TokenAccessInformation, capabilities_hash), image.address(capabilities_hash));
-    image.put64(offset_of!(TokenAccessInformation, trust_level_sid), 0);
+    let trust_level_sid = match &token.trust_level_sid {
+        Some(sid) => {
+            image.put(trust, sid);
+            image.address(trust)
+        }
+        None => 0,
+    };
+    image.put64(offset_of!(TokenAccessInformation, trust_level_sid), trust_level_sid);
     image.put64(offset_of!(TokenAccessInformation, security_attributes), image.address(attributes));
     Ok(image.bytes)
 }
