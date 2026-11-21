@@ -1120,10 +1120,19 @@ fn top_rows(image: &Image, rows: usize) -> Image {
 /// fora dele a tela muda em até 1/32. Uma notificação embaixo à direita, uma
 /// dica pequena, um painel vazio, lixo e a tela inteira trocada não passam.
 pub fn start_menu_open(before: &Image, after: &Image) -> Result<String, String> {
+    start_menu_open_over(taskbar_layout(before)?.rows, before, after)
+}
+
+/// [`start_menu_open`] com a altura `h` da barra já medida: o clique mede a
+/// barra antes de levar o ponteiro ao botão, porque o ponteiro sobre o
+/// logotipo entraria na medida dele.
+pub fn start_menu_open_over(h: usize, before: &Image, after: &Image) -> Result<String, String> {
     if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
         return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
     }
-    let h = taskbar_layout(before)?.rows;
+    if h == 0 || h >= before.height {
+        return Err(format!("barra de {h} linhas numa tela de {} linhas", before.height));
+    }
     let (width, area) = (before.width, before.height - h);
     let at = |x: usize, y: usize| (y * width + x) * 3;
     if after.rgb.chunks_exact(3).filter(|pixel| [pixel[0], pixel[1], pixel[2]] == BUGCHECK_BACKGROUND).count() * 2 > width * before.height {

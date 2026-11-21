@@ -621,6 +621,11 @@ pub enum InputAction {
     /// ([`screen_check::start_menu_open`]) e que o Esc o fecha (o
     /// `START_MENU_OK`).
     StartMenu(String),
+    /// Espera a área de trabalho com a barra parada, leva o ponteiro ao
+    /// ponto (`x`, `y`) do botão Iniciar ([`point_at`]), aperta o botão
+    /// esquerdo, confere o menu Iniciar aberto e que o Esc o fecha (o
+    /// `START_MENU_OK`).
+    StartClick { x: usize, y: usize },
     /// Leva o ponteiro ao ponto (`x`, `y`) da tela ([`point_at`]), aperta o
     /// botão direito, confere o menu de contexto aberto
     /// ([`screen_check::context_menu_open`]) e que o Esc o fecha (o
@@ -692,6 +697,16 @@ impl InputSend {
         let (after, delay, keys) = Self::when("--start-menu", text)?;
         key_names(keys)?;
         Ok(InputSend { after, delay, action: InputAction::StartMenu(keys.to_string()) })
+    }
+
+    /// `--start-click=MARCADOR[+MS]:X,Y`, o ponto do botão Iniciar na tela
+    /// de 1024x768.
+    pub fn start_click(text: &str) -> Result<InputSend, String> {
+        let (after, delay, point) = Self::when("--start-click", text)?;
+        match screen_point(point) {
+            Some((x, y)) => Ok(InputSend { after, delay, action: InputAction::StartClick { x, y } }),
+            None => Err(format!("--start-click={text}: o ponto e X,Y inteiros dentro da tela de 1024x768")),
+        }
     }
 
     /// `--context-menu=MARCADOR[+MS]:X,Y`, um ponto da tela de 1024x768.
@@ -1601,18 +1616,48 @@ const START_MENU_WAIT: Duration = Duration::from_secs(60);
 
 /// O `--start-menu`: espera a área de trabalho com a barra parada
 /// ([`screen_check::taskbar_screen`], por até [`STILL_WAIT`]), digita as
-/// teclas (a tecla do Windows, `{meta_l}`; a hora vai para `sent`), espera o
-/// menu aberto e parado ([`screen_check::start_menu_open`]), aperta o Esc e
-/// espera a tela de antes de volta ([`screen_check::same_screen`]), cada
-/// espera por até [`START_MENU_WAIT`]. Devolve o menu achado, ou o que faltou.
+/// teclas (a tecla do Windows, `{meta_l}`; a hora vai para `sent`) e confere
+/// o menu aberto e fechado ([`start_menu_shown`]). Devolve o menu achado, ou
+/// o que faltou.
 fn open_start_menu(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Option<Instant>) -> Result<String, String> {
     let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::taskbar_screen).map_err(|missing| format!("a area de trabalho com a barra nao parou: {missing}"))?;
     *sent = Some(Instant::now());
     type_keys(monitor, keys)?;
-    let open = still_screen(monitor, ppm, START_MENU_WAIT, |image| screen_check::start_menu_open(&before, image)).map_err(|missing| format!("o menu Iniciar nao abriu: {missing}"))?;
-    let opened = screen_check::start_menu_open(&before, &open)?;
+    let rows = screen_check::taskbar_layout(&before)?.rows;
+    start_menu_shown(monitor, ppm, &before, rows, "da tecla")
+}
+
+/// O `--start-click`: espera a área de trabalho com a barra parada, leva o
+/// ponteiro a (`x`, `y`) ([`point_at`]), o botão Iniciar, espera a tela
+/// parada com ele lá (a tela de antes, com o botão sob o ponteiro), aperta e
+/// solta o botão esquerdo (a hora vai para `sent`) e confere o menu aberto e
+/// fechado ([`start_menu_shown`]). Devolve o menu achado, ou o que faltou.
+fn click_start_menu(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, sent: &mut Option<Instant>) -> Result<String, String> {
+    let bar = still_screen(monitor, ppm, STILL_WAIT, screen_check::taskbar_screen).map_err(|missing| format!("a area de trabalho com a barra nao parou: {missing}"))?;
+    let rows = screen_check::taskbar_layout(&bar)?.rows;
+    let (px, py) = point_at(monitor, ppm, x, y)?;
+    // Com o ponteiro sobre o logotipo, a leitura da barra o mediria junto:
+    // a barra fica medida de antes, e basta a tela desenhada e parada (o
+    // botão já com o realce do mouse).
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen).map_err(|missing| format!("a area de trabalho com o ponteiro no botao Iniciar nao parou: {missing}"))?;
+    *sent = Some(Instant::now());
+    monitor.write_all(b"mouse_button 1\n").map_err(|error| format!("monitor HMP: {error}"))?;
+    thread::sleep(Duration::from_millis(60));
+    monitor.write_all(b"mouse_button 0\n").map_err(|error| format!("monitor HMP: {error}"))?;
+    let shown = start_menu_shown(monitor, ppm, &before, rows, "do clique")?;
+    Ok(format!("clique em ({px},{py}): {shown}"))
+}
+
+/// Depois da tecla ou do clique sobre `before`, com a barra de `rows`
+/// linhas: espera o menu aberto e parado
+/// ([`screen_check::start_menu_open_over`]), aperta o Esc e espera a tela
+/// de antes de volta ([`screen_check::same_screen`]), cada espera por até
+/// [`START_MENU_WAIT`]. Devolve o menu achado, ou o que faltou.
+fn start_menu_shown(monitor: &mut TcpStream, ppm: &Path, before: &crate::png::Image, rows: usize, what: &str) -> Result<String, String> {
+    let open = still_screen(monitor, ppm, START_MENU_WAIT, |image| screen_check::start_menu_open_over(rows, before, image)).map_err(|missing| format!("o menu Iniciar nao abriu: {missing}"))?;
+    let opened = screen_check::start_menu_open_over(rows, before, &open)?;
     type_keys(monitor, "{esc}")?;
-    let back = |image: &crate::png::Image| if screen_check::same_screen(&before, image) { Ok(String::new()) } else { Err("a tela nao voltou a de antes da tecla".to_string()) };
+    let back = |image: &crate::png::Image| if screen_check::same_screen(before, image) { Ok(String::new()) } else { Err(format!("a tela nao voltou a de antes {what}")) };
     still_screen(monitor, ppm, START_MENU_WAIT, back).map_err(|missing| format!("o menu Iniciar abriu ({opened}), mas nao fechou com o Esc: {missing}"))?;
     Ok(format!("{opened}; fechou com o Esc"))
 }
@@ -2349,6 +2394,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] o menu Iniciar nao abriu e fechou com {keys} (aos {at:.1} s): {missing}"));
                             return Err(format!("o menu Iniciar nao abriu e fechou com {keys}: {missing}"));
+                        }
+                    }
+                }
+                InputAction::StartClick { x, y } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| click_start_menu(monitor, &ppm, *x, *y, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] botao esquerdo no botao Iniciar em ({x},{y}) pelo monitor (aos {at:.1} s)\n[xtask] menu Iniciar: {description}\n{START_MENU_MARKER}")),
+                        Err(missing) => {
+                            note(format!("[xtask] o menu Iniciar nao abriu e fechou com o clique em ({x},{y}) (aos {at:.1} s): {missing}"));
+                            return Err(format!("o menu Iniciar nao abriu e fechou com o clique em ({x},{y}): {missing}"));
                         }
                     }
                 }

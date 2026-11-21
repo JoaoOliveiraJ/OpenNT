@@ -7926,6 +7926,14 @@ muda em até 1/8; acima dela, o maior grupo de mudanças fica colado à esquerda
 e à barra, tem 6h por 6h pixels ou mais, 3/4 deles mudados, de 1/200 a 1/2 de
 texto e ícones longe da mediana por 0x60 e a maioria dos vizinhos suaves; fora
 dele, a tela muda em até 1/32), e o log ganha o `START_MENU_OK`. O
+`--start-click=...:X,Y` abre o menu como uma pessoa com o mouse: espera a
+área de trabalho com a barra parada, leva o ponteiro ao botão Iniciar no
+ponto (X, Y) como o `--context-menu` abaixo (`qemu::point_at`), toma como
+tela de antes a tela parada com o ponteiro sobre o botão (a altura da barra
+vem da leitura de antes do ponteiro, que sobre o logotipo entraria na
+medida dele), aperta e solta o botão esquerdo e confere o menu aberto e o
+Esc com as mesmas medidas do `--start-menu` (`qemu::start_menu_shown`,
+`screen_check::start_menu_open_over`); o log ganha o `START_MENU_OK`. O
 `--context-menu=...:X,Y` espera a tela desenhada parada, leva o ponteiro ao
 ponto (X, Y) (`qemu::point_at`) e aperta o botão direito (`mouse_button 2`).
 O mouse PS/2 é relativo e a aceleração do Windows muda a distância com a

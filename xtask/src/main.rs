@@ -213,6 +213,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --start-menu=MARCADOR[+MS]:TECLAS (repetivel: espera a area de trabalho com a
                    barra parada, digita as teclas ({meta_l} e a tecla do Windows), confere o menu
                    Iniciar aberto e que o Esc o fecha: START_MENU_OK na serial)
+                   --start-click=MARCADOR[+MS]:X,Y (repetivel: espera a area de trabalho com a
+                   barra parada, leva o ponteiro ao botao Iniciar em X,Y, aperta o botao esquerdo,
+                   confere o menu Iniciar aberto e que o Esc o fecha: START_MENU_OK na serial)
                    --context-menu=MARCADOR[+MS]:X,Y (repetivel: leva o ponteiro do mouse PS/2 ao
                    ponto X,Y da tela, olhando onde a seta esta, aperta o botao direito, confere o
                    menu de contexto aberto no ponto e que o Esc o fecha: CONTEXT_MENU_OK na serial)
@@ -439,6 +442,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--mouse" => parsed.inputs.push(qemu::InputSend::mouse(&required()?)?),
             "--dismiss" => parsed.inputs.push(qemu::InputSend::dismiss(&required()?)?),
             "--start-menu" => parsed.inputs.push(qemu::InputSend::start_menu(&required()?)?),
+            "--start-click" => parsed.inputs.push(qemu::InputSend::start_click(&required()?)?),
             "--context-menu" => parsed.inputs.push(qemu::InputSend::context_menu(&required()?)?),
             "--double-click" => parsed.inputs.push(qemu::InputSend::double_click(&required()?)?),
             "--run" => parsed.inputs.push(qemu::InputSend::run(&required()?)?),
@@ -525,7 +529,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss, --mouse, --start-menu, --context-menu, --double-click, --run, --open, --type e --command sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse, --start-menu, --start-click, --context-menu, --double-click, --run, --open, --type e --command sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -842,6 +846,11 @@ mod tests {
         assert_eq!(parsed.inputs, vec![InputSend { after: "TASKBAR_OK".into(), delay: Duration::from_millis(3000), action: InputAction::StartMenu("{meta_l}".into()) }]);
         assert!(parse_words(&["test-boot", "--start-menu=X"]).is_err());
         assert!(parse_words(&["test-boot", "--start-menu=X:{win}"]).is_err());
+        let parsed = parse_words(&["test-boot", "--start-click=TASKBAR_OK+3000:24,748"]).unwrap();
+        assert_eq!(parsed.inputs, vec![InputSend { after: "TASKBAR_OK".into(), delay: Duration::from_millis(3000), action: InputAction::StartClick { x: 24, y: 748 } }]);
+        for bad in ["--start-click=X", "--start-click=X:24", "--start-click=X:24,768", "--start-click=X:{meta_l}"] {
+            assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
+        }
         let parsed = parse_words(&["test-boot", "--context-menu=TASKBAR_OK+3000:400,300"]).unwrap();
         assert_eq!(parsed.inputs, vec![InputSend { after: "TASKBAR_OK".into(), delay: Duration::from_millis(3000), action: InputAction::ContextMenu { x: 400, y: 300 } }]);
         for bad in ["--context-menu=X", "--context-menu=X:400", "--context-menu=X:1024,10", "--context-menu=X:10,768", "--context-menu=X:-1,5"] {
