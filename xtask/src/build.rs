@@ -282,6 +282,10 @@ impl BuildOptions {
             net: false,
             memory_pressure: false,
             tpm: false,
+            // Com a conta de teste, o gancho de primeiro boot é o dela, que já
+            // desabilita as contas embutidas: o volume é o mesmo com ou sem a
+            // opção (o test-boot com entrada pelo monitor a liga sozinho).
+            builtin_accounts_off: self.builtin_accounts_off && !self.test_account,
             // O `console_process`, o `test_account` e o `system_volume` (o
             // disco particionado) ficam: eles também mudam o volume NTFS.
             ..self.clone()
@@ -686,6 +690,14 @@ mod tests {
         assert_ne!(smss.image_key(), account.image_key());
         assert_eq!(base.kernel_key(), account.kernel_key());
         assert_eq!(smss.load_options().unwrap(), account.load_options().unwrap());
+        // O gancho da conta já desabilita as contas embutidas: a opção não
+        // muda o volume dela (e muda o do smss sem a conta).
+        let mut account_inputs = account.clone();
+        account_inputs.builtin_accounts_off = true;
+        assert_eq!(account.image_key(), account_inputs.image_key());
+        let mut builtins = smss.clone();
+        builtins.builtin_accounts_off = true;
+        assert_ne!(smss.image_key(), builtins.image_key());
         // O desligamento da cadeia muda a hive SYSTEM (outra imagem), não o
         // kernel.
         let mut chain = account.clone();

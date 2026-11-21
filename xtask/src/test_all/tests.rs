@@ -70,7 +70,10 @@ fn the_whole_round_compiles_one_kernel() {
         let mut command = vec![String::from("test-boot")];
         command.extend(test.arguments.iter().cloned());
         let options = crate::test_build_options(&crate::parse(command).unwrap());
-        (options.initial_process.clone(), options.console_process, options.test_account, options.builtin_accounts_off, options.shutdown_chain, options.kernel_test_scope == "e-process", !options.system_volume.is_empty())
+        // Com a conta de teste, as contas embutidas desligadas não mudam o
+        // volume (o gancho da conta já as desliga).
+        let builtin = options.builtin_accounts_off && !options.test_account;
+        (options.initial_process.clone(), options.console_process, options.test_account, builtin, options.shutdown_chain, options.kernel_test_scope == "e-process", !options.system_volume.is_empty())
     };
     let mut volumes: Vec<(String, bool, bool, bool, bool, bool, bool)> = Vec::new();
     for run in &runs {
@@ -82,10 +85,11 @@ fn the_whole_round_compiles_one_kernel() {
     volumes.sort();
     // O boot comum, o do processo de console, o do smss, o do smss com as
     // contas embutidas desligadas (os testes com entrada), o da conta de
-    // teste, o da conta de teste com o gancho que desliga a cadeia (o
-    // desligamento-cadeia) e o da conta de teste com entrada (o
-    // --start-menu do menu-iniciar também é entrada e liga o gancho das
-    // contas embutidas), mais o do e-process e o do volume-sistema.
+    // teste (com ou sem entrada: o --start-menu do menu-iniciar e o --run
+    // do prompt-de-comando ligam o gancho das contas embutidas, que o da
+    // conta já cobre) e o da conta de teste com o gancho que desliga a
+    // cadeia (o desligamento-cadeia), mais o do e-process e o do
+    // volume-sistema.
     let expected = [
         ("", false, false, false, false, false, false),
         ("", false, false, false, false, false, true),
@@ -95,7 +99,6 @@ fn the_whole_round_compiles_one_kernel() {
         ("smss", false, false, true, false, false, false),
         ("smss", false, true, false, false, false, false),
         ("smss", false, true, false, true, false, false),
-        ("smss", false, true, true, false, false, false),
     ];
     assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain, e_process, system_volume)| (String::from(process), console, account, builtin, chain, e_process, system_volume)), "volumes da rodada");
     let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
