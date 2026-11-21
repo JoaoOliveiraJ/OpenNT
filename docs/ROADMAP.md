@@ -42,7 +42,7 @@ Banco de páginas físicas, mapeamento recursivo, pool do kernel, variáveis exp
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Gerência de memória | Funciona | selftest, pagefile |
-| Multiprocessador (SMP) | Funciona | selftest, fase7 |
+| Multiprocessador (SMP) | Funciona | selftest, fase7, logonui-smp2, area-de-trabalho-smp2, barra-de-tarefas-smp2 |
 | Estado estendido do processador (XSAVE e AVX) | Funciona | xstate, selftest |
 
 ## Fase 3 — objetos e executive (concluída)

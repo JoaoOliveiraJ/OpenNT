@@ -561,10 +561,14 @@ sistema parado por 15 s (o BSP ocioso e nenhum intervalo de usuário), sai
 uma vez uma linha `[parada]` por thread de usuário, com o estado de
 despacho, a CPU dona, a presença na fila, a suspensão, o serviço e a espera,
 e uma por porta ALPC ou servidor com pedidos pendentes
-(`threads::report_stalled_threads`). Com `--user-smp` o boot até a área
-de trabalho ainda tem paradas longas (um pedido ALPC síncrono recebido pelo
-servidor, o LSM ou o csrss, fica sem resposta até um prazo vencer), e os
-testes da cadeia continuam com `--smp=1`. O
+(`threads::report_stalled_threads`). Os testes da cadeia continuam com
+`--smp=1`: o boot até a área de trabalho espera mais do que calcula, e com
+duas CPUs ele não fica mais rápido, só ocupa duas CPUs do anfitrião. Os
+testes `logonui-smp2`, `area-de-trabalho-smp2` e `barra-de-tarefas-smp2`
+repetem os boots e as conferências dos originais com `--smp=2 --user-smp`.
+O depurador do kernel ainda não para no breakpoint de usuário atingido num
+AP: a parada chega a ele como pedido de parada (SIGINT) na CPU 0, sem a
+thread do breakpoint, e os testes com `--kd` ficam com `--smp=1`. O
 autoteste `ntos/test/multiprocess/user_smp.rs` (com dois processadores ou
 mais) liga o despacho de usuário nos APs e, com o BSP só girando, confere
 que o serviço é atendido num AP, que cada sinal do BSP conclui exatamente
