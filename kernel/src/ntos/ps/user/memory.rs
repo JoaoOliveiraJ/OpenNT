@@ -241,16 +241,99 @@ fn contains(region: &Region, va: u64) -> bool {
     va >= region.base() && va < region.base() + region.size()
 }
 
+/// Uma lista do VAD com a busca por endereço: a árvore do EPROCESS.VadRoot
+/// do NT (o MiLocateAddress desce a árvore balanceada). A lista guarda a
+/// ordem de inserção; o índice (base -> região) é mantido a cada inserção e
+/// remoção. Se duas regiões da lista se sobrepõem ou dividem a base, o
+/// índice fica de lado e a busca volta à varredura na ordem da lista, a
+/// mesma resposta de sempre; uma remoção refaz o índice.
+#[derive(Default)]
+pub struct RegionList {
+    list: Vec<Region>,
+    index: BTreeMap<u64, Region>,
+    broken: bool,
+}
+
+impl RegionList {
+    /// As regiões, na ordem de inserção.
+    pub fn as_slice(&self) -> &[Region] {
+        &self.list
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    fn index_insert(&mut self, region: &Region) {
+        if self.broken {
+            return;
+        }
+        let (base, end) = (region.base(), region.base().saturating_add(region.size()));
+        let previous = self.index.range(..=base).next_back().is_some_and(|(&previous_base, previous)| previous_base == base || previous_base.saturating_add(previous.size()) > base);
+        let next = self.index.range(base..).next().is_some_and(|(&next_base, _)| next_base < end);
+        if previous || next {
+            self.broken = true;
+            self.index.clear();
+            return;
+        }
+        self.index.insert(base, region.clone());
+    }
+
+    fn rebuild(&mut self) {
+        self.broken = false;
+        self.index.clear();
+        let list = self.list.clone();
+        for region in &list {
+            self.index_insert(region);
+        }
+    }
+
+    fn push(&mut self, region: Region) {
+        self.index_insert(&region);
+        self.list.push(region);
+    }
+
+    /// Retira a região (pela identidade); devolve se estava na lista.
+    fn remove(&mut self, region: &Region) -> bool {
+        let Some(position) = self.list.iter().position(|candidate| state::same_region(candidate, region)) else { return false };
+        let removed = self.list.remove(position);
+        if self.broken {
+            self.rebuild();
+        } else if self.index.get(&removed.base()).is_some_and(|indexed| state::same_region(indexed, &removed)) {
+            self.index.remove(&removed.base());
+        }
+        true
+    }
+
+    /// Todas as regiões, e a lista fica vazia.
+    fn take(&mut self) -> Vec<Region> {
+        self.index.clear();
+        self.broken = false;
+        core::mem::take(&mut self.list)
+    }
+
+    fn find(&self, va: u64) -> Option<&Region> {
+        if self.broken {
+            return self.list.iter().find(|region| contains(region, va));
+        }
+        self.index.range(..=va).next_back().map(|(_, region)| region).filter(|region| contains(region, va))
+    }
+}
+
 /// O VAD de um processo: o que ele possui na metade de usuário. No NT é a
-/// árvore de EPROCESS.VadRoot; aqui são listas (o EPROCESS.VadRoot fica
-/// vazio).
+/// árvore de EPROCESS.VadRoot; aqui são duas listas com a busca por
+/// endereço de [`RegionList`] (o EPROCESS.VadRoot fica vazio).
 #[derive(Default)]
 pub struct Vad {
     /// Alocações privadas e vistas de seção de dados.
-    pub regions: Vec<Region>,
+    pub regions: RegionList,
     /// Imagens: o executável, a ntdll, as DLLs do loader e as vistas de
     /// seção de imagem.
-    pub images: Vec<Region>,
+    pub images: RegionList,
     /// Área de strings das entradas LDR montadas pelo kernel: (próxima VA,
     /// fim da região).
     pub ldr_strings: (u64, u64),
@@ -258,10 +341,10 @@ pub struct Vad {
 
 impl Vad {
     fn find(&self, va: u64) -> Option<Region> {
-        self.regions.iter().find(|region| contains(region, va)).or_else(|| self.images.iter().find(|region| contains(region, va))).cloned()
+        self.regions.find(va).or_else(|| self.images.find(va)).cloned()
     }
 
-    fn list(&mut self, kind: RegionKind) -> Option<&mut Vec<Region>> {
+    fn list(&mut self, kind: RegionKind) -> Option<&mut RegionList> {
         match kind {
             RegionKind::User => Some(&mut self.regions),
             RegionKind::ProcessImages => Some(&mut self.images),
@@ -271,10 +354,7 @@ impl Vad {
 
     /// Retira a região (pela identidade) da lista do tipo; devolve se estava lá.
     fn remove(&mut self, kind: RegionKind, region: &Region) -> bool {
-        let Some(list) = self.list(kind) else { return false };
-        let Some(index) = list.iter().position(|candidate| state::same_region(candidate, region)) else { return false };
-        list.remove(index);
-        true
+        self.list(kind).is_some_and(|list| list.remove(region))
     }
 }
 
@@ -332,12 +412,12 @@ impl Space {
 
     /// Alocações privadas e vistas de dados do processo.
     pub fn regions(self) -> Vec<Region> {
-        self.with_vad(|vad| vad.regions.clone()).unwrap_or_default()
+        self.with_vad(|vad| vad.regions.as_slice().to_vec()).unwrap_or_default()
     }
 
     /// Imagens do processo.
     pub fn images(self) -> Vec<Region> {
-        self.with_vad(|vad| vad.images.clone()).unwrap_or_default()
+        self.with_vad(|vad| vad.images.as_slice().to_vec()).unwrap_or_default()
     }
 
     /// Registra a região no VAD; `false` se o processo já saiu.
@@ -396,7 +476,7 @@ pub fn occupied(space: Space) -> Vec<section_address::Region> {
             continue;
         }
         let vad = state.vad.lock();
-        occupied.extend(vad.regions.iter().chain(vad.images.iter()).map(span));
+        occupied.extend(vad.regions.as_slice().iter().chain(vad.images.as_slice().iter()).map(span));
     }
     occupied.extend(sections::views().iter().filter(|view| view.root == root).map(|view| section_address::Region { base: view.base, size: view.size }));
     occupied.extend(section_views::all().iter().filter(|view| view.root() == root).map(|view| section_address::Region { base: view.base(), size: view.size() }));
@@ -1401,9 +1481,10 @@ fn split_private_region(space: Space, region: &Region, owner: &PrivateRegion, fi
     let root = space.root();
     let mut relisted: Vec<(working_set::ListedPage, bool)> = Vec::new();
     space.with_vad(|vad| {
-        let Some(position) = vad.regions.iter().position(|candidate| state::same_region(candidate, region)) else { return };
+        if !vad.regions.remove(region) {
+            return;
+        }
         let mut old = owner.state.lock();
-        vad.regions.remove(position);
         for (start, stop) in [(owner.base, first), (end, owner.base + owner.size)] {
             if stop <= start {
                 continue;
@@ -1687,7 +1768,7 @@ pub fn release_vad(state: &ProcessState) {
     let (regions, images) = {
         let mut vad = state.vad.lock();
         vad.ldr_strings = (0, 0);
-        (core::mem::take(&mut vad.regions), core::mem::take(&mut vad.images))
+        (vad.regions.take(), vad.images.take())
     };
     for region in &regions {
         if let Some(owner) = private(region) {

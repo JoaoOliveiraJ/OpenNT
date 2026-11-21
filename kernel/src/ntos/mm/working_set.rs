@@ -356,7 +356,7 @@ fn trim_candidates() -> Vec<(u64, Region)> {
             continue;
         }
         let vad = state.vad.lock();
-        candidates.extend(vad.regions.iter().filter(|region| private(region).is_some_and(|owner| owner.pageable)).map(|region| (root, region.clone())));
+        candidates.extend(vad.regions.as_slice().iter().filter(|region| private(region).is_some_and(|owner| owner.pageable)).map(|region| (root, region.clone())));
     }
     candidates.sort_by_key(|(root, region)| (*root, region.base()));
     candidates
@@ -415,7 +415,7 @@ pub fn empty_working_set(process: u64) -> u64 {
     if root == 0 || root == SYSTEM_ROOT {
         return 0;
     }
-    let regions: Vec<Region> = state.vad.lock().regions.iter().filter(|region| private(region).is_some_and(|owner| owner.pageable)).cloned().collect();
+    let regions: Vec<Region> = state.vad.lock().regions.as_slice().iter().filter(|region| private(region).is_some_and(|owner| owner.pageable)).cloned().collect();
     let mut moved = 0;
     for region in &regions {
         if let Some(owner) = private(region) {

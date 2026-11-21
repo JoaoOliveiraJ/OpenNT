@@ -82,7 +82,7 @@ pub fn vad(owner: usize, argument: &str, out: &mut Payload) {
         let mut index = 0;
         let mut lines = 0;
         loop {
-            let next = vad.regions.iter().chain(vad.images.iter()).filter(|region| previous.is_none_or(|previous| region.base() > previous)).min_by_key(|region| region.base());
+            let next = vad.regions.as_slice().iter().chain(vad.images.as_slice().iter()).filter(|region| previous.is_none_or(|previous| region.base() > previous)).min_by_key(|region| region.base());
             let Some(region) = next else { break };
             previous = Some(region.base());
             if index >= start {

@@ -1574,7 +1574,13 @@ além da KUSER_SHARED_DATA:
   Dois processos com raiz própria usam a mesma VA sem conflito.
 - **VAD por processo** (`memory::Vad`, no `ProcessState` de cada EPROCESS):
   as alocações privadas, as vistas de seção e as imagens são do processo que
-  as criou. Os serviços agem sobre um `memory::Space`, o do processo do
+  as criou. Cada lista (`memory::RegionList`) guarda a ordem de inserção e
+  um índice pela base, mantido em cada inserção e remoção: a busca por
+  endereço (a de cada sonda de memória de usuário no modo estrito de posse)
+  desce o índice, como o MiLocateAddress desce a árvore do VadRoot; se duas
+  regiões de uma lista se sobrepõem, a busca volta à varredura em ordem, com
+  a mesma resposta. Antes a varredura linear era um terço do tempo de kernel
+  do explorer, que enumera diretórios com milhares de regiões no VAD. Os serviços agem sobre um `memory::Space`, o do processo do
   handle (o pseudo-handle é o corrente, o anexado quando há attach): os Nt*
   de usuário, os Zw* e o NtMapViewOfSection (seção 4, memória entre
   processos). NtQueryVirtualMemory, NtFreeVirtualMemory e
