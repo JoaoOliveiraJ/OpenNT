@@ -26,8 +26,11 @@ opt-level = 1
 # O kernel dos builds comuns (build, run, test-boot, test-all) leva só as
 # tabelas de linha do DWARF: o depurador acha arquivo:linha e o nome de cada
 # função (inclusive as expandidas inline), e o kernel compila e liga mais
-# rápido e ocupa menos disco.
+# rápido e ocupa menos disco. Ele compila com opt-level 2: o boot até a área
+# de trabalho fica 4 a 8% mais curto que com o 1 do resto do workspace, sem
+# custo de compilação mensurável (limpo e incremental).
 [profile.dev.package.kernel]
+opt-level = 2
 debug = "line-tables-only"
 # O kernel e o stage2 vão para a imagem do convidado: os caminhos absolutos
 # desta máquina (o código-fonte da biblioteca padrão no rustup, a pasta do
@@ -41,11 +44,13 @@ trim-paths = "object"
 trim-paths = "object"
 
 # `cargo xtask debug` (e os depuradores gráficos, que o chamam): o DWARF
-# completo, com os tipos e as variáveis locais que eles mostram.
+# completo, com os tipos e as variáveis locais que eles mostram, e o kernel
+# com opt-level 1, em que as variáveis locais ainda aparecem.
 [profile.depuracao]
 inherits = "dev"
 
 [profile.depuracao.package.kernel]
+opt-level = 1
 debug = "full"
 trim-paths = "object"
 
