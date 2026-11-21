@@ -144,6 +144,9 @@ fn release_writer() {
 
 /// A página continua em transição no mesmo frame, sem cópia (`modified`)
 /// ou com ela.
+/// Abaixo disto de frames livres, o writer grava uma página por vez.
+const SMALL_CLUSTER_FRAMES: u64 = 4;
+
 fn still_listed(page: &ListedPage, modified: bool) -> bool {
     let Some(owner) = page.owner() else { return false };
     let state = owner.state.lock();
@@ -174,8 +177,15 @@ fn write_clusters(limit: u64) -> (u64, bool) {
     let mut written = 0;
     let mut no_space = false;
     while written < limit {
+        // Sem frames livres, uma página por escrita: o MDL dela usa o mapa
+        // direto, e a de várias páginas mapearia o cluster em PTEs de
+        // sistema, que podem pedir uma tabela nova sem frame para ela (a
+        // escrita falhava com STATUS_INSUFFICIENT_RESOURCES e a memória não
+        // andava). O writer do 19041 tem MDLs e PTEs reservados para nunca
+        // depender de memória nova.
+        let cluster_limit = if pfn::free_count() < SMALL_CLUSTER_FRAMES { 1 } else { MAXIMUM_WRITE_CLUSTER };
         let mut cluster: Vec<ListedPage> = Vec::new();
-        while cluster.len() < MAXIMUM_WRITE_CLUSTER {
+        while cluster.len() < cluster_limit {
             let Some(page) = MODIFIED.lock().pop_front() else { break };
             if still_listed(&page, true) {
                 cluster.push(page);
@@ -217,6 +227,20 @@ fn write_clusters(limit: u64) -> (u64, bool) {
         COUNTERS.dirty_write_ios.fetch_add(1, Ordering::Relaxed);
         if status & 0x8000_0000 != 0 && !WRITE_FAILED.swap(true, Ordering::Relaxed) {
             crate::debug_print!("[mm] escrita no arquivo de paginacao {} pagina {:#x} ({} paginas) -> {:#x}", first.file, first.offset, count, status);
+        }
+        if status & 0x8000_0000 != 0 {
+            // A escrita falhou (sem recurso para o MDL ou o pedido, sob
+            // pressão de memória): as páginas voltam à lista de modificadas
+            // para uma escrita seguinte, como no MiWriteComplete do 19041, e
+            // os slots voltam ao arquivo. Fora de toda lista, uma página em
+            // transição sem slot nunca mais seria gravada nem reaproveitada,
+            // e o frame dela ficaria preso. A rodada para aqui.
+            let mut list = MODIFIED.lock();
+            for (position, page) in cluster.into_iter().enumerate().rev() {
+                paging_file::release(Slot { file: first.file, offset: first.offset + position as u64 });
+                list.push_front(page);
+            }
+            break;
         }
         for (position, page) in cluster.into_iter().enumerate() {
             let slot = Slot { file: first.file, offset: first.offset + position as u64 };
