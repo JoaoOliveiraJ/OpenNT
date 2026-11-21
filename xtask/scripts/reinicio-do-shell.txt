@@ -1,0 +1,24 @@
+# Roteiro do teste `reinicio-do-shell` (cargo xtask test-boot --kd=com2
+# --script=xtask/scripts/reinicio-do-shell.txt, no boot da área de
+# trabalho): o explorer.exe sai como numa falha e o winlogon.exe o recria.
+#
+# Sem anexar, o roteiro espera a área de trabalho confirmada pela vigia da
+# tela (o DESKTOP_OK que o test-boot põe na COM1). Então para a máquina,
+# acha o explorer.exe e pede ao alvo o fim dele com o código de uma falha
+# de acesso (`monitor kill`, que roda num work item do kernel depois que a
+# máquina segue, pelo mesmo PspTerminateProcess de um NtTerminateProcess).
+# O callout de saída do win32k vê que o shell da Desktop de entrada saiu
+# com um código diferente de 1 e de 0xff e avisa o winlogon, que recria o
+# shell; o SHELL_RESTARTED e a área de trabalho de volta (o segundo
+# DESKTOP_OK) são do test-boot.
+
+wait-serial /t 1500000 DESKTOP_OK
+attach
+expect-stop SIGINT
+# Um explorer.exe só: o da sessão 1, criado pelo userinit.exe.
+for-each process shell name explorer.exe {
+}
+expect-eq $shell_count 1
+monitor kill ${shell_pid} c0000005
+expect sera encerrado com o codigo 0xc0000005
+detach

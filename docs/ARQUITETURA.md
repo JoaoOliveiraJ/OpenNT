@@ -1062,7 +1062,20 @@ na ordem do PspExitThread, as notificações e o callout de saída de thread do
 win32k (antes das rotinas de E/S, timers, notificações do Cm e mutantes), o
 rundown das APCs, o token, a contagem no EPROCESS e o objeto thread
 sinalizado; a última thread viva do processo conclui o fim dele ali mesmo,
-com o callout de saída de processo antes das notificações de processo. Os
+com o callout de saída de processo antes das notificações de processo. É
+por esse callout que o shell volta quando o explorer.exe cai: o
+DestroyProcessInfo do win32kbase (0x46f60) vê que o processo é o shell da
+Desktop de entrada (o ppiShellProcess que o SetShellWindow pôs no
+DESKTOPINFO, numa WindowStation com E/S) e lê o código de saída pelo
+PsGetProcessExitStatus; diferente de 1 e de 0xff (o explorer que sai pelo
+CTray::_DoExitExplorer usa 1 e não é recriado, como o `taskkill /f`), o
+PostWinlogonMessage(0x401, código) vai pelo RPC assíncrono do kernel
+(msrpc.sys) ao endpoint `WMsgKRpc<luid><sessão>` que o winlogon registrou
+e o RegisterLogonProcess ligou (WmsgpConnect). O WMsgKMessageHandler do
+winlogon liga o sinal Winsrv_ShellRestart (0xa), e o
+WLGeneric_ShellRestart_Enter lê o AutoRestartShell (1 sem o valor) e o
+Shell de Winlogon e cria o explorer.exe na Winsta0\Default com o token do
+usuário (teste reinicio-do-shell). Os
 serviços Nt* que
 esperam por handle (NtWaitFor*, NtDelayExecution) continuam com o modelo
 PENDING, sem pilha suspensa, com a espera registrada no despachante (abaixo). O NtWaitForSingleObject e o
@@ -3255,6 +3268,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     (DRIVER_OBJECT, os dispositivos e a tabela de despacho) e `handle` (a
     entrada da HANDLE_TABLE nativa, pelo caminho do
     ExpLookupHandleTableEntry).
+  - Fim de um processo de usuário (`kd/terminate.rs`, `monitor kill
+    <pid|end> <código>`): com a máquina parada o comando só acha o processo
+    pelas listas nativas e guarda o pedido em duas células atômicas, sem
+    trava nenhuma. Com o depurador ligado, o boot reserva um work item do
+    kernel e o deixa na fila com o pedido como predicado de prontidão:
+    depois que a máquina segue, a gerência das filas acorda uma worker, que
+    chama o PspTerminateProcess (`ps::create::exit_process`) a
+    PASSIVE_LEVEL, como um NtTerminateProcess de outro processo, e devolve o
+    item à fila. Processos de sistema ficam de fora. É o que o roteiro do
+    teste reinicio-do-shell usa para derrubar o explorer.exe.
   - Rastro de instruções (`kd/trace.rs`): o host arma com `monitor trace
     start` (número de instruções, endereço final, até o retorno,
     profundidade máxima, faixas puladas, entrar ou sair de uma faixa,
@@ -7464,10 +7487,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `SHELL_TRAY_CREATED` (depois do `USER_LOGON_OK`, o NtUserCreateWindowEx do
   explorer.exe da sessão 1 volta com uma janela da classe Shell_TrayWnd, o
   nome lido pelo `LargeString` que o user32 passa no segundo argumento;
-  `initial_process::win32k_window_created`) e `STARTMENU_HOST_STARTED` (o
+  `initial_process::win32k_window_created`), `SHELL_RESTARTED` (o
+  explorer.exe que o winlogon.exe da sessão 1 cria com o token desse
+  usuário depois do `EXPLORER_STARTED`, o shell recriado pelo
+  WLGeneric_ShellRestart_Enter, cria a janela Shell_TrayWnd dele;
+  `initial_process::shell_recreated`) e `STARTMENU_HOST_STARTED` (o
   StartMenuExperienceHost.exe nasce na sessão 1 com o token LowBox desse
   usuário); os testes barra-de-tarefas e menu-iniciar esperam também o
-  `TASKBAR_OK` e o `START_MENU_OK` da vigia e do `--start-menu`;
+  `TASKBAR_OK` e o `START_MENU_OK` da vigia e do `--start-menu`, e o teste
+  reinicio-do-shell, o segundo `DESKTOP_OK` da vigia depois do
+  `SHELL_RESTARTED`;
   os de falha são `*** PANIC`, `*** EXCECAO`, `SELFTEST FALHOU` e `*** STOP`
   (a parada do KeBugCheckEx; com `--expect-stop` o STOP faz parte do teste,
   como no `bugcheck`). O `test-boot` procura falhas desde o boot até
@@ -7600,6 +7629,18 @@ pixels ou mais, o resto da barra em até 1/20 e a tela acima em até 1/32
 (`screen_check::clock_ticked`: o relógio passou de minuto, o caminho do
 SetTimer, da repintura e do dwm, não um quadro congelado), e a leitura
 seguinte é igual; a tela vai para `<build>/barra-de-tarefas.png`.
+
+Num teste que espera o `SHELL_RESTARTED` (o explorer.exe recriado pelo
+winlogon.exe criou a barra de tarefas), a vigia segue depois da área de
+trabalho (e da barra, se o teste a espera) e confirma a área de trabalho de
+novo (`qemu::restart_step`), com a mesma conferência da primeira, só em
+leituras feitas depois do marcador: a leitura em que ele aparece pode ser de
+antes dele e não conta. A barra do explorer que saiu já foi destruída quando
+o novo cria a dele, então ela não passa por esta conferência. Duas leituras
+seguidas iguais põem no log a linha `[xtask] area de trabalho de volta` e o
+`DESKTOP_OK` de novo, e vão para `<build>/area-de-trabalho-reiniciada.png`.
+O teste que falha depois da primeira área de trabalho escreve no log o que
+faltou (o marcador ou a tela).
 
 O `test-boot --capture-every=SEGUNDOS` grava a tela durante o teste em
 `<build>/tela-NNNN.png` (`qemu::FrameSeries`): a NNNN é a dos NNNN×SEGUNDOS
