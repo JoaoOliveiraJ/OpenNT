@@ -309,6 +309,58 @@ pub fn is_recursive_mapping_address(va: u64) -> bool {
     pml4_index(va) == map::PAGE_TABLE_RECURSIVE_INDEX
 }
 
+/// A estrutura das tabelas de páginas (a criação de uma tabela que falta, a
+/// escrita de uma folha e a liberação de uma tabela que ficou vazia) muda sob
+/// esta trava. Com as threads de um processo em CPUs diferentes, uma CPU
+/// achava a PT de uma VA e escrevia a folha nela enquanto outra, que acabara
+/// de desfazer a última folha dessa PT, a dava por vazia e a devolvia ao PFN:
+/// a página nova ficava sem mapeamento (ou escrita num frame já de outro), e
+/// duas CPUs que criavam a mesma tabela que faltava perdiam uma delas. Os
+/// frames das tabelas novas vêm da reserva da CPU, enchida antes da trava:
+/// alocar do PFN com ela tomada podia recuperar memória e voltar a desfazer
+/// folhas aqui.
+static TABLES: SpinLock<()> = SpinLock::new(());
+
+/// Frames zerados para tabelas novas, por CPU (no máximo três por operação:
+/// PDPT, PD e PT).
+static TABLE_RESERVE: [SpinLock<Vec<u64>>; crate::ntos::mm::memory_map::MAX_CPUS] = [const { SpinLock::new(Vec::new()) }; crate::ntos::mm::memory_map::MAX_CPUS];
+
+/// Frames de tabela que uma operação pode pedir.
+const TABLE_RESERVE_FRAMES: usize = 3;
+
+fn reserve_slot() -> &'static SpinLock<Vec<u64>> {
+    &TABLE_RESERVE[crate::ntos::ke::context_switch::processor().min(crate::ntos::mm::memory_map::MAX_CPUS - 1)]
+}
+
+/// Uma tabela nova da reserva desta CPU (0 sem frame). Uma thread que
+/// esperou dentro da alocação da reserva pode seguir noutra CPU: a reserva
+/// que ela encheu é a de outra, e vale também.
+fn take_table_frame() -> u64 {
+    if let Some(frame) = reserve_slot().lock().pop() {
+        return frame;
+    }
+    TABLE_RESERVE.iter().find_map(|slot| slot.lock().pop()).unwrap_or(0)
+}
+
+/// Roda `body` com a estrutura das tabelas travada, com a reserva de frames
+/// desta CPU cheia antes.
+fn with_tables<R>(body: impl FnOnce() -> R) -> R {
+    loop {
+        let missing = TABLE_RESERVE_FRAMES.saturating_sub(reserve_slot().lock().len());
+        if missing == 0 {
+            break;
+        }
+        let frame = pfn::alloc_page();
+        if frame == 0 {
+            break;
+        }
+        zero_frame(frame);
+        reserve_slot().lock().push(frame);
+    }
+    let _guard = TABLES.lock();
+    body()
+}
+
 fn zero_frame(frame: u64) {
     // Tabelas novas não têm pai publicado nem referências de PFN; mantém as
     // notificações se o rastreador já conhece esta tabela.
@@ -343,7 +395,7 @@ fn pd_entry_address(root: u64, va: u64, create: bool, user: bool) -> u64 {
             return 0;
         }
         assert!(!frozen, "kernel PML4 entry missing after the kernel half was frozen");
-        let pdpt_frame = pfn::alloc_page();
+        let pdpt_frame = take_table_frame();
         if pdpt_frame == 0 {
             return 0;
         }
@@ -360,7 +412,7 @@ fn pd_entry_address(root: u64, va: u64, create: bool, user: bool) -> u64 {
         if !create {
             return 0;
         }
-        let pd_frame = pfn::alloc_page();
+        let pd_frame = take_table_frame();
         if pd_frame == 0 {
             return 0;
         }
@@ -559,6 +611,10 @@ pub fn split_large_page(va: u64, user: bool) -> bool {
 
 /// [`split_large_page`] nas tabelas da raiz `root`.
 pub fn split_large_page_in(root: u64, va: u64, user: bool) -> bool {
+    with_tables(|| split_large_page_locked(root, va, user))
+}
+
+fn split_large_page_locked(root: u64, va: u64, user: bool) -> bool {
     if is_recursive_mapping_address(va) {
         return false;
     }
@@ -580,7 +636,7 @@ pub fn split_large_page_in(root: u64, va: u64, user: bool) -> bool {
     let nx = physical::read32(pd_entry_address + 4) & 0x8000_0000 != 0;
     // PS vira o bit PAT da PTE; o PAT de página grande vai do bit 12 ao 7.
     let leaf_flags = (pd_entry & 0xF7F) | if pd_entry & 0x1000 != 0 { 0x80 } else { 0 };
-    let pt_frame = pfn::alloc_page();
+    let pt_frame = take_table_frame();
     if pt_frame == 0 {
         return false;
     }
@@ -602,7 +658,7 @@ fn ensure_page_table(root: u64, va: u64, user: bool) -> u64 {
     }
     let pd_entry = read_entry(pd_entry_address);
     if pd_entry & PAGE_PRESENT == 0 {
-        let pt_frame = pfn::alloc_page();
+        let pt_frame = take_table_frame();
         if pt_frame == 0 {
             return 0;
         }
@@ -612,7 +668,7 @@ fn ensure_page_table(root: u64, va: u64, user: bool) -> u64 {
         return pt_frame;
     }
     if pd_entry & PAGE_PS != 0 {
-        if !split_large_page_in(root, va, user) {
+        if !split_large_page_locked(root, va, user) {
             return 0;
         }
         return table_of(read_entry(pd_entry_address));
@@ -694,6 +750,10 @@ fn reclaim_empty_tables(root: u64, va: u64, deferred: Option<&mut Vec<u64>>) {
 /// mudar nada: quem a mapeou ainda não a desfez. Devolve quantas tabelas
 /// liberou.
 pub fn release_user_half_in(root: u64, discarded: &[u64]) -> Result<u64, KernelError> {
+    with_tables(|| release_user_half_locked(root, discarded))
+}
+
+fn release_user_half_locked(root: u64, discarded: &[u64]) -> Result<u64, KernelError> {
     if root == PML4 || root == current_root() {
         return Err(KernelError::new("page-table root still in use"));
     }
@@ -780,6 +840,10 @@ pub fn map_page(va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
 /// outra raiz ele só é redundante. Trocar a proteção de uma página é mapear
 /// o mesmo frame de novo com as flags novas.
 pub fn map_page_in(root: u64, va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
+    with_tables(|| map_page_locked(root, va, pa, flags, options))
+}
+
+fn map_page_locked(root: u64, va: u64, pa: u64, flags: u64, options: MapOptions<'_>) -> bool {
     if is_recursive_mapping_address(va) || pa >= 0x10_0000_0000_0000 || pa % 4096 != 0 {
         return false;
     }
@@ -817,6 +881,10 @@ pub fn unmap_page(va: u64, options: MapOptions<'_>) -> bool {
 
 /// [`unmap_page`] nas tabelas da raiz `root`.
 pub fn unmap_page_in(root: u64, va: u64, options: MapOptions<'_>) -> bool {
+    with_tables(|| unmap_page_locked(root, va, options))
+}
+
+fn unmap_page_locked(root: u64, va: u64, options: MapOptions<'_>) -> bool {
     if is_recursive_mapping_address(va) {
         return false;
     }
@@ -868,6 +936,10 @@ pub fn read_leaf_in(root: u64, va: u64) -> Option<u64> {
 /// formatos de software do Mm (transição e arquivo de paginação). Invalida
 /// a VA quando a raiz é a carregada; `false` sem tabela.
 pub fn write_leaf_in(root: u64, va: u64, value: u64) -> bool {
+    with_tables(|| write_leaf_locked(root, va, value))
+}
+
+fn write_leaf_locked(root: u64, va: u64, value: u64) -> bool {
     if is_recursive_mapping_address(va) {
         return false;
     }
@@ -955,6 +1027,10 @@ pub fn map_large_page(va: u64, pa: u64, flags: u64, nx: bool) -> bool {
 
 /// [`map_large_page`] nas tabelas da raiz `root`.
 pub fn map_large_page_in(root: u64, va: u64, pa: u64, flags: u64, nx: bool) -> bool {
+    with_tables(|| map_large_page_locked(root, va, pa, flags, nx))
+}
+
+fn map_large_page_locked(root: u64, va: u64, pa: u64, flags: u64, nx: bool) -> bool {
     if is_recursive_mapping_address(va) || offset_at(va, 0x20_0000) != 0 || pa >= 0x10_0000_0000_0000 || pa % 0x20_0000 != 0 {
         return false;
     }
@@ -989,6 +1065,10 @@ pub fn unmap_large_page(va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool
 
 /// [`unmap_large_page`] nas tabelas da raiz `root`.
 pub fn unmap_large_page_in(root: u64, va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool {
+    with_tables(|| unmap_large_page_locked(root, va, deferred_tables))
+}
+
+fn unmap_large_page_locked(root: u64, va: u64, deferred_tables: Option<&mut Vec<u64>>) -> bool {
     if is_recursive_mapping_address(va) || offset_at(va, 0x20_0000) != 0 {
         return false;
     }
