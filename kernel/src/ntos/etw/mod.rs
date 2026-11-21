@@ -11,6 +11,7 @@ pub mod rundown;
 pub mod user_registration;
 pub mod wmi;
 pub mod coverage;
+pub mod process_telemetry;
 pub mod stack_walk;
 pub mod syscalls;
 pub mod exports;

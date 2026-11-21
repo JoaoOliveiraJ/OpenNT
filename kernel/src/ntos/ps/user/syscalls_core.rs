@@ -808,11 +808,14 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         });
     }
     // ProcessQuotaLimits, ProcessVmCounters, ProcessTimes,
-    // ProcessPriorityClass, ProcessImageFileNameWin32 e
-    // ProcessMitigationPolicy (`ps/query_process`): o ProbeForWrite de
-    // alinhamento 4 só pela faixa e o ReturnLength sondado antes da classe.
+    // ProcessPriorityClass, ProcessImageFileNameWin32,
+    // ProcessMitigationPolicy (`ps/query_process`) e
+    // ProcessTelemetryIdInformation (`etw/process_telemetry`): o
+    // ProbeForWrite de alinhamento 4 só pela faixa e o ReturnLength sondado
+    // antes da classe.
+    use crate::ntos::etw::process_telemetry;
     use crate::ntos::ps::query_process;
-    if matches!(class, query_process::PROCESS_QUOTA_LIMITS | query_process::PROCESS_VM_COUNTERS | query_process::PROCESS_TIMES | query_process::PROCESS_PRIORITY_CLASS | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY) {
+    if matches!(class, query_process::PROCESS_QUOTA_LIMITS | query_process::PROCESS_VM_COUNTERS | query_process::PROCESS_TIMES | query_process::PROCESS_PRIORITY_CLASS | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY | process_telemetry::PROCESS_TELEMETRY_ID_INFORMATION) {
         if length != 0 {
             if buffer & 3 != 0 {
                 return Ok(0x8000_0002);
@@ -838,6 +841,12 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             query_process::PROCESS_TIMES => query_process::query_times(buffer, length as u32, returned, process_of),
             query_process::PROCESS_PRIORITY_CLASS => query_process::query_priority_class(buffer, length as u32, returned, process_of),
             query_process::PROCESS_IMAGE_FILE_NAME_WIN32 => query_process::query_image_file_name_win32(buffer, length as u32, returned, process_of),
+            // O handle com PROCESS_QUERY_LIMITED_INFORMATION e o
+            // EtwQueryProcessTelemetryInfo em UserMode.
+            process_telemetry::PROCESS_TELEMETRY_ID_INFORMATION => match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
+                Ok(process) => process_telemetry::query(process, buffer, length as u32, 1, returned),
+                Err(status) => Ok(status),
+            },
             _ => query_process::query_mitigation_policy(buffer, length as u32, process_of),
         });
     }

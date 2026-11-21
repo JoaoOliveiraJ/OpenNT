@@ -562,6 +562,15 @@ pub fn stall_execution_processor_for_driver(microseconds: u32) {
     }
 }
 
+/// KeQueryInterruptTime (a macro do wdm.h, sem export no x64): o
+/// KUSER_SHARED_DATA.InterruptTime do último tick.
+pub fn interrupt_time() -> u64 {
+    match shared() {
+        Some(data) => read_shared_time(&data.interrupt_time),
+        None => uptime_100ns(),
+    }
+}
+
 /// KeQueryUnbiasedInterruptTime (rva 0x35ade0): InterruptTime do último
 /// tick menos InterruptTimeBias (o tempo dormido; zero sem suspensão).
 pub fn unbiased_interrupt_time() -> u64 {

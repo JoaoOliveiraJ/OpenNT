@@ -419,6 +419,12 @@ pub fn create_process(process_id: u64, image_name: &str, image_base: u64, execut
     object.pcb.directory_table_base.set(process_address_space::root_of(process).unwrap_or(memory_map::PML4_PHYS));
     object.unique_process_id.set(process_id);
     write_time(&object.create_time, create_time);
+    // Como no PspAllocateProcess 19041: o InterruptTime da KUSER_SHARED_DATA,
+    // o KeQueryUnbiasedInterruptTime e o LastAppStateUpdateTime igual ao
+    // CreateInterruptTime.
+    object.create_interrupt_time.set(clock::interrupt_time());
+    object.create_unbiased_interrupt_time.set(clock::unbiased_interrupt_time());
+    object.last_app_state_update_time.set(object.create_interrupt_time.get());
     object.active_threads.set(1);
     let short_name = image_name.as_bytes();
     for (index, character) in object.image_file_name.iter().enumerate() {

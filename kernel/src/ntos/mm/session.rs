@@ -143,6 +143,18 @@ pub fn session_id_ex(process: u64) -> u32 {
     space(pointer).session_id.get()
 }
 
+/// MmGetSessionCreateTime (19041 0x6119dc): o CreateTime do MM_SESSION_SPACE
+/// do processo; 0 sem sessão ou para um processo de sistema
+/// (Flags3.SystemProcess).
+pub fn session_create_time(process: u64) -> u64 {
+    let object = eprocess(process);
+    let pointer = object.session.get();
+    if pointer == 0 || object.system_process() != 0 {
+        return 0;
+    }
+    space(pointer).create_time.get()
+}
+
 /// MmGetSessionId: o mesmo, com o -1 virando 0.
 pub fn session_id(process: u64) -> u32 {
     match session_id_ex(process) {

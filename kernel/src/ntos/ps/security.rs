@@ -137,17 +137,24 @@ pub fn process_attributes(token_pointer: u64, system_application: u64, package_i
     if system_application == 0 && package_identity == 0 {
         return Ok(0);
     }
-    let token = owned_token(token_pointer, "PsQueryProcessAttributesByToken")?;
-    let present = |name: &str| -> Result<u8, KernelError> { attribute_present(&token, name).map(|present| present as u8) };
+    let (system, packaged) = token_attributes(token_pointer)?;
     if system_application != 0 {
         // SAFETY: PBOOLEAN de saída do chamador de kernel.
-        unsafe { Field::<u8>::at(system_application) }.set(present("WIN://SYSAPPID")?);
+        unsafe { Field::<u8>::at(system_application) }.set(system as u8);
     }
     if package_identity != 0 {
         // SAFETY: PBOOLEAN de saída do chamador de kernel.
-        unsafe { Field::<u8>::at(package_identity) }.set(present("WIN://PKG")?);
+        unsafe { Field::<u8>::at(package_identity) }.set(packaged as u8);
     }
     Ok(0)
+}
+
+/// As duas respostas do PsQueryProcessAttributesByToken (19041 0x601050):
+/// (o PspSysAppIdClaim, WIN://SYSAPPID, presente; o PspPackagedAppClaim,
+/// WIN://PKG, presente).
+pub fn token_attributes(token_pointer: u64) -> Result<(bool, bool), KernelError> {
+    let token = owned_token(token_pointer, "PsQueryProcessAttributesByToken")?;
+    Ok((attribute_present(&token, "WIN://SYSAPPID")?, attribute_present(&token, "WIN://PKG")?))
 }
 
 /// O SeSecurityAttributePresent do PsQueryProcessAttributesByToken: o

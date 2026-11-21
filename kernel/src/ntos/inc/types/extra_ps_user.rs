@@ -620,3 +620,53 @@ const _: () = {
     assert!(core::mem::offset_of!(PrefetcherInformation, prefetcher_information) == 0x10);
     assert!(core::mem::offset_of!(PrefetcherInformation, prefetcher_information_length) == 0x18);
 };
+
+/// `_PROCESS_TELEMETRY_ID_INFORMATION` (NtQueryInformationProcess
+/// (ProcessTelemetryIdInformation, classe 64); cabeçalho de 0x60 bytes, o
+/// que o EtwQueryProcessTelemetryInfo do ntoskrnl 19041 grava em HeaderSize):
+/// a identidade do processo seguida, depois do cabeçalho, do SID do usuário,
+/// do caminho da imagem, do nome do pacote, do nome relativo do aplicativo e
+/// da linha de comando, nos offsets gravados nos campos `*_offset`.
+#[repr(C)]
+pub struct ProcessTelemetryIdInformation {
+    pub header_size: Field<u32>,
+    pub process_id: Field<u32>,
+    pub process_start_key: Field<u64>,
+    pub create_time: Field<u64>,
+    pub create_interrupt_time: Field<u64>,
+    pub create_unbiased_interrupt_time: Field<u64>,
+    pub process_sequence_number: Field<u64>,
+    pub session_create_time: Field<u64>,
+    pub session_id: Field<u32>,
+    pub boot_id: Field<u32>,
+    pub image_checksum: Field<u32>,
+    pub image_time_date_stamp: Field<u32>,
+    pub user_sid_offset: Field<u32>,
+    pub image_path_offset: Field<u32>,
+    pub package_name_offset: Field<u32>,
+    pub relative_app_name_offset: Field<u32>,
+    pub command_line_offset: Field<u32>,
+    pub _padding: Field<u32>,
+}
+
+unsafe impl NtStruct for ProcessTelemetryIdInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ProcessTelemetryIdInformation>() == 0x60);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, process_id) == 0x4);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, process_start_key) == 0x8);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, create_time) == 0x10);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, create_interrupt_time) == 0x18);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, create_unbiased_interrupt_time) == 0x20);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, process_sequence_number) == 0x28);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, session_create_time) == 0x30);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, session_id) == 0x38);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, boot_id) == 0x3c);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, image_checksum) == 0x40);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, image_time_date_stamp) == 0x44);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, user_sid_offset) == 0x48);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, image_path_offset) == 0x4c);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, package_name_offset) == 0x50);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, relative_app_name_offset) == 0x54);
+    assert!(core::mem::offset_of!(ProcessTelemetryIdInformation, command_line_offset) == 0x58);
+};
