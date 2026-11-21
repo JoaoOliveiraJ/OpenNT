@@ -1,6 +1,6 @@
 //! Spin lock de cancelamento compartilhado e IoCancelIrp.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::Field;
@@ -8,16 +8,25 @@ use crate::ntos::inc::types::{IoStackLocation, Irp, NtStruct};
 use crate::ntos::ke::irql;
 use crate::rtl::KernelError;
 
-static HELD: AtomicBool = AtomicBool::new(false);
+/// A CPU dona do lock (`FREE` sem dono).
+static OWNER: AtomicUsize = AtomicUsize::new(FREE);
+const FREE: usize = usize::MAX;
 
-/// IoAcquireCancelSpinLock: eleva a DISPATCH_LEVEL e devolve o IRQL anterior.
-/// A posse é tomada numa troca atômica; com o lock já tomado (o código de
-/// driver roda no BSP, então é reentrância) a aquisição falha.
+/// IoAcquireCancelSpinLock (o KeAcquireQueuedSpinLock do LockQueueIoCancelLock):
+/// eleva a DISPATCH_LEVEL, devolve o IRQL anterior e gira enquanto outra CPU
+/// tem o lock. Com o despacho de usuário nos APs, o código de driver roda
+/// também neles, e duas CPUs disputam o lock; só a aquisição na CPU que já o
+/// tem é reentrância, e falha.
 pub fn acquire() -> Result<u8, KernelError> {
-    if HELD.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    let cpu = crate::ntos::ke::context_switch::processor();
+    if OWNER.load(Ordering::Acquire) == cpu {
         return Err(KernelError::new("Recursive acquisition of the cancel spin lock"));
     }
-    Ok(irql::raise_irql(irql::DISPATCH_LEVEL))
+    let previous = irql::raise_irql(irql::DISPATCH_LEVEL);
+    while OWNER.compare_exchange_weak(FREE, cpu, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    Ok(previous)
 }
 
 /// IoAcquireCancelSpinLock(Irql): o IRQL anterior vai para *Irql.
@@ -30,15 +39,17 @@ pub fn acquire_into(irql_output: u64) -> Result<(), KernelError> {
 
 /// IoReleaseCancelSpinLock.
 pub fn release(previous: u8) -> Result<(), KernelError> {
-    if HELD.compare_exchange(true, false, Ordering::Release, Ordering::Relaxed).is_err() {
+    let cpu = crate::ntos::ke::context_switch::processor();
+    if OWNER.compare_exchange(cpu, FREE, Ordering::Release, Ordering::Relaxed).is_err() {
         return Err(KernelError::new("Cancel spin lock is not held"));
     }
     irql::lower_irql(previous as u64);
     Ok(())
 }
 
+/// Esta CPU tem o lock (a rotina de cancelamento é chamada com ele).
 pub fn is_held() -> bool {
-    HELD.load(Ordering::Acquire)
+    OWNER.load(Ordering::Acquire) == crate::ntos::ke::context_switch::processor()
 }
 
 /// IoCancelIrp: marca Cancel e toma a rotina com InterlockedExchangePointer
