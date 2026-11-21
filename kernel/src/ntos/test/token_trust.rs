@@ -14,7 +14,10 @@
 //!   SID colado (24 bytes) ou só o ponteiro nulo (8), e o
 //!   TokenAccessInformation aponta o TrustLevelSid; o NtCompareTokens
 //!   distingue a presença do SID;
-//! - o token do System tem o SeProcTrustWinTcbSid.
+//! - o token do System tem o SeProcTrustWinTcbSid;
+//! - o RtlpSetSecurityObject e o RtlpNewSecurityObject com rótulos de
+//!   confiança (o sujeito precisa dominar cada rótulo novo; a máscara com
+//!   direitos genéricos é STATUS_INVALID_LABEL).
 
 use crate::ntos::inc::types::TokenAccessInformation;
 use crate::ntos::ps::process;
@@ -89,4 +92,53 @@ pub fn run(assert: Assert) {
 
     let system_trust = process::get_primary_token(process::get_system_process()).and_then(trust::token_trust_sid);
     assert(system_trust.as_ref() == Some(&wintcb), "trust: o token do System tem o SeProcTrustWinTcbSid");
+
+    labels(assert, &lite_windows, &lite_wintcb, &none);
+}
+
+/// Uma SACL com uma SYSTEM_PROCESS_TRUST_LABEL_ACE (OI|CI) de `mask` para
+/// `label`.
+fn trust_sacl(label: &[u8], mask: u32) -> alloc::vec::Vec<u8> {
+    let ace_size = 8 + label.len();
+    let mut acl = alloc::vec![2u8, 0];
+    acl.extend_from_slice(&((8 + ace_size) as u16).to_le_bytes());
+    acl.extend_from_slice(&[1, 0, 0, 0]);
+    acl.extend_from_slice(&[trust::TRUST_LABEL_ACE_TYPE, 3]);
+    acl.extend_from_slice(&(ace_size as u16).to_le_bytes());
+    acl.extend_from_slice(&mask.to_le_bytes());
+    acl.extend_from_slice(label);
+    acl
+}
+
+/// O RtlpSetSecurityObject e o RtlpNewSecurityObject com rótulos de
+/// confiança: o sujeito sem SID não troca rótulo nenhum, um rótulo acima do
+/// sujeito é negado, a máscara com direitos genéricos é STATUS_INVALID_LABEL
+/// e o criador sem rótulo explícito não é conferido. O merge do
+/// SeSetSecurityDescriptorInfo pelo System (WinTcb) grava o rótulo do
+/// AppXSvc e recusa a máscara genérica.
+fn labels(assert: Assert, lite_windows: &[u8], lite_wintcb: &[u8], none: &[u8]) {
+    use crate::ntos::se::policy_descriptor::OwnedDescriptor;
+    use crate::ntos::se::set_security;
+    let appx = trust_sacl(none, 0x00FF_FFFF);
+    let windows = trust_sacl(lite_windows, 0x0002_0019);
+    let wintcb = trust_sacl(lite_wintcb, 0x0002_0019);
+    let new_labels = trust::check_new_trust_labels(Some(&appx), None) == Err(0xC000_0022)
+        && trust::check_new_trust_labels(Some(&appx), Some(lite_windows)).is_ok()
+        && trust::check_new_trust_labels(Some(&windows), Some(lite_windows)).is_ok()
+        && trust::check_new_trust_labels(Some(&wintcb), Some(lite_windows)) == Err(0xC000_0022)
+        && trust::check_new_trust_labels(Some(&trust_sacl(none, 0x1000_0000)), Some(lite_wintcb)) == Err(0xC000_0446)
+        && trust::check_new_trust_labels(None, None) == Err(0xC000_0022)
+        && trust::check_new_trust_labels(None, Some(lite_windows)).is_ok();
+    let creator = trust::check_creator_trust_label(Some(&windows), None) == Err(0xC000_0022)
+        && trust::check_creator_trust_label(Some(&windows), Some(lite_wintcb)).is_ok()
+        && trust::check_creator_trust_label(Some(&wintcb), Some(lite_windows)) == Err(0xC000_0022)
+        && trust::check_creator_trust_label(None, None).is_ok();
+    assert(new_labels && creator, "trust: RtlpSetSecurityObject e RtlpNewSecurityObject conferem os rotulos de confianca pelo sujeito");
+
+    let system = alloc::vec![1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let current = OwnedDescriptor { control: 0x8000, owner: Some(system.clone()), group: Some(system.clone()), dacl: None, sacl: None };
+    let modified = |sacl: alloc::vec::Vec<u8>| OwnedDescriptor { control: 0x8010, owner: None, group: None, dacl: None, sacl: Some(sacl) };
+    let merged = set_security::merge(&current, 0x80, &modified(appx.clone()), 0, None).is_ok_and(|merged| merged.sacl.as_deref().is_some_and(|sacl| sacl.len() == appx.len() && sacl[8] == trust::TRUST_LABEL_ACE_TYPE));
+    let refused = matches!(set_security::merge(&current, 0x80, &modified(trust_sacl(none, 0x1000_0000)), 0, None), Err(0xC000_0446));
+    assert(merged && refused, "trust: SeSetSecurityDescriptorInfo com PROCESS_TRUST_LABEL pelo System grava o rotulo e recusa a mascara generica");
 }

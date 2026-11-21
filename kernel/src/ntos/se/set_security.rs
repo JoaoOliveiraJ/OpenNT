@@ -36,7 +36,7 @@ use crate::ntos::inc::types::{GenericMapping, NtStruct, SecurityDescriptorRelati
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_access;
 use crate::ntos::se::policy_descriptor::OwnedDescriptor;
-use crate::ntos::se::token::tokens;
+use crate::ntos::se::token::{tokens, trust};
 use crate::ntos::se::{descriptor, out, query_descriptor};
 
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
@@ -52,6 +52,7 @@ const GROUP_SECURITY_INFORMATION: u32 = 0x02;
 const DACL_SECURITY_INFORMATION: u32 = 0x04;
 const SACL_SECURITY_INFORMATION: u32 = 0x08;
 const SYSTEM_ACL_SELECTORS: u32 = 0x1F8;
+const PROCESS_TRUST_LABEL_SECURITY_INFORMATION: u32 = 0x80;
 
 // AutoInheritFlags.
 const SEF_DACL_AUTO_INHERIT: u32 = 0x01;
@@ -254,6 +255,13 @@ pub fn merge(current: &OwnedDescriptor, information: u32, modified: &OwnedDescri
     };
     let group_source = if information & GROUP_SECURITY_INFORMATION != 0 { &modified.group } else { &current.group };
     let Some(group) = group_source.as_deref().filter(|group| valid_sid(group)).map(<[u8]>::to_vec) else { return Err(STATUS_INVALID_PRIMARY_GROUP) };
+    // PROCESS_TRUST_LABEL_SECURITY_INFORMATION: o sujeito precisa de um SID
+    // de confiança que domine cada rótulo da SACL nova (o
+    // SepLocateTokenTrustLevel e o RtlpValidTrustSubjectContext).
+    if information & PROCESS_TRUST_LABEL_SECURITY_INFORMATION != 0 {
+        let source = if modified.control & SE_SACL_PRESENT != 0 { modified.sacl.as_deref() } else { None };
+        trust::check_new_trust_labels(source, trust::current_subject_trust_sid().as_deref())?;
+    }
 
     let mut control = SE_SELF_RELATIVE;
     let mut dacl = if information & DACL_SECURITY_INFORMATION != 0 {

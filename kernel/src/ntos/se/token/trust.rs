@@ -96,6 +96,73 @@ pub fn valid_trust_subject(token: Option<&[u8]>, label: &[u8]) -> Result<(), u32
     }
 }
 
+/// SepLocateTokenTrustLevel(SubjectContext): sem token de cliente, o SID do
+/// primário; com ele, o do cliente quando o primário o domina, senão o do
+/// primário.
+pub fn subject_trust_sid(primary: u64, client: Option<u64>) -> Option<Sid> {
+    let primary_sid = token_trust_sid(primary);
+    let Some(client) = client else { return primary_sid };
+    let client_sid = token_trust_sid(client);
+    if dominates(primary_sid.as_deref(), client_sid.as_deref()) == Ok(true) {
+        client_sid
+    } else {
+        primary_sid
+    }
+}
+
+/// O SID de confiança do sujeito corrente (o SeCaptureSubjectContext da
+/// thread: o token de impersonação dela, se houver, e o primário do
+/// processo), pelo [`subject_trust_sid`].
+pub fn current_subject_trust_sid() -> Option<Sid> {
+    let primary = crate::ntos::ps::process::get_primary_token(crate::ntos::ps::process::get_current_process())?;
+    let client = super::thread::get(crate::ntos::ps::process::get_current_thread()).map(|state| state.token);
+    subject_trust_sid(primary, client)
+}
+
+/// SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE.
+pub const TRUST_LABEL_ACE_TYPE: u8 = 0x14;
+/// STATUS_INVALID_LABEL.
+const STATUS_INVALID_LABEL: u32 = 0xC000_0446;
+
+/// As ACEs de uma ACL em bytes (cabeçalho de 8 bytes e AceSize de cada).
+fn aces(acl: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let count = acl.get(4..6).map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize);
+    let mut offset = 8usize;
+    (0..count).map_while(move |_| {
+        let size = acl.get(offset + 2..offset + 4).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)?;
+        let ace = acl.get(offset..offset + size).filter(|_| size >= 8)?;
+        offset += size;
+        Some(ace)
+    })
+}
+
+/// O RtlpSetSecurityObject com PROCESS_TRUST_LABEL_SECURITY_INFORMATION:
+/// sem SID de confiança no sujeito, STATUS_ACCESS_DENIED; cada
+/// SYSTEM_PROCESS_TRUST_LABEL_ACE da SACL nova precisa de uma máscara sem
+/// direitos genéricos (STATUS_INVALID_LABEL) e de um SID que o sujeito
+/// domine (RtlpValidTrustSubjectContext).
+pub fn check_new_trust_labels(sacl: Option<&[u8]>, subject: Option<&[u8]>) -> Result<(), u32> {
+    let Some(subject) = subject else { return Err(STATUS_ACCESS_DENIED) };
+    for ace in sacl.into_iter().flat_map(aces).filter(|ace| ace[0] == TRUST_LABEL_ACE_TYPE) {
+        let mask = u32::from_le_bytes([ace[4], ace[5], ace[6], ace[7]]);
+        if mask & 0xFF00_0000 != 0 {
+            return Err(STATUS_INVALID_LABEL);
+        }
+        valid_trust_subject(Some(subject), &ace[8..])?;
+    }
+    Ok(())
+}
+
+/// O RtlpNewSecurityObject com um rótulo de confiança explícito na SACL do
+/// criador: o sujeito precisa de um SID de confiança que o domine
+/// (RtlpValidTrustSubjectContext), senão STATUS_ACCESS_DENIED.
+pub fn check_creator_trust_label(sacl: Option<&[u8]>, subject: Option<&[u8]>) -> Result<(), u32> {
+    match sacl.into_iter().flat_map(aces).find(|ace| ace[0] == TRUST_LABEL_ACE_TYPE) {
+        Some(ace) => valid_trust_subject(subject, &ace[8..]),
+        None => Ok(()),
+    }
+}
+
 /// O SID de confiança do token `token` (nenhum num token sem nível).
 pub fn token_trust_sid(token: u64) -> Option<Sid> {
     tokens::with(token, |record| record.trust_level_sid.clone()).flatten()

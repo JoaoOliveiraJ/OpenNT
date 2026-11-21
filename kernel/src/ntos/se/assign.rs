@@ -15,7 +15,7 @@ use crate::ntos::ps::process;
 use crate::ntos::se::inherit_descriptor::{self, Captured};
 use crate::ntos::se::model::sid;
 use crate::ntos::se::query_descriptor;
-use crate::ntos::se::token::tokens;
+use crate::ntos::se::token::{tokens, trust};
 
 // SECURITY_INFORMATION bits.
 const OWNER_INFORMATION: u32 = 0x0000_0001;
@@ -23,6 +23,7 @@ const GROUP_INFORMATION: u32 = 0x0000_0002;
 const DACL_INFORMATION: u32 = 0x0000_0004;
 /// SACL(8) | LABEL(0x10) | ATTRIBUTE(0x20) | SCOPE(0x40) | TRUST(0x80) | FILTER(0x100).
 const SACL_SELECTORS: u32 = 0x0000_01F8;
+const PROCESS_TRUST_LABEL_INFORMATION: u32 = 0x0000_0080;
 
 // SECURITY_DESCRIPTOR control bits.
 const SELF_RELATIVE: u16 = 0x8000;
@@ -162,6 +163,14 @@ pub fn assign_components(parent: Option<&Captured>, explicit: Option<&Captured>,
 /// [`assign_components`] com o token de quem cria já resolvido (o efetivo
 /// do contexto do sujeito: o de impersonação, quando há, senão o primário).
 pub fn assign_components_for_token(parent: Option<&Captured>, explicit: Option<&Captured>, mapping: &[u32; 4], container: bool, auto_flags: u32, token: u64) -> Result<Captured, u32> {
+    // RtlpNewSecurityObject: um rótulo de confiança explícito na SACL do
+    // criador pede um sujeito que o domine (o SepLocateTokenTrustLevel do
+    // primário do processo e do token efetivo, quando é outro).
+    if let Some(explicit) = explicit {
+        let primary = process::get_primary_token(process::get_current_process()).unwrap_or(token);
+        let subject = trust::subject_trust_sid(primary, (token != primary).then_some(token));
+        trust::check_creator_trust_label(explicit.sacl.as_deref(), subject.as_deref())?;
+    }
     let (owner_default, group_default) = token_owner_group(token);
     let mut creator = Captured {
         control: explicit.map_or(0, |captured| captured.control),
@@ -211,6 +220,14 @@ pub fn set_info(information_pointer: u64, modification: u64, object_sd_pointer: 
     let current = captured_from(object_sd.get());
     let modification = captured_from(modification);
     let mapping = read_mapping(map);
+    // O rótulo de confiança novo pede um sujeito que o domine (o
+    // RtlpSetSecurityObject com PROCESS_TRUST_LABEL_SECURITY_INFORMATION).
+    if information & PROCESS_TRUST_LABEL_INFORMATION != 0 {
+        let sacl = modification.as_ref().filter(|captured| captured.control & SACL_PRESENT != 0).and_then(|captured| captured.sacl.as_deref());
+        if let Err(status) = trust::check_new_trust_labels(sacl, trust::current_subject_trust_sid().as_deref()) {
+            return status;
+        }
+    }
     // Cada componente vem da Modification se o seu bit estiver em Information,
     // senão permanece o do objeto.
     let pick = |from_modification: bool| if from_modification { modification.as_ref() } else { current.as_ref() };
