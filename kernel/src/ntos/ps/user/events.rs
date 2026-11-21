@@ -225,7 +225,7 @@ fn nt_create_event(out: u64, access: u64, attributes: u64, event_type: u64, rsp:
     if pointer == 0 {
         return Ok(0xC000_0017);
     }
-    let signaled = state::stack_arg32(rsp, 5) & 255 != 0;
+    let signaled = state::stack_boolean(rsp, 5);
     match create(pointer, &name, event_type, signaled, attributes, true) {
         Ok(object) => publish(&object, out, access as u32, attributes, 0, true),
         Err(error) if error.status != 0 => Ok(error.status),

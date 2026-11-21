@@ -347,7 +347,7 @@ pub fn raise(record: u64, context: u64, first_chance: u64) -> Result<u32, Kernel
             return Ok(invalid);
         }
         let captured = guest::try_read_bytes(record, RECORD_SIZE as usize)?;
-        if first_chance & 0xFF == 0 {
+        if !super::state::boolean(first_chance) {
             let code = u32_at(&captured, offset_of!(ExceptionRecord, exception_code));
             let rsp = state::user_struct::<Context>(context)?.rsp.probe_get()?;
             if let Some(thread) = threads::current() {

@@ -111,7 +111,7 @@ fn nt_create_mutant(out: u64, access: u64, attributes: u64, initial_owner: u64, 
     if pointer == 0 {
         return Ok(0xC000_0017);
     }
-    dispatcher::initialize_mutant(pointer, initial_owner & 255 != 0);
+    dispatcher::initialize_mutant(pointer, state::boolean(initial_owner));
     let object = Arc::new(MutantObject { pointer, name: name.clone(), node: SpinLock::new(None) });
     if let Err(error) = dispatcher_objects::create(pointer, "mutant", dispose, Some(busy), attributes, true, DispatcherHooks::default()) {
         guest::free_bytes(pointer);

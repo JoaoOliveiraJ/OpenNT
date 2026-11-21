@@ -1276,11 +1276,11 @@ fn nt_query_ea_file(handle: u64, iosb: u64, buffer: u64, length: u64, rsp: u64) 
         io_status: iosb,
         buffer,
         length: length as u32,
-        single: state::stack_arg(rsp, 5) as u8 != 0,
+        single: state::stack_boolean(rsp, 5),
         ea_list: state::stack_arg(rsp, 6),
         ea_list_length: state::stack_arg32(rsp, 7),
         ea_index: state::stack_arg(rsp, 8),
-        restart: state::stack_arg(rsp, 9) as u8 != 0,
+        restart: state::stack_boolean(rsp, 9),
         user: true,
     })
 }
@@ -1621,7 +1621,7 @@ fn notify_change_directory(handle: u64, event: u64, apc_routine: u64, apc_contex
         buffer: state::stack_arg(rsp, 6),
         length: state::stack_arg32(rsp, 7),
         completion_filter: state::stack_arg32(rsp, 8),
-        watch_tree: state::stack_arg(rsp, 9) & 0xFF != 0,
+        watch_tree: state::stack_boolean(rsp, 9),
         class,
     })
 }
@@ -1686,8 +1686,8 @@ fn nt_lock_file(handle: u64, event: u64, apc_routine: u64, apc_context: u64, rsp
         byte_offset: state::stack_arg(rsp, 6),
         length: state::stack_arg(rsp, 7),
         key: state::stack_arg32(rsp, 8),
-        fail_immediately: state::stack_arg(rsp, 9) & 0xFF != 0,
-        exclusive: state::stack_arg(rsp, 10) & 0xFF != 0,
+        fail_immediately: state::stack_boolean(rsp, 9),
+        exclusive: state::stack_boolean(rsp, 10),
     }))
 }
 

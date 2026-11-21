@@ -7632,6 +7632,7 @@ pub fn run(assert: Assert) {
     user_handle_operations(assert);
     user_events_and_semaphores(assert);
     super::keyed_events::run(assert);
+    super::boolean_arguments::run(assert);
     user_mutants_and_timers(assert);
     user_io_completion(assert);
     user_threads(assert);

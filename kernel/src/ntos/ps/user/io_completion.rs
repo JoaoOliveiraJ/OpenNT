@@ -251,7 +251,7 @@ fn nt_remove_io_completion_ex(handle: u64, out: u64, count: u64, removed: u64, r
     let raw = state::service_raw_arguments();
     let (handle, out, removed) = if raw != 0 { (guest::read64(raw + 8), guest::read64(raw + 16), guest::read64(raw + 32)) } else { (handle, out, removed) };
     let consumer = threads::current().map(|thread| thread.pointer());
-    let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, state::stack_arg(rsp, 5), state::stack_arg32(rsp, 6) as u8 != 0, 1, false, consumer)?;
+    let request = crate::ntos::io::completion::remove::begin(handle, out, count, removed, state::stack_arg(rsp, 5), state::stack_boolean(rsp, 6), 1, false, consumer)?;
     let request = Arc::new(crate::rtl::SpinLock::new(request));
     let (polled, cancelled) = (request.clone(), request);
     Ok(threads::wait_custom(Wait { poll: Some(Box::new(move || polled.lock().poll())), cleanup: Some(Box::new(move |_status| cancelled.lock().cancel())), reason: Some(crate::ntos::ke::wait::reason::WR_QUEUE), ..Wait::default() }, 0, Some(None)))

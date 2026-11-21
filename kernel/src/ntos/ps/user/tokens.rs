@@ -129,7 +129,7 @@ fn nt_duplicate_token(existing: u64, access: u64, attributes: u64, effective_onl
         crate::debug_print!("[se] NtDuplicateToken de um token sandboxed sem suporte");
         return Ok(0xC000_00BB);
     }
-    crate::ntos::se::token::duplicate::duplicate(token_argument(1, existing), access as u32, attributes, effective_only & 0xFF != 0, state::stack_arg32(rsp, 5), stack_arg(rsp, 6), 1)
+    crate::ntos::se::token::duplicate::duplicate(token_argument(1, existing), access as u32, attributes, state::boolean(effective_only), state::stack_arg32(rsp, 5), stack_arg(rsp, 6), 1)
 }
 
 /// NtFilterToken(ExistingTokenHandle, Flags, SidsToDisable,
@@ -190,14 +190,14 @@ fn nt_privilege_check(token_handle: u64, required: u64, result: u64, _a4: u64, _
 }
 
 fn nt_open_thread_token(thread: u64, access: u64, as_self: u64, out: u64, _rsp: u64) -> Result<u32, KernelError> {
-    token_handles::open_thread(thread, access as u32, as_self & 0xFF != 0, 0, out, true)
+    token_handles::open_thread(thread, access as u32, state::boolean(as_self), 0, out, true)
 }
 
 fn nt_open_thread_token_ex(thread: u64, access: u64, as_self: u64, attributes: u64, rsp: u64) -> Result<u32, KernelError> {
     if !state::probe_syscall_stack(rsp, 8) {
         return Ok(0xC000_0005);
     }
-    token_handles::open_thread(thread, access as u32, as_self & 0xFF != 0, attributes as u32, stack_arg(rsp, 5), true)
+    token_handles::open_thread(thread, access as u32, state::boolean(as_self), attributes as u32, stack_arg(rsp, 5), true)
 }
 
 /// O ReturnLength e o buffer de usuário, com o contrato do Zw
@@ -329,7 +329,7 @@ fn nt_adjust_privileges_token(handle: u64, disable_all: u64, new_state: u64, buf
         Ok(token) => token,
         Err(status) => return Ok(status),
     };
-    crate::ntos::se::token::adjust::adjust_privileges(token, disable_all as u8 != 0, new_state, buffer_length as u32, previous_state, return_length)
+    crate::ntos::se::token::adjust::adjust_privileges(token, state::boolean(disable_all), new_state, buffer_length as u32, previous_state, return_length)
 }
 
 /// NtAdjustGroupsToken(TokenHandle, ResetToDefault, NewState, BufferLength,
@@ -340,7 +340,7 @@ fn nt_adjust_groups_token(handle: u64, reset: u64, new_state: u64, buffer_length
         return Ok(0xC000_0005);
     }
     let (previous_state, return_length) = (stack_arg(rsp, 5), stack_arg(rsp, 6));
-    if reset as u8 == 0 && new_state == 0 {
+    if !state::boolean(reset) && new_state == 0 {
         return Ok(0xC000_000D);
     }
     let access = 0x40 | if previous_state != 0 { 8 } else { 0 };
@@ -539,7 +539,7 @@ fn nt_privileged_service_audit_alarm(_subsystem: u64, service: u64, client_token
 fn nt_privilege_object_audit_alarm(subsystem: u64, handle_id: u64, client_token: u64, desired: u64, rsp: u64) -> Result<u32, KernelError> {
     use crate::ntos::se::audit;
     let privileges = stack_arg(rsp, 5);
-    let granted = stack_arg(rsp, 6) as u8 != 0;
+    let granted = state::stack_boolean(rsp, 6);
     if !crate::ntos::se::privilege::audit_privilege_check(1) {
         return Ok(0xC000_0061);
     }
@@ -583,7 +583,7 @@ fn nt_privilege_object_audit_alarm(subsystem: u64, handle_id: u64, client_token:
 /// HandleId, GenerateOnClose): o SubsystemName sondado só com
 /// GenerateOnClose; o alarme é `se::audit`.
 fn object_audit_alarm(subsystem: u64, handle_id: u64, generate_on_close: u64, delete: bool) -> Result<u32, KernelError> {
-    let generate = generate_on_close as u8 != 0;
+    let generate = state::boolean(generate_on_close);
     let privileged = generate && crate::ntos::se::privilege::audit_privilege_check(1);
     let name = if generate && privileged {
         if subsystem == 0 || !probe_user_read(subsystem, UnicodeString::SIZE) {

@@ -493,6 +493,13 @@ pub fn stack_boolean(user_rsp: u64, index: u64) -> bool {
     guest::try_read::<u8>(user_rsp + 0x28 + (index - 5) * 8).unwrap_or(0) != 0
 }
 
+/// Um BOOLEAN num registrador de argumento (os quatro primeiros): só o byte
+/// baixo. O chamador o carrega com um `mov r8b, 1` ou um `setcc`, e o resto
+/// do registrador é o que havia nele; o serviço do NT só testa o byte.
+pub fn boolean(argument: u64) -> bool {
+    argument & 0xFF != 0
+}
+
 /// O despachante nativo sonda a pilha antes de copiá-la; os handlers
 /// validam aqui a extensão de argumentos de que precisam.
 pub fn probe_syscall_stack(rsp: u64, bytes: u64) -> bool {

@@ -3177,7 +3177,7 @@ fn nt_delay_execution(alertable: u64, interval: u64, _a3: u64, _a4: u64, _rsp: u
         Ok(interval) => interval,
         Err(status) => return Ok(status),
     };
-    let alertable = alertable & 0xFF != 0;
+    let alertable = state::boolean(alertable);
     if interval == 0 && !alertable {
         // A UserApcPending já publicada encerra a espera não alertável de
         // UserMode antes da troca (KiBeginThreadWait).

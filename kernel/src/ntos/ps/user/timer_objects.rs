@@ -102,7 +102,7 @@ fn nt_open_timer(out: u64, access: u64, attributes: u64, _a4: u64, _rsp: u64) ->
 /// NtSetTimer(TimerHandle, DueTime, TimerApcRoutine, TimerContext,
 /// ResumeTimer, Period, PreviousState): os três últimos na pilha.
 fn nt_set_timer(handle: u64, due: u64, apc_routine: u64, apc_context: u64, rsp: u64) -> Result<u32, KernelError> {
-    let resume = state::stack_arg(rsp, 5) as u8 != 0;
+    let resume = state::stack_boolean(rsp, 5);
     let period = state::stack_arg32(rsp, 6) as i32;
     let previous_state = state::stack_arg(rsp, 7);
     timer_object::set(handle, due, apc_routine, apc_context, resume, period, previous_state, USER_MODE)

@@ -546,11 +546,11 @@ fn nt_open_keyed_event(handle_out: u64, access: u64, attributes: u64, _a4: u64, 
 }
 
 fn nt_wait_for_keyed_event(handle: u64, key: u64, alertable: u64, timeout: u64, _rsp: u64) -> Result<u32, KernelError> {
-    wait(handle, key, alertable & 0xFF != 0, timeout, 1)
+    wait(handle, key, crate::ntos::ps::user::state::boolean(alertable), timeout, 1)
 }
 
 fn nt_release_keyed_event(handle: u64, key: u64, alertable: u64, timeout: u64, _rsp: u64) -> Result<u32, KernelError> {
-    release(handle, key, alertable & 0xFF != 0, timeout, 1)
+    release(handle, key, crate::ntos::ps::user::state::boolean(alertable), timeout, 1)
 }
 
 /// Os serviços de modo usuário.

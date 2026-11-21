@@ -314,7 +314,7 @@ fn nt_wait_for_single_object(handle: u64, alertable: u64, timeout: u64, _a4: u64
         Err(status) => return Ok(status),
     };
     Ok(match ob_wait::reference_objects(&[handle], USER_MODE, ob_wait::WAIT_ANY) {
-        Ok(set) => wait_captured(set, ob_wait::WAIT_ANY, timeout, alertable & 0xFF != 0),
+        Ok(set) => wait_captured(set, ob_wait::WAIT_ANY, timeout, state::boolean(alertable)),
         Err(status) => status,
     })
 }
@@ -342,7 +342,7 @@ fn nt_wait_for_multiple_objects(count: u64, handles: u64, wait_type: u64, alerta
     };
     let handles: Vec<u64> = captured.chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))).collect();
     Ok(match ob_wait::reference_objects(&handles, USER_MODE, wait_type) {
-        Ok(set) => wait_captured(set, wait_type, timeout, alertable & 0xFF != 0),
+        Ok(set) => wait_captured(set, wait_type, timeout, state::boolean(alertable)),
         Err(status) => status,
     })
 }
@@ -375,7 +375,7 @@ fn nt_signal_and_wait_for_single_object(signal: u64, wait: u64, alertable: u64, 
         set.release();
         return Ok(status);
     }
-    Ok(wait_captured(set, ob_wait::WAIT_ANY, timeout, alertable & 0xFF != 0))
+    Ok(wait_captured(set, ob_wait::WAIT_ANY, timeout, state::boolean(alertable)))
 }
 
 /// NtSerializeBoot(): `io/pnp::serialize_boot`, de modo usuário.
@@ -1257,8 +1257,8 @@ fn nt_query_license_value(name: u64, type_pointer: u64, data: u64, data_size: u6
 /// ReturnSingleEntry, RestartScan, Context*, ReturnLength*)
 /// (`ob/handles/namespace`).
 fn nt_query_directory_object(handle: u64, buffer: u64, length: u64, single: u64, rsp: u64) -> Result<u32, KernelError> {
-    let restart = state::stack_arg32(rsp, 5) & 0xFF != 0;
-    Ok(namespace_handles::query_directory_mode(handle, buffer, length as u32, single & 0xFF != 0, restart, stack_arg(rsp, 6), stack_arg(rsp, 7), true))
+    let restart = state::stack_boolean(rsp, 5);
+    Ok(namespace_handles::query_directory_mode(handle, buffer, length as u32, state::boolean(single), restart, stack_arg(rsp, 6), stack_arg(rsp, 7), true))
 }
 
 /// NtApphelpCacheControl(Service, ServiceData) (`ps/apphelp_cache`).

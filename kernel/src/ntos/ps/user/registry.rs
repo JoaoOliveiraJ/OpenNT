@@ -260,10 +260,10 @@ fn nt_notify_change_key(handle: u64, event: u64, apc_routine: u64, apc_context: 
         apc_context,
         io_status: state::stack_arg(rsp, 5),
         filter: state::stack_arg32(rsp, 6),
-        watch_tree: state::stack_arg32(rsp, 7) as u8 != 0,
+        watch_tree: state::stack_boolean(rsp, 7),
         buffer: state::stack_arg(rsp, 8),
         buffer_size: state::stack_arg32(rsp, 9),
-        asynchronous: state::stack_arg32(rsp, 10) as u8 != 0,
+        asynchronous: state::stack_boolean(rsp, 10),
     })
 }
 
@@ -280,10 +280,10 @@ fn nt_notify_change_multiple_keys(handle: u64, count: u64, subordinate: u64, eve
         apc_context: state::stack_arg(rsp, 6),
         io_status: state::stack_arg(rsp, 7),
         filter: state::stack_arg32(rsp, 8),
-        watch_tree: state::stack_arg32(rsp, 9) as u8 != 0,
+        watch_tree: state::stack_boolean(rsp, 9),
         buffer: state::stack_arg(rsp, 10),
         buffer_size: state::stack_arg32(rsp, 11),
-        asynchronous: state::stack_arg32(rsp, 12) as u8 != 0,
+        asynchronous: state::stack_boolean(rsp, 12),
     })
 }
 

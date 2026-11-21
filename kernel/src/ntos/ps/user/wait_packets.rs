@@ -295,7 +295,7 @@ pub fn cancel(handle: u64, remove_signaled: bool) -> u32 {
 }
 
 fn nt_cancel_wait_completion_packet(handle: u64, remove: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
-    Ok(cancel(handle, remove & 0xFF != 0))
+    Ok(cancel(handle, state::boolean(remove)))
 }
 
 pub fn pump() {
