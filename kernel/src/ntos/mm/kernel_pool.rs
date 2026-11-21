@@ -349,21 +349,17 @@ pub fn allocate(bytes: u64, options: AllocateOptions) -> Result<u64, KernelError
     if rounded > map::KERNEL_POOL_TOP - map::KERNEL_POOL_BASE {
         return Ok(0);
     }
-    let mut chosen = None;
+    // A faixa livre numa slab de 4 KB existente (só os pedidos que cabem numa
+    // página): a região e o (índice, deslocamento) dela.
+    let choose = |pool: &Pool| -> Option<(u64, (usize, u64))> {
+        if rounded > 4096 {
+            return None;
+        }
+        pool.regions.iter().filter(|(_, region)| region.bytes == 4096 && !region.busy && region.paged == options.paged && region.nx == options.nx && region.cold == options.cold).find_map(|(&id, region)| fit(region, rounded, options.alignment).map(|choice| (id, choice)))
+    };
     let needed = {
         let pool = POOL.lock();
-        if rounded <= 4096 {
-            for (&id, region) in &pool.regions {
-                if region.bytes != 4096 || region.busy || region.paged != options.paged || region.nx != options.nx || region.cold != options.cold {
-                    continue;
-                }
-                if let Some(choice) = fit(region, rounded, options.alignment) {
-                    chosen = Some((id, choice));
-                    break;
-                }
-            }
-        }
-        match chosen {
+        match choose(&pool) {
             Some((id, _)) => (pool.regions[&id].pages[0].frame == 0) as u64,
             None => rounded.div_ceil(4096),
         }
@@ -375,10 +371,20 @@ pub fn allocate(bytes: u64, options: AllocateOptions) -> Result<u64, KernelError
         return Ok(0);
     }
     let mut pool = POOL.lock();
-    // A escolha da primeira passagem é refeita sob a trava: com ela solta
-    // (o reclaim de páginas), outra CPU pode ter alocado da mesma região, e
-    // o índice e o deslocamento livres de antes já não valem.
-    let chosen = chosen.and_then(|(id, _)| pool.regions.get(&id).filter(|region| !region.busy).and_then(|region| fit(region, rounded, options.alignment)).map(|choice| (id, choice)));
+    // A escolha é refeita sob a trava, em todas as slabs: com ela solta (o
+    // reclaim, que pode gravar páginas e alocar do pool), a faixa escolhida
+    // antes pode ter sido tomada, por outra CPU ou pelo próprio reclaim, e o
+    // índice e o deslocamento livres de antes já não valem.
+    let mut chosen = choose(&pool);
+    // Sem slab com lugar e sem frames para uma região nova (o reclaim
+    // consumiu a faixa que havia), mais um reclaim antes de recusar.
+    let pages = rounded.div_ceil(4096);
+    if chosen.is_none() && pfn::free_count() < pages + reserve {
+        drop(pool);
+        page_residency::reclaim(pages + reserve - pfn::free_count());
+        pool = POOL.lock();
+        chosen = choose(&pool);
+    }
     let (id, (free_index, offset)) = match chosen {
         Some(choice) => choice,
         None => match pool.create_region(rounded.div_ceil(4096) * 4096, options.paged, options.nx, options.cold) {
