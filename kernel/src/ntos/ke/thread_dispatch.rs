@@ -1490,6 +1490,34 @@ pub fn add_dispatcher(cpu: usize) {
     CONCURRENT.store(true, Ordering::Release);
 }
 
+/// A CPU `cpu` deixa de despachar threads de usuário (o despacho nos APs foi
+/// desligado e ela já terminou os intervalos dela): a reserva que ainda
+/// tiver volta à fila, e sem nenhuma CPU além do BSP o despacho deixa de
+/// ser concorrente (as posses, os empréstimos, os IPIs e os shootdowns entre
+/// CPUs voltam a ser os do despacho só no BSP).
+pub fn remove_dispatcher(cpu: usize) {
+    if cpu >= map::MAX_CPUS {
+        return;
+    }
+    let reserved = {
+        let _queues = QUEUES.lock();
+        let thread = prcb(cpu).next_thread.get();
+        if thread != 0 && thread_state(thread) == state::STANDBY {
+            prcb(cpu).next_thread.set(0);
+            end_yield_reservation_locked(cpu, thread);
+            enqueue_ready_locked(thread, true, false);
+        }
+        let remaining = DISPATCHERS.fetch_and(!(1 << cpu), Ordering::SeqCst) & !(1 << cpu);
+        if remaining == 0 {
+            CONCURRENT.store(false, Ordering::Release);
+        }
+        thread
+    };
+    if reserved != 0 {
+        kick(reserved);
+    }
+}
+
 /// As CPUs que despacham threads de usuário.
 pub fn dispatchers() -> u64 {
     DISPATCHERS.load(Ordering::Acquire)

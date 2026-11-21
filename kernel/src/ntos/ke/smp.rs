@@ -795,6 +795,13 @@ fn processor_loop(slot: usize) -> ! {
         if !dispatcher && user_dispatch_enabled() {
             dispatcher = true;
             thread_dispatch::add_dispatcher(number);
+        } else if dispatcher && !user_dispatch_enabled() {
+            // O despacho foi desligado (o fim de um autoteste): fora do
+            // conjunto, com a raiz do System carregada (nenhuma tradução de
+            // usuário fica no TLB deste AP).
+            dispatcher = false;
+            let _ = crate::ntos::ke::context_switch::load_root(crate::ntos::mm::process_address_space::SYSTEM_ROOT);
+            thread_dispatch::remove_dispatcher(number);
         }
         let generation = thread_dispatch::ready_generation();
         let dispatching = dispatcher && user_dispatch_enabled();
