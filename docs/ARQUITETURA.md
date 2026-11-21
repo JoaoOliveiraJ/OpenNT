@@ -536,7 +536,17 @@ de página e a captura de chamada de um intervalo são tratadas com a thread
 ainda Running na CPU dela, antes do fim da execução (o KiDispatchException
 roda no contexto da thread). A escolha de uma faixa livre de VA
 de usuário e o registro dela no VAD são um passo só, sob a
-AddressCreationLock do processo (`memory::address_creation`). Um pulso (ou
+AddressCreationLock do processo (`memory::address_creation`). A thread
+criada suspensa vai direto à espera, com a decisão tomada sob o PrcbLock
+pela contagem de suspensão (`attach_scheduling`), sem passar pela fila. A
+posse de uma thread consultada fora da CPU dela lê o ponteiro da KTHREAD
+sob a trava da thread (a liberação da morta o zera sob a mesma trava). Nas
+seções, a busca da control area de um arquivo e a referência nova
+(`sections::create`) e a última referência (`destroy_section`) são
+decididas sob a trava de FILE_AREAS, e as páginas novas de uma seção de
+imagem ou de arquivo são preenchidas em frames ainda fora da control area e
+só então publicadas (a falta de outra CPU na mesma página nunca mapeia um
+frame ainda por ler; a que outra CPU publicou no meio fica). Um pulso (ou
 o sinal seguido do reset) que outra CPU dá entre a instalação de uma espera
 adiada e a ligação dos blocos dela a satisfaz na ligação, como satisfaria a
 do 19041, ligada dentro do serviço. Uma espera que gira num AP (o
@@ -544,7 +554,15 @@ do 19041, ligada dentro do serviço. Uma espera que gira num AP (o
 kernel da própria thread; o BSP que disputa um SharedLock atende as IRQs e
 as DPCs e roda as threads de kernel quando não pode dar intervalo de
 usuário. A linha `[perf] t=N ms aps:` soma os intervalos e o HLT dos APs, os
-empréstimos recusados, os IPIs de reescalonamento e os shootdowns. O
+empréstimos recusados, os IPIs de reescalonamento e os shootdowns; com o
+sistema parado por 15 s (o BSP ocioso e nenhum intervalo de usuário), sai
+uma vez uma linha `[parada]` por thread de usuário, com o estado de
+despacho, a CPU dona, a presença na fila, a suspensão, o serviço e a espera,
+e uma por porta ALPC ou servidor com pedidos pendentes
+(`threads::report_stalled_threads`). Com `--user-smp` o boot até a área
+de trabalho ainda tem paradas longas (um pedido ALPC síncrono recebido pelo
+servidor, o LSM ou o csrss, fica sem resposta até um prazo vencer), e os
+testes da cadeia continuam com `--smp=1`. O
 autoteste `ntos/test/multiprocess/user_smp.rs` (com dois processadores ou
 mais) liga o despacho de usuário nos APs e, com o BSP só girando, confere
 que o serviço é atendido num AP, que cada sinal do BSP conclui exatamente

@@ -53,6 +53,34 @@ pub(crate) fn add_port(port: &Arc<Port>) {
     }
 }
 
+/// Diagnóstico de parada (`threads::report_stalled_threads`): as portas com
+/// mensagens ou pedidos na fila, cada uma numa linha `[parada] porta`.
+pub fn report_stalled_ports() {
+    let ports: Vec<Arc<Port>> = PORTS.lock().clone();
+    for port in ports {
+        let (role, pending, requests, completion, closing, service) = port.inspect(|state| {
+            let role = match state.role {
+                Role::None => "sem papel",
+                Role::Listener => "conexao",
+                Role::Client => "cliente",
+                Role::Server => "servidor",
+            };
+            (role, state.pending.len(), state.jobs.clone(), state.completion.is_some(), state.closing, state.service.is_some())
+        });
+        if pending == 0 && requests.is_empty() {
+            continue;
+        }
+        // SAFETY: o EPROCESS dono da porta viva.
+        let pid = if port.process_pointer != 0 { unsafe { crate::ntos::inc::types::Eprocess::at(port.process_pointer) }.unique_process_id.get() } else { 0 };
+        let mut line = alloc::format!("[parada] porta {:#x} ({} {}) do pid {}: {} mensagens, {} pedidos, IOCP {}, servico do kernel {}, fechando {}", port.pointer, port.kind, role, pid, pending, requests.len(), completion, service, closing);
+        for request in requests.iter().take(4) {
+            let state = request.state.lock();
+            line.push_str(&alloc::format!(" | pedido {} de {}:{} sincrono {} entregue {} sondando {} cancelado {} continuacao {} servidor {}:{}", request.id, state.sender.process, state.sender.thread, state.synchronous, state.delivered, state.polling, state.canceled, state.job.is_some(), state.server.process, state.server.thread));
+        }
+        crate::debug_print!("{}", line);
+    }
+}
+
 fn has_port(port: &Arc<Port>) -> bool {
     PORTS.lock().iter().any(|candidate| Arc::ptr_eq(candidate, port))
 }

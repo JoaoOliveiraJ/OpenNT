@@ -65,10 +65,26 @@ impl Association {
     }
 
     fn publish_pending(self: &Arc<Self>) {
+        loop {
+            if !self.publish_round() {
+                break;
+            }
+        }
+        self.collect();
+    }
+
+    /// Uma rodada de [`Association::publish_pending`] sob `draining`; `true`
+    /// quando há pendência a publicar outra vez. A notificação (ou a
+    /// retirada) que chega em outra CPU enquanto esta drena acha `draining`
+    /// e volta sem publicar: a pendência dela é conferida aqui, sob a trava
+    /// de `flags`, depois de soltar `draining`, e a rodada se repete. Sem a
+    /// conferência a mensagem ficava na fila da porta sem pacote na IOCP, e
+    /// as threads do servidor RPC esperavam na fábrica para sempre.
+    fn publish_round(self: &Arc<Self>) -> bool {
         {
             let mut flags = self.flags.lock();
             if flags.draining || flags.storage_released {
-                return;
+                return false;
             }
             flags.draining = true;
         }
@@ -104,8 +120,10 @@ impl Association {
                 },
             );
         }
-        self.flags.lock().draining = false;
-        self.collect();
+        let mut flags = self.flags.lock();
+        flags.draining = false;
+        // Com a trava tomada o estado não é solto (`collect` também a toma).
+        !flags.storage_released && !self.queue.closed() && pending.load(Ordering::SeqCst) != 0 && published.load(Ordering::SeqCst) < state.limit.get()
     }
 }
 

@@ -769,6 +769,8 @@ pub fn report_stalled_threads() {
         if termination || deferred.is_some() {
             line.push_str(&alloc::format!(" termino pedido {} adiado {:?}", termination, deferred));
         }
+        let kthread = kernel_thread(pointer);
+        line.push_str(&alloc::format!(" servico {:#x}", kthread.system_call_number.get()));
         if let Some((objects, shape, kernel_wait, reason, deadline)) = wait {
             line.push_str(&alloc::format!(" | {} motivo {} kernel {} prazo {:?}:", shape, reason, kernel_wait, deadline));
             for object in objects {
@@ -777,8 +779,29 @@ pub fn report_stalled_threads() {
                 line.push_str(&alloc::format!(" {:#x} (tipo {} sinal {})", object, header.type_.get() & 0x7F, header.signal_state.get()));
             }
         }
+        // Os KWAIT_BLOCKs ligados da KTHREAD (a espera de kernel dentro de um
+        // serviço não guarda os objetos no registro).
+        let list = kthread.wait_block_list.get();
+        let count = kthread.wait_block_count.get().min(8) as u64;
+        if list != 0 && count != 0 {
+            line.push_str(&alloc::format!(" | KTHREAD motivo {} blocos:", kthread.wait_reason.get()));
+            for index in 0..count {
+                // SAFETY: a lista de blocos da espera ligada da thread (a
+                // KTHREAD ou o vetor do chamador, vivo enquanto ela espera).
+                let block = unsafe { KwaitBlock::at(list + index * core::mem::size_of::<KwaitBlock>() as u64) };
+                let object = block.object.get();
+                if object == 0 || object < 0xFFFF_8000_0000_0000 {
+                    continue;
+                }
+                // SAFETY: o objeto do bloco ligado.
+                let header = unsafe { crate::ntos::inc::types::DispatcherHeader::at(object) };
+                line.push_str(&alloc::format!(" {:#x} (tipo {} sinal {} estado {})", object, header.type_.get() & 0x7F, header.signal_state.get(), block.block_state.get()));
+            }
+        }
         crate::debug_print!("{}", line);
     }
+    super::alpc::report_stalled_ports();
+    crate::ntos::alpc::server::report_stalled_servers();
 }
 
 /// Registra a thread no despacho (USER_RUNTIME | TID), suspensa se o

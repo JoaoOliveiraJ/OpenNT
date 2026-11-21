@@ -1301,6 +1301,12 @@ pub extern "C" fn opennt_user_syscall(frame: *mut u64) -> u64 {
     let mut result: u64 = 0;
     let mut stack_count = 0u64;
     let number = unsafe { *frame };
+    // KTHREAD.SystemCallNumber, que o KiSystemCall64 grava na entrada.
+    let thread = crate::ntos::ke::pcr::current_thread();
+    if thread != 0 {
+        // SAFETY: a KTHREAD corrente, viva durante a syscall dela.
+        unsafe { crate::ntos::inc::types::Kthread::at(thread) }.system_call_number.set(number as u32);
+    }
     let sampled = crate::ntos::kd::sampler::service_start();
     // O papel do KTHREAD.TrapFrame, que o KiSystemServiceStart grava antes da
     // busca na tabela: o CONTEXT do intervalo recebe os registradores desta

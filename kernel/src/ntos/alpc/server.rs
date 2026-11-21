@@ -418,6 +418,25 @@ pub struct UserServer {
 static SERVERS: SpinLock<BTreeMap<u64, Arc<UserServer>>> = SpinLock::new(BTreeMap::new());
 static COMMUNICATION: SpinLock<BTreeMap<u64, (Arc<UserServer>, u64)>> = SpinLock::new(BTreeMap::new());
 
+/// Diagnóstico de parada (`ps/user/threads::report_stalled_threads`): os
+/// servidores com mensagens na fila ou pedidos sem resposta, uma linha
+/// `[parada] servidor` cada, com os MessageIds e se o servidor já recebeu.
+pub fn report_stalled_servers() {
+    let servers: alloc::vec::Vec<Arc<UserServer>> = SERVERS.lock().values().cloned().collect();
+    for server in servers {
+        let state = server.state.lock();
+        if state.queue.is_empty() && state.requests.is_empty() {
+            continue;
+        }
+        let queued: alloc::vec::Vec<u32> = state.queue.iter().map(|delivery| delivery.id).take(8).collect();
+        let waiting: alloc::vec::Vec<(u32, u64, u64, bool)> = state.requests.keys().take(8).map(|id| {
+            let origin = state.senders.get(id);
+            (*id, origin.map_or(0, |origin| origin.sender.process), origin.map_or(0, |origin| origin.sender.thread), origin.is_some_and(|origin| origin.received))
+        }).collect();
+        crate::debug_print!("[parada] servidor da porta {:#x} (pid {}): na fila {:?}; sem resposta (id, pid, tid, recebida) {:?}", server.listener.pointer, server.listener.process_id(), queued, waiting);
+    }
+}
+
 /// A próxima sequência de uma porta de servidor (o `lock xadd` no contador
 /// da porta do AlpcpDispatchNewMessage, do AlpcpDispatchConnectionRequest e
 /// do AlpcpDispatchCloseMessage): cada mensagem posta para um cliente

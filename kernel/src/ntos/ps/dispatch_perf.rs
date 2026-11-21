@@ -260,7 +260,7 @@ pub fn report_if_due() {
         values[21],
         values[22]
     );
-    report_processors(now, milliseconds(values[0]), milliseconds(values[8]));
+    report_processors(now, milliseconds(values[0]) + milliseconds(values[2]), milliseconds(values[8]));
     report_exits();
     report_threads();
     crate::ntos::kd::sampler::report_images();
@@ -270,8 +270,9 @@ pub fn report_if_due() {
 /// O que andou nos APs desde a linha anterior.
 static LAST_PROCESSORS: crate::rtl::SpinLock<[u64; 8]> = crate::rtl::SpinLock::new([0; 8]);
 
-/// As linhas seguidas em que o sistema ficou parado (o BSP no HLT e nenhum
-/// intervalo de usuário), e se a lista das threads já saiu nesta parada.
+/// As linhas seguidas em que o sistema ficou parado (o BSP ocioso, no HLT ou
+/// girando, e nenhum intervalo de usuário), e se a lista das threads já saiu
+/// nesta parada.
 static QUIET: crate::rtl::SpinLock<(u32, bool)> = crate::rtl::SpinLock::new((0, false));
 
 /// As linhas paradas seguidas antes da lista das threads (15 s).
@@ -281,7 +282,7 @@ const QUIET_REPORTS: u32 = 3;
 /// Parado por [`QUIET_REPORTS`] linhas seguidas, lista uma vez as threads de
 /// usuário (`threads::report_stalled_threads`): uma espera ou uma retomada
 /// perdida entre CPUs aparece ali.
-fn report_processors(now: u64, bootstrap_halt_ms: u64, bootstrap_slice_ms: u64) {
+fn report_processors(now: u64, bootstrap_idle_ms: u64, bootstrap_slice_ms: u64) {
     if !crate::ntos::ke::thread_dispatch::concurrent() {
         return;
     }
@@ -303,7 +304,7 @@ fn report_processors(now: u64, bootstrap_halt_ms: u64, bootstrap_slice_ms: u64) 
     static LAST_KERNEL_SHOOTDOWN_TSC: AtomicU64 = AtomicU64::new(0);
     let shootdown_delta = shootdown.wrapping_sub(LAST_SHOOTDOWN_TSC.swap(shootdown, Ordering::Relaxed));
     let kernel_shootdown_delta = kernel_shootdown.wrapping_sub(LAST_KERNEL_SHOOTDOWN_TSC.swap(kernel_shootdown, Ordering::Relaxed));
-    let quiet = bootstrap_halt_ms * 10 >= REPORT_INTERVAL_MS * 9 && bootstrap_slice_ms < 50 && milliseconds(delta[0]) < 50;
+    let quiet = bootstrap_idle_ms * 10 >= REPORT_INTERVAL_MS * 9 && bootstrap_slice_ms < 50 && milliseconds(delta[0]) < 50;
     let report = {
         let mut state = QUIET.lock();
         if quiet {
