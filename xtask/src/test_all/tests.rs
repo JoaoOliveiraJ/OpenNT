@@ -62,15 +62,17 @@ fn the_whole_round_compiles_one_kernel() {
     kernels.dedup();
     assert_eq!(kernels.len(), 1, "builds do kernel diferentes na rodada");
     // Cada pasta de imagens é um volume: o processo inicial, o processo de
-    // console, a conta de teste, as contas embutidas desligadas e o gancho
-    // que desliga a cadeia.
+    // console, a conta de teste, as contas embutidas desligadas, o gancho
+    // que desliga a cadeia, o escopo e-process (que leva os programas do
+    // boot do smss ao volume) e o volume do sistema no ntfs.sys (o disco
+    // particionado).
     let volume = |test: &Test| {
         let mut command = vec![String::from("test-boot")];
         command.extend(test.arguments.iter().cloned());
         let options = crate::test_build_options(&crate::parse(command).unwrap());
-        (options.initial_process.clone(), options.console_process, options.test_account, options.builtin_accounts_off, options.shutdown_chain)
+        (options.initial_process.clone(), options.console_process, options.test_account, options.builtin_accounts_off, options.shutdown_chain, options.kernel_test_scope == "e-process", !options.system_volume.is_empty())
     };
-    let mut volumes: Vec<(String, bool, bool, bool, bool)> = Vec::new();
+    let mut volumes: Vec<(String, bool, bool, bool, bool, bool, bool)> = Vec::new();
     for run in &runs {
         let found = volume(&tests[run.test]);
         if !volumes.contains(&found) {
@@ -83,9 +85,19 @@ fn the_whole_round_compiles_one_kernel() {
     // teste, o da conta de teste com o gancho que desliga a cadeia (o
     // desligamento-cadeia) e o da conta de teste com entrada (o
     // --start-menu do menu-iniciar também é entrada e liga o gancho das
-    // contas embutidas).
-    let expected = [("", false, false, false, false), ("", true, false, false, false), ("smss", false, false, false, false), ("smss", false, false, true, false), ("smss", false, true, false, false), ("smss", false, true, false, true), ("smss", false, true, true, false)];
-    assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain)| (String::from(process), console, account, builtin, chain)), "volumes da rodada");
+    // contas embutidas), mais o do e-process e o do volume-sistema.
+    let expected = [
+        ("", false, false, false, false, false, false),
+        ("", false, false, false, false, false, true),
+        ("", false, false, false, false, true, false),
+        ("", true, false, false, false, false, false),
+        ("smss", false, false, false, false, false, false),
+        ("smss", false, false, true, false, false, false),
+        ("smss", false, true, false, false, false, false),
+        ("smss", false, true, false, true, false, false),
+        ("smss", false, true, true, false, false, false),
+    ];
+    assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain, e_process, system_volume)| (String::from(process), console, account, builtin, chain, e_process, system_volume)), "volumes da rodada");
     let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
     assert_eq!(images, volumes.len(), "uma pasta de imagens por volume");
     // As execuções de uma pasta vêm juntas, e a de cada teste é a da chave dele.
