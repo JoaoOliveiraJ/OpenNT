@@ -314,9 +314,26 @@ fn standard_information(file_attributes: u32) -> Attribute {
     standard_information_with(file_attributes, SECURITY_ID)
 }
 
+/// A hora de instalação de todo arquivo do volume (FILETIME UTC,
+/// 2019-12-07 00:00:00): criação, escrita, mudança do registro e acesso no
+/// $STANDARD_INFORMATION e na cópia do $FILE_NAME. Uma instalação de
+/// verdade tem horas em todo arquivo, e componentes do Windows as comparam
+/// (o Mm só retém sem uso a control area de imagem de um arquivo cuja
+/// versão, o tamanho e as horas, ele consegue conferir). Uma hora fixa
+/// deixa a imagem igual entre builds e não traz nada do hospedeiro.
+const INSTALL_TIME: u64 = 132_201_504_000_000_000;
+
+/// As quatro horas (criação, escrita, mudança, acesso) a partir de `at`.
+fn put_times(value: &mut [u8], at: usize) {
+    for index in 0..4 {
+        put64(value, at + index * 8, INSTALL_TIME);
+    }
+}
+
 /// $STANDARD_INFORMATION com o SecurityId dado.
 fn standard_information_with(file_attributes: u32, security_id: u32) -> Attribute {
     let mut value = vec![0u8; 72];
+    put_times(&mut value, 0);
     put32(&mut value, 32, file_attributes);
     put32(&mut value, 52, security_id);
     resident(0x10, "", value)
@@ -331,6 +348,7 @@ fn file_name_value(parent: u64, name: &str, file_attributes: u32, allocated: u64
     }
     let mut value = vec![0u8; 66 + units.len()];
     put64(&mut value, 0, reference(parent));
+    put_times(&mut value, 8);
     put64(&mut value, 40, allocated);
     put64(&mut value, 48, real_size);
     put32(&mut value, 56, file_attributes);
