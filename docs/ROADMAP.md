@@ -85,7 +85,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Depurador do kernel | Funciona | kd, kd-parada, kd-usuario |
+| Depurador do kernel | Funciona | kd, kd-parada, kd-usuario, reinicio-do-shell |
 | Relógio e fuso horário | Funciona | relogio, selftest, fase6, fase7 |
 | Carregador de PE e exports do kernel | Parcial | fase6, boot |
 | hal.dll | Funciona | drivers |
@@ -129,7 +129,7 @@ Cache Manager e os drivers reais do Windows para a tela gráfica (win32k.sys, dx
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
 | Cache Manager | Parcial | fase6, ntfs, nvme, e-process |
-| win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display |
+| win32k.sys, win32kbase.sys e win32kfull.sys | Parcial | win32k, win32k-display, reinicio-do-shell |
 | acpi.sys e pci.sys | Parcial | acpi, usb |
 | Pilha USB 3 e HID (usbxhci.sys, ucx01000.sys, usbhub3.sys, hidusb.sys, hidclass.sys, kbdhid.sys e mouhid.sys) | Parcial | usb |
 | dxgkrnl.sys e BasicDisplay.sys | Parcial | dxgkrnl, basicdisplay, win32k-display, fase6 |
