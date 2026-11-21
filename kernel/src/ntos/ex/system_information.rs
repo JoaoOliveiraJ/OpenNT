@@ -352,10 +352,12 @@ pub fn query(class: u32, output: u64, length: u32, returned: u64) -> Result<u32,
             set_reported(returned, reported);
             return Ok(status);
         }
-        5 => {}
+        // A lista de processos: `ps/system_process_information`.
+        system_process_information::SYSTEM_SESSION_PROCESS_INFORMATION => return system_process_information::query_session(output, length as u64, returned, false),
+        system_process_information::SYSTEM_PROCESS_INFORMATION | system_process_information::SYSTEM_EXTENDED_PROCESS_INFORMATION | system_process_information::SYSTEM_FULL_PROCESS_INFORMATION => {}
         _ => return Ok(0xC000_000D),
     }
-    system_process_information::query(output, length as u64, returned, false)
+    system_process_information::query_class(class, output, length as u64, returned, false)
 }
 
 /// O ReturnLength opcional de um chamador de modo kernel recebe a célula de

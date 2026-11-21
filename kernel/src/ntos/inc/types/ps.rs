@@ -5971,3 +5971,67 @@ const _: () = {
     assert!(core::mem::offset_of!(GdiTebBatch32, hdc) == 0x4);
     assert!(core::mem::offset_of!(GdiTebBatch32, buffer) == 0x8);
 };
+
+/// `_PROCESS_ENERGY_VALUES` (0x110 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `ProcessEnergyValuesView1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct ProcessEnergyValues {
+    pub cycles: [[Field<u64>; 2]; 4],
+    pub disk_energy: Field<u64>,
+    pub network_tail_energy: Field<u64>,
+    pub mbb_tail_energy: Field<u64>,
+    pub network_tx_rx_bytes: Field<u64>,
+    pub mbb_tx_rx_bytes: Field<u64>,
+    pub durations: [EnergyStateDuration; 3],
+    pub composition_rendered: Field<u32>,
+    pub composition_dirty_generated: Field<u32>,
+    pub composition_dirty_propagated: Field<u32>,
+    pub reserved1: Field<u32>,
+    pub attributed_cycles: [[Field<u64>; 2]; 4],
+    pub work_on_behalf_cycles: [[Field<u64>; 2]; 4],
+}
+
+/// Vista 1 de `_PROCESS_ENERGY_VALUES` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct ProcessEnergyValuesView1 {
+    _pad_0: Reserved<0x68>,
+    pub foreground_duration: EnergyStateDuration,
+    pub desktop_visible_duration: EnergyStateDuration,
+    pub psm_foreground_duration: EnergyStateDuration,
+    _pad_80: Reserved<0x90>,
+}
+
+impl core::ops::Deref for ProcessEnergyValues {
+    type Target = ProcessEnergyValuesView1;
+    #[inline(always)]
+    fn deref(&self) -> &ProcessEnergyValuesView1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<ProcessEnergyValuesView1>() }
+    }
+}
+
+unsafe impl NtStruct for ProcessEnergyValues {}
+
+const _: () = {
+    assert!(core::mem::size_of::<ProcessEnergyValues>() == 0x110);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, cycles) == 0x0);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, disk_energy) == 0x40);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, network_tail_energy) == 0x48);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, mbb_tail_energy) == 0x50);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, network_tx_rx_bytes) == 0x58);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, mbb_tx_rx_bytes) == 0x60);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, durations) == 0x68);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, composition_rendered) == 0x80);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, composition_dirty_generated) == 0x84);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, composition_dirty_propagated) == 0x88);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, reserved1) == 0x8c);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, attributed_cycles) == 0x90);
+    assert!(core::mem::offset_of!(ProcessEnergyValues, work_on_behalf_cycles) == 0xd0);
+    assert!(core::mem::size_of::<ProcessEnergyValuesView1>() == 0x110);
+    assert!(core::mem::align_of::<ProcessEnergyValuesView1>() == core::mem::align_of::<ProcessEnergyValues>());
+    assert!(core::mem::offset_of!(ProcessEnergyValuesView1, foreground_duration) == 0x68);
+    assert!(core::mem::offset_of!(ProcessEnergyValuesView1, desktop_visible_duration) == 0x70);
+    assert!(core::mem::offset_of!(ProcessEnergyValuesView1, psm_foreground_duration) == 0x78);
+};

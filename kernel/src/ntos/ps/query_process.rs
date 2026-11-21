@@ -759,8 +759,8 @@ pub fn query_vm_counters(output: u64, length: u32, returned: u64, process_of: im
     };
     // SAFETY: EPROCESS retido pelo handle que o nomeou (ou o corrente).
     let eprocess = unsafe { Eprocess::at(process) };
-    let (peak_virtual, virtual_size) = process_usage::virtual_size(process);
     let working_set = process_usage::query_working_set(process);
+    let (peak_virtual, virtual_size) = process_usage::virtual_size(process);
     let pools = super::pool_quota::snapshot(process).ok();
     let copied = copy_out::<VmCountersEx2>(output, length, |counters| {
         counters.peak_virtual_size.set(peak_virtual);

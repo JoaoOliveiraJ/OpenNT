@@ -25,6 +25,7 @@ pub mod user_callback;
 pub mod time_services;
 
 pub mod process_queries;
+pub mod process_list;
 pub mod ipi_stall;
 pub mod contention;
 pub mod current_thread;

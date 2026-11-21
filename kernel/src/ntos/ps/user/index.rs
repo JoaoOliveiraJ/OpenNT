@@ -11,7 +11,7 @@ use crate::ntos::ex::system_services;
 use crate::ntos::ke::{clock, context_switch};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::{kernel_stack, paging, shared_user_data};
-use crate::ntos::ps::{process, system_process_information};
+use crate::ntos::ps::process;
 use crate::ntos::ps::user::{memory, registry};
 use crate::ntos::ps::user::state::{self, STATUS_NOT_IMPLEMENTED};
 use crate::rtl::{KernelError, SpinLock};
@@ -256,9 +256,6 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
 pub fn invoke_service(name: &str, arguments: [u64; 4], rip: u64, user_rsp: u64) -> Result<u32, KernelError> {
     let thread = process::get_current_thread();
     let started = clock::uptime_ms();
-    if matches!(name, "NtFreeVirtualMemory" | "NtUnmapViewOfSection" | "NtUnmapViewOfSectionEx") {
-        system_process_information::sample();
-    }
     let result = handle_service(Some(name), arguments, rip, user_rsp, 0);
     process::account_thread(thread, true, (clock::uptime_ms() - started) * 10_000);
     result

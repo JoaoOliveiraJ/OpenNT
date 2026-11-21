@@ -80,7 +80,7 @@ use crate::hal::amd64::context_switch::{EXIT_BLOCKED, EXIT_THREAD_EXITED};
 use crate::ntos::ke::user_callback::CalloutStacks;
 use crate::ntos::ke::{apc, clock, context_switch, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_lock, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
-use crate::ntos::ps::{alert_thread, cid, dispatch_perf, process, query_thread, set_thread_information, system_process_information};
+use crate::ntos::ps::{alert_thread, cid, dispatch_perf, process, query_thread, set_thread_information};
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -2481,7 +2481,6 @@ pub fn release_execution_resources(thread: &Arc<UserThread>) {
     // A pilha e a TEB da thread principal são do VAD do processo e voltam no
     // término dele.
     let Some(regions) = thread.with(|thread| thread.regions.take()) else { return };
-    system_process_information::sample();
     for region in &regions {
         memory::release_private_region(region);
     }

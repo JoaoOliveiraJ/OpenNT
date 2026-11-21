@@ -5081,7 +5081,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   e a ProcessVmCounters (3) (`ps/query_process.rs`, com o working set e o
   tamanho virtual tirados do VAD em `mm/process_usage.rs`); o total físico
   é o que o PFN enxerga, então o services.exe só separa os svchost quando
-  isso passa do SvcHostSplitThresholdInKB. Também respondem como no 19041,
+  isso passa do SvcHostSplitThresholdInKB. O `mm/process_usage.rs`
+  recalcula esses valores nos campos do EPROCESS que o NT mantém
+  (Vm.WorkingSetLeafSize, WorkingSetLeafPrivateSize, PeakWorkingSetSize,
+  VirtualSize e PeakVirtualSize; as folhas presentes contadas pelas tabelas
+  de páginas, `mm/paging::count_present_in`), e as duas consultas que os
+  leem os recalculam antes: o MmQueryWorkingSetInformation da
+  ProcessVmCounters e o ExpCopyProcessInfo da lista de processos. Também respondem como no 19041,
   cada uma no componente dono: a SystemCpuQuotaInformation (113,
   0xC00001A9 sem DFSS, `ps/session.rs`), a
   SystemEnergyEstimationConfigInformation (158, um BOOLEAN FALSE), a
@@ -5421,6 +5427,23 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   Desktops Winlogon e Default da WinSta0, abertas pela ParseProcedure da
   WindowStation, e o `WINLOGON_DESKTOPS_OK` quando o winlogon.exe da sessão
   1 tem as dele (o teste winlogon).
+- **Lista de processos** (`ps/system_process_information.rs`): o
+  ExpGetProcessInformation do 19041 para a SystemProcessInformation (5), a
+  SystemSessionProcessInformation (53), a SystemExtendedProcessInformation
+  (57) e a SystemFullProcessInformation (148). Cada registro tem o
+  SYSTEM_PROCESS_INFORMATION com os campos do EPROCESS que o
+  ExpCopyProcessInfo copia (working set, privado, picos, faltas de página,
+  tamanho virtual, cotas de pool, commit, handles pelo ExHandleTableQuery
+  da tabela do processo, `ob/handle_table::query_handle_count`), os tempos,
+  o CycleTime e os contadores de E/S do PsQueryStatisticsProcess
+  (`ps/process_statistics.rs`), um registro de thread por thread viva (0x50
+  na classe 5, 0x88 nas outras), a extensão de 0x170 bytes que o 19041 põe
+  em todas as classes, o SID e a identidade de pacote na 148 e o nome da
+  imagem do SeAuditProcessCreationInfo (só o último componente fora da
+  148). O Gerenciador de Tarefas lê a classe 5; a coluna Memória é o
+  WorkingSetPrivateSize. O autoteste `test/multiprocess/process_list.rs`
+  confere a lista contra a ProcessVmCounters de um processo real parado e a
+  forma das três classes.
 - **As portas LPC de modo usuário** (`alpc/lpc_ports.rs` sobre
   `alpc/server.rs`, adaptadores em `ps/user/lpc.rs`): como no 19041, os
   serviços do LPC antigo são finos sobre o ALPC, e uma porta LPC é uma ALPC
@@ -7902,7 +7925,11 @@ da sessão 1 com a classe da janela principal dele põe na serial o
 `EXPLORER_WINDOW_CREATED` (a CabinetWClass do explorer.exe), o
 `NOTEPAD_WINDOW_CREATED` (a Notepad do notepad.exe), o
 `CONSOLE_WINDOW_CREATED` (a ConsoleWindowClass do conhost.exe) ou o
-`TASKMGR_WINDOW_CREATED` (a TaskManagerWindow do Taskmgr.exe). Uma entrada
+`TASKMGR_WINDOW_CREATED` (a TaskManagerWindow do Taskmgr.exe); a primeira
+lista de processos que o Taskmgr.exe recebe do NtQuerySystemInformation
+com o próprio registro e o de outro processo com WorkingSetPrivateSize (a
+coluna Memória) diferente de zero dá o `TASKMGR_PROCESS_MEMORY_OK`
+(`process_list_returned`). Uma entrada
 de tela que não vê a tela mudar como esperado encerra o teste com o que
 faltou na última leitura.
 
@@ -7911,7 +7938,9 @@ a tecla de atalho que o SetWinlogonHotKeys do win32kfull registra (id 4)
 chama o WinlogonHotkeyCallback, que manda o PostWinlogonMessage(0x404, 4)
 ao winlogon; o WLGeneric_AppLauncher_Enter cria o `launchtm.exe` na sessão
 do usuário, e ele abre o Taskmgr.exe pelo ShellExecuteExW. O Taskmgr.exe
-consulta os contadores de processador pelo pcwum.dll e o `\Device\PcwDrv`
+lê a lista de processos pela SystemProcessInformation (a memória de cada
+processo na aba Processos, que o teste abre com Alt+D) e consulta os
+contadores de processador pelo pcwum.dll e o `\Device\PcwDrv`
 do pcw.sys, que no boot do processo inicial real é driver de boot, como na
 instalação. Os conjuntos de contadores do próprio kernel (o
 ExpPcwHostCallback do 19041, que registra Processor Information,

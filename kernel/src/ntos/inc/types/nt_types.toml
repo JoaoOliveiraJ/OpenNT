@@ -89,6 +89,9 @@ raizes = [
   "_NAMED_PIPE_CREATE_PARAMETERS", "_MAILSLOT_CREATE_PARAMETERS",
   # Etw: buffers de sessão, registros de evento e notificações de modo usuário
   "_WMI_BUFFER_HEADER", "_EVENT_HEADER", "_ETWP_NOTIFICATION_HEADER",
+  # lista de processos do NtQuerySystemInformation e conjuntos de contadores do PCW
+  "_PROCESS_ENERGY_VALUES", "_PCW_REGISTRATION_INFORMATION", "_PCW_COUNTER_DESCRIPTOR",
+  "_PCW_CALLBACK_INFORMATION", "_PCW_MASK_INFORMATION", "_PCW_COUNTER_INFORMATION", "_PCW_DATA",
 ]
 
 # O PDB do ntoskrnl.exe 10.0.19041 que os tipos seguem (GUID e idade do RSDS

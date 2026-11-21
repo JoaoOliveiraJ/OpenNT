@@ -309,6 +309,51 @@ fn program_window_created(image: &str, class: &str, hwnd: u64) {
     }
 }
 
+/// O `TASKMGR_PROCESS_MEMORY_OK` já saiu.
+static TASKMGR_PROCESS_MEMORY: AtomicBool = AtomicBool::new(false);
+
+/// O NtQuerySystemInformation de uma lista de processos (classe `class`)
+/// voltou com sucesso para um processo da sessão 1 com a lista em
+/// `buffer`: o Taskmgr.exe, depois do `USER_LOGON_OK`, que recebe o próprio
+/// registro e o de outro processo com WorkingSetPrivateSize (a coluna
+/// Memória da aba Processos) diferente de zero põe na serial a contagem e o
+/// `TASKMGR_PROCESS_MEMORY_OK`, uma vez. Só observação: a lista já foi
+/// copiada.
+pub fn process_list_returned(class: u32, buffer: u64) {
+    use crate::ntos::inc::types::SystemProcessInformation;
+    use crate::ntos::ps::user::state;
+    if TASKMGR_PROCESS_MEMORY.load(Ordering::Acquire) || !boot_config::smss_boot() || !USER_LOGON_OK.load(Ordering::Acquire) {
+        return;
+    }
+    let current = process::get_current_process();
+    if crate::ntos::mm::session::session_id(current) != 1 || !image_name(current).eq_ignore_ascii_case("taskmgr.exe") {
+        return;
+    }
+    let pid = process::get_current_process_id();
+    let (mut total, mut with_memory, mut own) = (0u32, 0u32, 0u64);
+    let mut at = buffer;
+    for _ in 0..1024 {
+        let Ok(entry) = state::user_struct::<SystemProcessInformation>(at) else { return };
+        let (Ok(next), Ok(id), Ok(private)) = (entry.next_entry_offset.probe_get(), entry.unique_process_id.probe_get(), entry.working_set_private_size.quad_part.probe_get()) else { return };
+        total += 1;
+        if private > 0 {
+            with_memory += 1;
+        }
+        if id == pid {
+            own = private as u64;
+        }
+        if next == 0 {
+            break;
+        }
+        at += next as u64;
+    }
+    if own == 0 || with_memory < 2 || TASKMGR_PROCESS_MEMORY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::debug_print!("[init] Taskmgr.exe (pid {}): lista de processos da classe {} com {} de {} processos com working set privado (o dele {} KB)", pid, class, with_memory, total, own / 1024);
+    crate::debug_print!("TASKMGR_PROCESS_MEMORY_OK");
+}
+
 /// Um serviço da tabela do win32k voltou ao modo usuário com `result`, com
 /// os argumentos `arguments` (o pacote do serviço): o `SHELL_TRAY_CREATED`
 /// sai quando o NtUserCreateWindowEx (o número do stub do win32u.dll) do

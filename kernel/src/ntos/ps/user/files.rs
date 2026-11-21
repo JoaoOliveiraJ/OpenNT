@@ -970,8 +970,7 @@ fn nt_query_section(handle: u64, class: u64, out: u64, length: u64, rsp: u64) ->
 /// VAD. Libera o que o processo possui, e só o dele: as requisições de
 /// `device_io`, as fábricas de workers, a cópia do callback de
 /// instrumentação, os mutantes e as threads de usuário, os canais de
-/// `cm::service::rpc` e os picos de `system_process_information`, nesta
-/// ordem. Os handles, o VAD e os módulos do loader saem logo depois, em
+/// `cm::service::rpc`, nesta ordem. Os handles, o VAD e os módulos do loader saem logo depois, em
 /// `process_state::destroy`. Nada é reiniciado entre processos: um processo
 /// vivo não perde nada quando outro termina.
 pub fn release_user_resources(process: u64) {
@@ -983,7 +982,6 @@ pub fn release_user_resources(process: u64) {
     super::mutants::release_process(process);
     super::threads::release_process(process);
     crate::ntos::cm::service::rpc::release_process(process_id);
-    crate::ntos::ps::system_process_information::release_process(process_id);
 }
 
 /// Registra os handlers de arquivos, dispositivos e seções, e a liberação

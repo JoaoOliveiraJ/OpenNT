@@ -621,6 +621,13 @@ pub fn list_head() -> u64 {
     REGISTRY.lock().list_head
 }
 
+/// ExHandleTableQuery(HandleTable, HandleCount*, ...) (ntoskrnl 19041, rva
+/// 0x619330) sem os opcionais: a soma dos HandleCount das listas livres da
+/// tabela (o OpenNT usa uma lista, a FreeLists[0]), lida sem trava.
+pub fn query_handle_count(table: u64) -> u32 {
+    table_at(table).free_lists.iter().map(|list| list.handle_count.get() as i64).sum::<i64>().clamp(0, u32::MAX as i64) as u32
+}
+
 /// Armazenamento do dono: (folhas, slots livres, ULONGs do índice livre).
 pub fn storage(table: u64) -> Option<(usize, u32, usize)> {
     REGISTRY.lock().tables.get(&table).map(|owner| (owner.leaves.len(), owner.free_count, owner.free_links.len()))

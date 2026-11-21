@@ -406,7 +406,14 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
         124 => return Ok(crate::ntos::ex::time_of_day_information::query_counter_class(buffer, length, returned, true)),
         1 | 63 => return Ok(processor_information::query(buffer, length as u32, returned, true, class == 63)),
         154 => return Ok(processor_information::query_features(buffer, length as u32, returned, true)),
-        5 => return system_process_information::query(buffer, length, returned, true),
+        5 | 57 | 148 => {
+            let result = system_process_information::query_class(class, buffer, length, returned, true);
+            if matches!(result, Ok(0)) {
+                crate::ntos::init::initial_process::process_list_returned(class, buffer);
+            }
+            return result;
+        }
+        53 => return system_process_information::query_session(buffer, length, returned, true),
         _ => {}
     }
     // ProbeForWrite real: o buffer de saída e o ReturnLength opcional

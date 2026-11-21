@@ -491,6 +491,42 @@ pub fn find_mapping_in(root: u64, base: u64, size: u64) -> Option<(u64, u64)> {
     None
 }
 
+/// Páginas de 4 KB com folha presente em [base, base + size) nas tabelas da
+/// raiz `root`: um nível não presente pula a faixa inteira dele, uma página
+/// grande conta as páginas de 4 KB que cobre e uma tabela de páginas é lida
+/// de uma vez, uma entrada por página.
+pub fn count_present_in(root: u64, base: u64, size: u64) -> u64 {
+    let end = base.saturating_add(size);
+    let mut address = base / 4096 * 4096;
+    let mut count = 0u64;
+    'walk: while address < end {
+        let mut table = root;
+        for (level, &shift) in [39u32, 30, 21].iter().enumerate() {
+            let span = 1u64 << shift;
+            let next = (address / span * span).saturating_add(span);
+            let entry = read_entry(table + index_at(address, shift) * 8);
+            if entry & PAGE_PRESENT == 0 {
+                address = next;
+                continue 'walk;
+            }
+            if level > 0 && entry & PAGE_PS != 0 {
+                count += (next.min(end) - address).div_ceil(4096);
+                address = next;
+                continue 'walk;
+            }
+            table = table_of(entry);
+        }
+        let limit = ((address / 0x20_0000 * 0x20_0000).saturating_add(0x20_0000)).min(end);
+        while address < limit {
+            if read_entry(table + pt_index(address) * 8) & PAGE_PRESENT != 0 {
+                count += 1;
+            }
+            address += 4096;
+        }
+    }
+    count
+}
+
 /// Permissões efetivas: interseção de todos os níveis, na raiz corrente.
 pub fn access_flags(va: u64) -> u64 {
     access_flags_in(current_root(), va)

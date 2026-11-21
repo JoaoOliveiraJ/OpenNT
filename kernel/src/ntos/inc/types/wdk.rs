@@ -4562,6 +4562,116 @@ const _: () = {
     assert!(core::mem::offset_of!(SystemProcessInformation, other_transfer_count) == 0xf8);
 };
 
+/// `_SYSTEM_THREAD_INFORMATION` (winternl.h / NtQuerySystemInformation; 0x50
+/// bytes): o registro de thread da SystemProcessInformation (5), gravado pelo
+/// ExpGetProcessInformation do ntoskrnl 19041 (rva 0x63f56d..0x63f5fe).
+#[repr(C)]
+pub struct SystemThreadInformation {
+    pub kernel_time: LargeInteger,
+    pub user_time: LargeInteger,
+    pub create_time: LargeInteger,
+    pub wait_time: Field<u32>,
+    _pad_1c: Reserved<0x4>,
+    pub start_address: Field<u64>,
+    pub client_id: ClientId,
+    pub priority: Field<i32>,
+    pub base_priority: Field<i32>,
+    pub context_switches: Field<u32>,
+    pub thread_state: Field<u32>,
+    pub wait_reason: Field<u32>,
+    _pad_4c: Reserved<0x4>,
+}
+
+unsafe impl NtStruct for SystemThreadInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemThreadInformation>() == 0x50);
+    assert!(core::mem::offset_of!(SystemThreadInformation, kernel_time) == 0x0);
+    assert!(core::mem::offset_of!(SystemThreadInformation, user_time) == 0x8);
+    assert!(core::mem::offset_of!(SystemThreadInformation, create_time) == 0x10);
+    assert!(core::mem::offset_of!(SystemThreadInformation, wait_time) == 0x18);
+    assert!(core::mem::offset_of!(SystemThreadInformation, start_address) == 0x20);
+    assert!(core::mem::offset_of!(SystemThreadInformation, client_id) == 0x28);
+    assert!(core::mem::offset_of!(SystemThreadInformation, priority) == 0x38);
+    assert!(core::mem::offset_of!(SystemThreadInformation, base_priority) == 0x3c);
+    assert!(core::mem::offset_of!(SystemThreadInformation, context_switches) == 0x40);
+    assert!(core::mem::offset_of!(SystemThreadInformation, thread_state) == 0x44);
+    assert!(core::mem::offset_of!(SystemThreadInformation, wait_reason) == 0x48);
+};
+
+/// `_SYSTEM_EXTENDED_THREAD_INFORMATION` (NtQuerySystemInformation; 0x88
+/// bytes): o registro de thread das classes SystemExtendedProcessInformation
+/// (57) e SystemFullProcessInformation (148), gravado pelo
+/// ExpGetProcessInformation do ntoskrnl 19041 (rva 0x63f6ac..0x63f71d).
+#[repr(C)]
+pub struct SystemExtendedThreadInformation {
+    pub thread_info: SystemThreadInformation,
+    pub stack_base: Field<u64>,
+    pub stack_limit: Field<u64>,
+    pub win32_start_address: Field<u64>,
+    pub teb_base: Field<u64>,
+    pub reserved2: Field<u64>,
+    pub reserved3: Field<u64>,
+    pub reserved4: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemExtendedThreadInformation {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemExtendedThreadInformation>() == 0x88);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, thread_info) == 0x0);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, stack_base) == 0x50);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, stack_limit) == 0x58);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, win32_start_address) == 0x60);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, teb_base) == 0x68);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, reserved2) == 0x70);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, reserved3) == 0x78);
+    assert!(core::mem::offset_of!(SystemExtendedThreadInformation, reserved4) == 0x80);
+};
+
+/// `_SYSTEM_PROCESS_INFORMATION_EXTENSION` (NtQuerySystemInformation; 0x170
+/// bytes): o bloco que o ExpGetProcessInformation do ntoskrnl 19041 grava
+/// depois dos registros de thread de todo processo, em todas as classes da
+/// lista (rva 0x63eb9b..0x63ed08): os contadores de disco do processo, as
+/// trocas de contexto do PsQueryStatisticsProcess, as flags (bit 0 o
+/// HasStrongId, bits 1..=4 a classificação, bit 5 o
+/// BackgroundActivityModerated), os deslocamentos do SID, do nome do pacote
+/// e do AppId (só a classe 148 os preenche), os valores de energia, o
+/// SharedCommitCharge em bytes, o JobId e o ProcessSequenceNumber.
+#[repr(C)]
+pub struct SystemProcessInformationExtension {
+    pub disk_counters: ProcessDiskCounters,
+    pub context_switches: Field<u64>,
+    pub flags: Field<u32>,
+    pub user_sid_offset: Field<u32>,
+    pub package_full_name_offset: Field<u32>,
+    _pad_3c: Reserved<0x4>,
+    pub energy_values: ProcessEnergyValues,
+    pub app_id_offset: Field<u32>,
+    _pad_154: Reserved<0x4>,
+    pub shared_commit_charge: Field<u64>,
+    pub job_object_id: Field<u32>,
+    pub spare_ulong: Field<u32>,
+    pub process_sequence_number: Field<u64>,
+}
+
+unsafe impl NtStruct for SystemProcessInformationExtension {}
+
+const _: () = {
+    assert!(core::mem::size_of::<SystemProcessInformationExtension>() == 0x170);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, disk_counters) == 0x0);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, context_switches) == 0x28);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, flags) == 0x30);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, user_sid_offset) == 0x34);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, package_full_name_offset) == 0x38);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, energy_values) == 0x40);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, app_id_offset) == 0x150);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, shared_commit_charge) == 0x158);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, job_object_id) == 0x160);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, spare_ulong) == 0x164);
+    assert!(core::mem::offset_of!(SystemProcessInformationExtension, process_sequence_number) == 0x168);
+};
+
 /// `_SYSTEM_CODEINTEGRITY_INFORMATION` (winternl.h; 0x8 bytes).
 #[repr(C)]
 pub struct SystemCodeintegrityInformation {

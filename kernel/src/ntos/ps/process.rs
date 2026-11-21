@@ -1120,10 +1120,22 @@ pub fn thread_kernel_time(thread: u64) -> u64 {
     STATE.lock().threads.get(&thread).map_or(0, |record| record.kernel_time)
 }
 
-/// Rotina inicial publicada da thread.
+/// Rotina inicial publicada da thread, também na ETHREAD: o PspCreateThread
+/// grava a rotina pedida em Win32StartAddress e o ponto de entrada em
+/// StartAddress, que a lista de processos do NtQuerySystemInformation lê.
+/// O OpenNT grava a rotina pedida nos dois.
 pub fn set_thread_start(thread: u64, start: u64) {
-    if let Some(record) = STATE.lock().threads.get_mut(&thread) {
-        record.start = start;
+    let known = match STATE.lock().threads.get_mut(&thread) {
+        Some(record) => {
+            record.start = start;
+            true
+        }
+        None => false,
+    };
+    if known {
+        let object = ethread(thread);
+        object.win32_start_address.set(start);
+        object.start_address.set(start);
     }
 }
 

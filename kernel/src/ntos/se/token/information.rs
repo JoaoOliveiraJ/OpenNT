@@ -324,6 +324,15 @@ pub fn security_attribute_present(token: u64, name_pointer: u64) -> Result<bool,
     Ok(present)
 }
 
+/// [`security_attribute_present`] com o nome já em texto, para chamadores
+/// de kernel (o PspSysAppIdClaim do ExpGetProcessInformation).
+pub fn attribute_present(token: u64, name: &str) -> bool {
+    let Some(record) = tokens::get(token).filter(|record| record.refs > 0) else {
+        return false;
+    };
+    security_attributes::select(&record.security_attributes, Some(&[String::from(name)])).is_ok_and(|selected| selected.is_some())
+}
+
 /// SeQueryServerSiloToken(Token, Silo*) (ntoskrnl 19041 rva 0x693660): o
 /// SessionId do token, lido sob o lock dele, e o silo da sessão pelo
 /// PsGetSiloBySessionId; devolve o NTSTATUS (STATUS_INVALID_SESSION sem a
