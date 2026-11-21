@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -738,6 +738,17 @@ struct Watch {
     taskbar_candidate: Option<crate::png::Image>,
     /// A barra de tarefas confirmada (`TASKBAR_OK`).
     taskbar: Option<crate::png::Image>,
+    /// O teste espera o `SHELL_RESTARTED`: depois da área de trabalho (e da
+    /// barra, se o teste a espera), a vigia confirma de novo a área de
+    /// trabalho, com o shell recriado ([`restart_step`]).
+    wants_restart: bool,
+    /// O `SHELL_RESTARTED` já apareceu na serial.
+    restart_seen: bool,
+    /// A leitura anterior, quando ela passou na conferência da área de
+    /// trabalho depois do `SHELL_RESTARTED`.
+    restart_candidate: Option<crate::png::Image>,
+    /// A área de trabalho de volta, confirmada (o segundo `DESKTOP_OK`).
+    restarted: Option<crate::png::Image>,
 }
 
 /// Um passo da vigia da tela (`--watch-screen`) sobre `image`. Na primeira
@@ -749,7 +760,9 @@ struct Watch {
 /// `tela-de-logon.png`, ao lado, e fica em `watch.logon`. Devolve true
 /// quando a vigia acabou (a tela de logon apareceu). Num teste da área de
 /// trabalho ([`Watch::wants_desktop`]), depois do primeiro pixel vai a
-/// [`desktop_step`] em vez da tela de logon.
+/// [`desktop_step`] em vez da tela de logon; com o `SHELL_RESTARTED`
+/// esperado ([`Watch::wants_restart`]), a vigia só acaba com a área de
+/// trabalho de volta ([`restart_step`]).
 fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output: &Mutex<String>) -> bool {
     if !watch.first_seen {
         let Some(description) = screen_check::drawn_pixels(image) else { return false };
@@ -759,8 +772,11 @@ fn watch_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output
         output.lock().unwrap().push_str(&line);
         save_capture(image, first, "primeira tela desenhada", &description);
     }
+    if watch.wants_restart && watch.desktop.is_some() && (!watch.wants_taskbar || watch.taskbar.is_some()) {
+        return restart_step(image, first, watch, output);
+    }
     if watch.wants_taskbar && watch.desktop.is_some() {
-        return taskbar_step(image, first, watch, output);
+        return taskbar_step(image, first, watch, output) && !watch.wants_restart;
     }
     if watch.wants_desktop {
         return desktop_step(image, first, watch, output);
@@ -816,7 +832,42 @@ fn desktop_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, outp
     save_capture(image, &first.with_file_name("area-de-trabalho.png"), "area de trabalho", &description);
     watch.desktop_candidate = None;
     watch.desktop = Some(image.clone());
-    !watch.wants_taskbar
+    !watch.wants_taskbar && !watch.wants_restart
+}
+
+/// A área de trabalho de volta, num teste que espera o `SHELL_RESTARTED`
+/// ([`RESTART_AFTER`]): depois da área de trabalho confirmada (e da barra,
+/// se o teste a espera), o explorer.exe sai e o winlogon.exe o recria. A
+/// vigia espera o marcador na serial (a barra de tarefas do explorer novo
+/// já existe); a leitura em que ele aparece pode ser de antes dele e não
+/// conta. Depois, a mesma conferência da primeira
+/// ([`screen_check::desktop_screen`]): duas leituras seguidas que passam e
+/// são a mesma tela põem no log a descrição e o `DESKTOP_OK` de novo, e a
+/// segunda vai para `area-de-trabalho-reiniciada.png`, ao lado de `first`,
+/// e fica em `watch.restarted`. A barra do explorer que saiu já foi
+/// destruída quando o novo cria a dele, então ela não passa por esta.
+/// Devolve true quando a área de trabalho voltou.
+fn restart_step(image: &crate::png::Image, first: &Path, watch: &mut Watch, output: &Mutex<String>) -> bool {
+    if !watch.restart_seen {
+        watch.restart_seen = output.lock().unwrap().contains(RESTART_AFTER);
+        watch.restart_candidate = None;
+        return false;
+    }
+    let Ok(description) = screen_check::desktop_screen(image) else {
+        watch.restart_candidate = None;
+        return false;
+    };
+    if !watch.restart_candidate.as_ref().is_some_and(|previous| screen_check::same_screen(previous, image)) {
+        watch.restart_candidate = Some(image.clone());
+        return false;
+    }
+    let line = format!("\n[xtask] area de trabalho de volta depois do {RESTART_AFTER} (igual em duas leituras seguidas): {description}\n{DESKTOP_MARKER}\n");
+    print!("{line}");
+    output.lock().unwrap().push_str(&line);
+    save_capture(image, &first.with_file_name("area-de-trabalho-reiniciada.png"), "area de trabalho de volta", &description);
+    watch.restart_candidate = None;
+    watch.restarted = Some(image.clone());
+    true
 }
 
 /// A barra de tarefas na vigia de um teste que espera o `TASKBAR_OK`, depois
@@ -878,6 +929,8 @@ struct ScreenOutcome {
     desktop: Option<crate::png::Image>,
     /// A barra de tarefas que a vigia confirmou.
     taskbar: Option<crate::png::Image>,
+    /// A área de trabalho de volta depois do `SHELL_RESTARTED`.
+    restarted: Option<crate::png::Image>,
 }
 
 /// O passo da espera da thread da tela: o fim do teste a encontra em até
@@ -886,8 +939,8 @@ const SCREEN_STEP: Duration = Duration::from_millis(100);
 
 /// A thread da tela. O QMP atende um cliente por vez, então uma thread só
 /// faz as duas leituras periódicas: a vigia (`watch`, o PNG da primeira
-/// tela desenhada e se o teste espera a área de trabalho ou a barra de
-/// tarefas, a cada
+/// tela desenhada e se o teste espera a área de trabalho, a barra de
+/// tarefas ou a área de trabalho de volta depois do shell recriado, a cada
 /// [`SCREEN_POLL`]) e a série do `--capture-every`
 /// (`frames`); quando as duas vencem juntas, uma leitura serve às duas. Os
 /// prazos contam de `launched` (a subida do QEMU). Devolve a última tela
@@ -896,14 +949,14 @@ fn screen_thread(
     port: u16,
     scratch: PathBuf,
     launched: Instant,
-    watch: Option<(PathBuf, bool, bool)>,
+    watch: Option<(PathBuf, bool, bool, bool)>,
     mut frames: Option<FrameSeries>,
     output: Arc<Mutex<String>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) -> ScreenOutcome {
     use std::sync::atomic::Ordering;
-    let (wants_desktop, wants_taskbar) = watch.as_ref().map_or((false, false), |(_, desktop, taskbar)| (*desktop || *taskbar, *taskbar));
-    let mut state = Watch { wants_desktop, wants_taskbar, ..Watch::default() };
+    let (wants_desktop, wants_taskbar, wants_restart) = watch.as_ref().map_or((false, false, false), |(_, desktop, taskbar, restart)| (*desktop || *taskbar || *restart, *taskbar, *restart));
+    let mut state = Watch { wants_desktop, wants_taskbar, wants_restart, ..Watch::default() };
     let mut watch_at = watch.is_some().then_some(SCREEN_POLL);
     let mut frame = frames.as_ref().map(|series| series.next_index(Duration::ZERO));
     let mut last = None;
@@ -924,7 +977,7 @@ fn screen_thread(
         let elapsed = launched.elapsed();
         if watch_at.is_some_and(|at| at <= elapsed) {
             watch_at = Some(elapsed + SCREEN_POLL);
-            if let (Ok(image), Some((first, _, _))) = (&screen, &watch) {
+            if let (Ok(image), Some((first, _, _, _))) = (&screen, &watch) {
                 if watch_step(image, first, &mut state, &output) {
                     watch_at = None;
                 }
@@ -946,7 +999,7 @@ fn screen_thread(
             last = Some(image);
         }
     }
-    ScreenOutcome { last, frames, logon: state.logon, desktop: state.desktop, taskbar: state.taskbar }
+    ScreenOutcome { last, frames, logon: state.logon, desktop: state.desktop, taskbar: state.taskbar, restarted: state.restarted }
 }
 
 /// Limite de tamanho de uma captura (a tela gráfica é reduzida até caber).
@@ -1835,6 +1888,9 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // O teste da barra de tarefas: depois da área de trabalho, a vigia
     // procura o relógio da barra passando de minuto.
     let taskbar_test = expects(TASKBAR_MARKER);
+    // O teste do shell recriado: depois da área de trabalho, a vigia a
+    // confirma de novo com o explorer.exe que o winlogon recriou.
+    let restart_test = expects(RESTART_AFTER) && desktop_test;
     let nmi_pumper = nmi_port.map(|port| {
         let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
         thread::spawn(move || nmi_pump(port, serial, stop))
@@ -1842,7 +1898,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     let screen_watcher = match (test.watch_screen || test.capture_every.is_some(), qmp_port) {
         (true, Some(qmp)) => {
             let scratch = log.with_file_name("tela.ppm");
-            let first = test.watch_screen.then(|| (log.with_file_name("primeira-tela.png"), desktop_test, taskbar_test));
+            let first = test.watch_screen.then(|| (log.with_file_name("primeira-tela.png"), desktop_test, taskbar_test, restart_test));
             let frames = test.capture_every.map(|every| FrameSeries::new(log.parent().unwrap_or(Path::new(".")), every));
             let (serial, stop) = (Arc::clone(&output), Arc::clone(&screen_stop));
             Some(thread::spawn(move || screen_thread(qmp, scratch, launched, first, frames, serial, stop)))
@@ -2091,7 +2147,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     if let Some(pumper) = nmi_pumper {
         let _ = pumper.join();
     }
-    let ScreenOutcome { last: last_screen, frames, logon, desktop, taskbar } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
+    let ScreenOutcome { last: last_screen, frames, logon, desktop, taskbar, restarted } = screen_watcher.and_then(|watcher| watcher.join().ok()).unwrap_or_default();
     // O teste da tela de logon que falhou diz no log o que faltou na última
     // tela lida.
     let logon_test = test.marker == LOGON_SCREEN_MARKER || test.expect.iter().chain(&test.expect_any).any(|expected| expected == LOGON_SCREEN_MARKER);
@@ -2131,7 +2187,20 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         print!("{line}");
         output.lock().unwrap().push_str(&line);
     }
-    let confirmed = if taskbar_test { taskbar.or(desktop) } else if desktop_test { desktop } else { logon };
+    // O teste do shell recriado que falhou depois da primeira área de
+    // trabalho diz o que faltou na última tela lida.
+    if let (true, Err(_), Some(_), None, Some(last)) = (restart_test, &result, &desktop, &restarted, &last_screen) {
+        let seen = output.lock().unwrap().contains(RESTART_AFTER);
+        let verdict = match (seen, screen_check::desktop_screen(last)) {
+            (false, _) => format!("o {RESTART_AFTER} nao apareceu na serial"),
+            (true, Ok(description)) => format!("passou numa leitura, mas nao em duas seguidas iguais depois do {RESTART_AFTER}: {description}"),
+            (true, Err(missing)) => missing,
+        };
+        let line = format!("\n[xtask] a ultima tela lida nao mostra a area de trabalho de volta: {verdict}\n");
+        print!("{line}");
+        output.lock().unwrap().push_str(&line);
+    }
+    let confirmed = if restart_test { restarted.or(desktop) } else if taskbar_test { taskbar.or(desktop) } else if desktop_test { desktop } else { logon };
     let mut machine = current.into_inner();
     // As capturas do fim saem com o QEMU ainda vivo, passe o teste ou não
     // (prazo esgotado, STOP); se elas falharem, o resultado do teste não
@@ -2412,8 +2481,8 @@ mod tests {
         let (port, server) = fake_qmp(vec![a.clone(), a.clone(), b.clone(), b.clone(), b, a.clone()], Arc::clone(&stop));
         let output = Arc::new(Mutex::new("primeira linha\nultima linha\n".to_string()));
         let frames = FrameSeries::new(&directory, Duration::from_millis(30));
-        let ScreenOutcome { last, frames, logon, desktop, taskbar } = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
-        assert!(logon.is_none() && desktop.is_none() && taskbar.is_none(), "sem a vigia, nada de tela de logon, area de trabalho ou barra");
+        let ScreenOutcome { last, frames, logon, desktop, taskbar, restarted } = screen_thread(port, directory.join("tela.ppm"), Instant::now(), None, Some(frames), output, stop);
+        assert!(logon.is_none() && desktop.is_none() && taskbar.is_none() && restarted.is_none(), "sem a vigia, nada de tela de logon, area de trabalho ou barra");
         assert_eq!(server.join().unwrap(), 6);
         let frames = frames.unwrap();
         assert_eq!((frames.saved, frames.repeated), (3, 3));
@@ -2508,6 +2577,42 @@ mod tests {
         assert!(text.find(DESKTOP_AFTER).unwrap() < text.find(DESKTOP_MARKER).unwrap(), "{text}");
         let saved = crate::png::read_info(&std::fs::read(directory.join("area-de-trabalho.png")).unwrap()).unwrap();
         assert_eq!(saved.text("opennt-resultado"), Some("area de trabalho"));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A vigia de um teste do shell recriado: o primeiro DESKTOP_OK não
+    /// encerra a vigia; o segundo só conta depois do SHELL_RESTARTED, com
+    /// duas leituras seguidas iguais feitas depois dele (a leitura em que ele
+    /// aparece não conta, e a tela sem a barra recomeça), e a tela vai para
+    /// area-de-trabalho-reiniciada.png.
+    #[test]
+    fn watch_confirms_the_desktop_again_after_the_shell_restart() {
+        use crate::screen_check::samples::*;
+        let directory = scratch_dir("watch-restart");
+        let first = directory.join("primeira-tela.png");
+        let output = Mutex::new(String::from("EXPLORER_STARTED\n"));
+        let mut watch = Watch { wants_desktop: true, wants_restart: true, ..Watch::default() };
+        let area = desktop(40, 256, true);
+        for _ in 0..2 {
+            assert!(!watch_step(&area, &first, &mut watch, &output), "o primeiro DESKTOP_OK nao encerra a vigia");
+        }
+        assert!(watch.desktop.is_some());
+        for _ in 0..3 {
+            assert!(!watch_step(&area, &first, &mut watch, &output), "sem o SHELL_RESTARTED a area de trabalho nao conta de novo");
+        }
+        assert_eq!(output.lock().unwrap().matches(DESKTOP_MARKER).count(), 1);
+        output.lock().unwrap().push_str("\nSHELL_RESTARTED\n");
+        let bare = wallpaper();
+        for (image, why) in [(&area, "a leitura do marcador"), (&area, "a candidata"), (&bare, "sem a barra"), (&area, "a candidata de novo")] {
+            assert!(!watch_step(image, &first, &mut watch, &output), "{why}");
+        }
+        assert!(watch_step(&area, &first, &mut watch, &output));
+        assert!(watch.restarted.as_ref() == Some(&area));
+        let text = output.lock().unwrap().clone();
+        assert_eq!(text.matches(DESKTOP_MARKER).count(), 2, "{text}");
+        assert!(text.find(RESTART_AFTER).unwrap() < text.rfind(DESKTOP_MARKER).unwrap(), "{text}");
+        let saved = crate::png::read_info(&std::fs::read(directory.join("area-de-trabalho-reiniciada.png")).unwrap()).unwrap();
+        assert_eq!(saved.text("opennt-resultado"), Some("area de trabalho de volta"));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 

@@ -674,6 +674,11 @@ pub const DESKTOP_MARKER: &str = "DESKTOP_OK";
 /// o explorer.exe que o userinit.exe criou com o token do usuário
 /// (`initial_process.rs`).
 pub const DESKTOP_AFTER: &str = "EXPLORER_STARTED";
+/// Num teste que espera este marcador, a vigia confirma a área de trabalho
+/// uma segunda vez, só com leituras feitas depois dele: o explorer.exe que o
+/// winlogon.exe recriou depois de o shell sair criou a barra de tarefas
+/// (`initial_process.rs`).
+pub const RESTART_AFTER: &str = "SHELL_RESTARTED";
 /// Um pixel da barra de tarefas: nenhum canal acima disto.
 const TASKBAR_DARK: u8 = 0x80;
 /// Uma linha é da barra com pelo menos 3/10 dos pixels escuros (a caixa de
