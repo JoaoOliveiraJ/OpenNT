@@ -67,6 +67,13 @@ pub struct BuildOptions {
     /// `--trace-rpc`: uma linha na serial por mensagem ALPC das portas de
     /// servidor, com a interface e o opnum dos pedidos LRPC.
     pub trace_rpc: bool,
+    /// `--trace-failures`: toda linha `FALHOU` dos serviços de modo usuário
+    /// (sem a opção, cada chamador sai nas quatro primeiras vezes e depois
+    /// uma a cada 256).
+    pub trace_failures: bool,
+    /// `--trace-files`: cada abertura de arquivo do volume e cada consulta de
+    /// atributos de um caminho ausente.
+    pub trace_files: bool,
     /// `--heap-census`: o censo do heap do kernel na serial a cada 4 MB a
     /// mais de uso (`hal::heap_census`).
     pub heap_census: bool,
@@ -182,6 +189,12 @@ impl BuildOptions {
         if self.trace_rpc {
             words.push(String::from(name::TRACE_RPC));
         }
+        if self.trace_failures {
+            words.push(String::from(name::TRACE_FAILURES));
+        }
+        if self.trace_files {
+            words.push(String::from(name::TRACE_FILES));
+        }
         if self.heap_census {
             words.push(String::from(name::HEAP_CENSUS));
         }
@@ -246,6 +259,8 @@ impl BuildOptions {
             start_driver: String::new(),
             trace_driver_api: false,
             trace_rpc: false,
+            trace_failures: false,
+            trace_files: false,
             heap_census: false,
             profile: String::new(),
             slow_service_exit: false,
@@ -538,6 +553,8 @@ mod tests {
             start_driver: String::new(),
             trace_driver_api: false,
             trace_rpc: false,
+            trace_failures: false,
+            trace_files: false,
             heap_census: false,
             profile: String::new(),
             slow_service_exit: false,

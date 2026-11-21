@@ -255,7 +255,10 @@ bytes vivos por local de alocação, na serial a cada 4 MB a mais de uso; `cargo
 heap-census` dá os nomes das funções), `--perfil[=nmi]` (o perfil por amostragem do
 processador de boot em linhas `[pf]` da serial, pelo tique do relógio ou pelas NMIs que o
 `test-boot` injeta a cada 2 ms; `cargo xtask perfil` soma e dá os nomes),
-`--initial-process=smss` (o primeiro processo de
+`--trace-failures` (toda linha `FALHOU` dos serviços de modo usuário; sem a opção, cada
+pid, serviço, status e chamador sai nas quatro primeiras vezes e depois uma a cada 256, com a
+contagem), `--trace-files` (cada abertura de arquivo do volume e cada consulta de atributos de
+um caminho que não existe), `--initial-process=smss` (o primeiro processo de
 usuário passa a ser o smss.exe real, que monta a sessão e cria o csrss.exe; o
 build põe no volume os binários dessa cadeia e o kernel deixa de montar o
 `\KnownDlls` e de imitar o csrss).
@@ -280,7 +283,7 @@ começa do volume que o build montou.
 
 As opções de boot (`--kernel-test-scope`, `--start-driver`, `--kd`,
 `--initial-process`, `--storage`, `--display`, `--pnp-root`,
-`--trace-driver-api`, `--trace-rpc`, `--heap-census`, `--perfil`, `--console-mirror`, `--user-program`) não recompilam o
+`--trace-driver-api`, `--trace-rpc`, `--trace-failures`, `--trace-files`, `--heap-census`, `--perfil`, `--console-mirror`, `--user-program`) não recompilam o
 kernel: vão no bloco de opções de carga da imagem de boot (como as opções de
 boot do Windows no LoadOptions do loader), que o kernel lê ao entrar e mostra
 na serial (`[boot] opcoes de carga: ...`). Só o `--initial-process=smss` muda

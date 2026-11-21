@@ -131,14 +131,41 @@ fn connect_port_name(name: &str, arguments: &[u64; 4]) -> Option<alloc::string::
 /// O retorno do chamador do stub da ntdll (`[rsp]` do RSP de modo usuário
 /// salvo na entrada do syscall, não a pilha de argumentos copiada que os
 /// handlers recebem): o `rip` da linha é sempre o `ret` do próprio stub.
-/// Sai como `módulo+deslocamento` quando o endereço cai num módulo.
-fn stub_caller() -> alloc::string::String {
+fn stub_return() -> u64 {
     let user_stack = state::syscall_record().user_stack;
-    let caller = if user_stack == 0 || !state::probe_user_read(user_stack, 8) { 0 } else { guest::try_read::<u64>(user_stack).unwrap_or(0) };
+    if user_stack == 0 || !state::probe_user_read(user_stack, 8) { 0 } else { guest::try_read::<u64>(user_stack).unwrap_or(0) }
+}
+
+/// O chamador do stub como `módulo+deslocamento` quando o endereço cai num
+/// módulo.
+fn describe_caller(caller: u64) -> alloc::string::String {
     if caller == 0 {
         return alloc::string::String::from("0x0");
     }
     super::crash_report::module_offset(caller)
+}
+
+/// Falhas já vistas por (pid, serviço, status, chamador).
+static FAILURE_LINES: SpinLock<alloc::collections::BTreeMap<(u64, alloc::string::String, u32, u64), u32>> = SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Quantas vezes a falha (pid, serviço, status, chamador) já aconteceu, com
+/// esta, quando ela sai na serial: as quatro primeiras e depois uma a cada
+/// 256, como as `[win32k] FALHOU`; todas com TRACEFAILURES (`--trace-failures`).
+/// Uma falha repetida do mesmo chamador é o padrão comum do Windows (o
+/// NtOpenThreadToken sem personificação, a sondagem de valores do
+/// Registro), e cada byte da serial custa uns 5 us no WHPX.
+fn failure_printed(name: &str, result: u32, caller: u64) -> Option<u32> {
+    if crate::ntos::init::boot_config::trace_failures() {
+        return Some(1);
+    }
+    let key = (process::get_current_process_id(), alloc::string::String::from(name), result, caller);
+    let count = {
+        let mut lines = FAILURE_LINES.lock();
+        let count = lines.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    };
+    super::win32k_status::printed(count).then_some(count)
 }
 
 /// Linhas `negado:` já impressas por (pid, serviço, motivo, tipo).
@@ -205,15 +232,21 @@ pub fn handle_service(name: Option<&str>, arguments: [u64; 4], rip: u64, user_rs
     }
     let failed = result & 0x8000_0000 != 0;
     if failed && (![0xC000_0034, 0xC000_0225, 0x102, 0xC000_0023, 0xC000_0353].contains(&result) || port_name.is_some()) {
-        let mut detail = alloc::string::String::new();
-        if let Some(port) = &port_name {
-            detail = alloc::format!(" porta \"{port}\"");
+        let caller = stub_return();
+        if let Some(count) = failure_printed(name, result, caller) {
+            let mut detail = alloc::string::String::new();
+            if let Some(port) = &port_name {
+                detail = alloc::format!(" porta \"{port}\"");
+            }
+            if let Some(code) = control_code {
+                detail = alloc::format!(" codigo {code:#x}");
+            }
+            detail.push_str(&denial_detail(name, &arguments, result, denial));
+            if count > 4 {
+                detail.push_str(&alloc::format!(" ({count} vezes)"));
+            }
+            crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, describe_caller(caller), detail);
         }
-        if let Some(code) = control_code {
-            detail = alloc::format!(" codigo {code:#x}");
-        }
-        detail.push_str(&denial_detail(name, &arguments, result, denial));
-        crate::debug_print!("[usermode] {}:{} {} FALHOU com {:#x} (rip {:#x}, chamador {}){}", crate::ntos::ps::process::get_current_process_id(), crate::ntos::ps::process::get_current_thread_id(), name, result, rip, stub_caller(), detail);
     }
     Ok(result)
 }

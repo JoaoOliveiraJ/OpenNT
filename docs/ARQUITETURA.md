@@ -4928,7 +4928,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   concedido= falta= imagem=`: a primeira recusa anotada na chamada
   (`state::note_denial`: fora do tipo, DACL/integridade, privilégio, acesso
   do handle, duplicação além da origem, proteção do processo), as quatro
-  primeiras por (pid, serviço, motivo, tipo) e depois uma a cada 64. O
+  primeiras por (pid, serviço, motivo, tipo) e depois uma a cada 64. A
+  própria linha `FALHOU` sai nas quatro primeiras vezes de cada (pid,
+  serviço, status, chamador) e depois uma a cada 256, com ` (N vezes)`, como
+  a `[win32k] FALHOU`: a mesma falha do mesmo chamador é o padrão comum do
+  Windows (o NtOpenThreadToken sem personificação, a sondagem de valores
+  do Registro) e era metade dos 2,4 MB da serial do boot até a barra de
+  tarefas, a uns 5 us por byte. Com `--trace-failures` (TRACEFAILURES) sai
+  toda falha; com `--trace-files` (TRACEFILES), cada abertura de arquivo
+  (`[usermode] arquivo aberto:`; a criação sai sempre) e cada consulta de
+  atributos de um caminho ausente (`[file-io] attributes absent:`). O
   ProductPolicy do licenciamento é capturado quando a hive SYSTEM é ligada
   (o CmGetSystemControlValues, `cm/hive_init.rs`) e publicado logo depois,
   antes do primeiro driver (`init/phase1.rs`). O NtDeleteWnfStateName de um nome permanente ou persistente
@@ -6229,7 +6238,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   `--build-dir`). Cada execução tem a pasta `build/test-all/<id>` (`<id>.<n>`
   com `--repeat`). As opções de boot dos testes (`--kernel-test-scope`,
   `--start-driver`, `--kd`, `--initial-process`, `--storage`, `--display`,
-  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--heap-census`, `--perfil`, `--console-mirror`) não entram no
+  `--pnp-root`, `--usb`, `--tpm`, `--trace-driver-api`, `--trace-rpc`, `--trace-failures`, `--trace-files`, `--heap-census`, `--perfil`, `--console-mirror`) não entram no
   build: vão no bloco de opções de carga da imagem de boot (abaixo), então
   a rodada inteira compila um kernel só. Uma thread monta as imagens
   (`test-boot --build-only`) uma vez por chave de imagem

@@ -402,7 +402,10 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
             return Err(error);
         }
         let status = complete(iosb, 0, information);
-        debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
+        // A criação sai sempre; cada abertura, só com TRACEFILES.
+        if information == 2 || crate::ntos::init::boot_config::trace_files() {
+            debug_print!("[usermode] arquivo {}{} ({} bytes)", if information == 2 { "criado: " } else { "aberto: " }, name, file.size());
+        }
         Ok(status)
     })?;
     Ok(match reparse {
@@ -538,7 +541,11 @@ fn query_attributes(attributes: u64, out: u64, length: u64) -> Result<u32, Kerne
         Err(status) => return Ok(status),
     };
     let Some(file) = volume_files::lookup_volume_file(&name) else {
-        debug_print!("[file-io] attributes absent: {}", name);
+        // A sondagem de um caminho que não existe (o .local, o GAC, os
+        // diretórios de idioma) é o caminho comum do loader e do SxS.
+        if crate::ntos::init::boot_config::trace_files() {
+            debug_print!("[file-io] attributes absent: {}", name);
+        }
         return Ok(0xC000_0034);
     };
     if file.pending_delete() {

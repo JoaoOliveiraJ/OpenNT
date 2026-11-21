@@ -24,6 +24,10 @@ static LENGTH: AtomicUsize = AtomicUsize::new(0);
 /// `TRACERPC`, decidido no [`capture`]: o ALPC consulta a opção a cada
 /// mensagem, e o boot sem ela paga só a leitura desta célula.
 static TRACE_RPC: AtomicBool = AtomicBool::new(false);
+/// `TRACEFAILURES` e `TRACEFILES`, decididos no [`capture`]: consultados a
+/// cada falha de serviço e a cada abertura de arquivo.
+static TRACE_FAILURES: AtomicBool = AtomicBool::new(false);
+static TRACE_FILES: AtomicBool = AtomicBool::new(false);
 
 /// Copia as opções do bloco que o setor de boot deixou em
 /// `BOOT_LOAD_OPTIONS_PHYS` (a memória baixa ainda é a do loader). Chamada
@@ -39,6 +43,8 @@ pub fn capture() {
     unsafe { (&mut *TEXT.0.get())[..text.len()].copy_from_slice(text.as_bytes()) };
     LENGTH.store(text.len(), Ordering::Release);
     TRACE_RPC.store(flag(name::TRACE_RPC), Ordering::Relaxed);
+    TRACE_FAILURES.store(flag(name::TRACE_FAILURES), Ordering::Relaxed);
+    TRACE_FILES.store(flag(name::TRACE_FILES), Ordering::Relaxed);
 }
 
 /// O texto das opções de carga deste boot (vazio sem o bloco).
@@ -93,6 +99,18 @@ pub fn trace_driver_api() -> bool {
 /// respostas (`alpc/rpc_trace`).
 pub fn trace_rpc() -> bool {
     TRACE_RPC.load(Ordering::Relaxed)
+}
+
+/// `TRACEFAILURES` (`--trace-failures`): toda linha `FALHOU` dos serviços
+/// de modo usuário vai para a serial, sem o limite por chamador.
+pub fn trace_failures() -> bool {
+    TRACE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// `TRACEFILES` (`--trace-files`): cada abertura de arquivo do volume e cada
+/// consulta de atributos de um caminho ausente vão para a serial.
+pub fn trace_files() -> bool {
+    TRACE_FILES.load(Ordering::Relaxed)
 }
 
 /// `USERSMP` (`--user-smp`): os APs armam o anel 3 no boot

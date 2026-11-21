@@ -79,6 +79,14 @@ pub const TPM: &str = "TPM";
 /// O teste do processo de console de ponta a ponta no boot comum: o
 /// cmd.exe real com um console sem janela (`test/console_process.rs`).
 pub const CONSOLE_PROCESS: &str = "CONSOLEPROCESS";
+/// Toda linha `FALHOU` dos serviços de modo usuário vai para a serial; sem
+/// a opção, cada (pid, serviço, status, chamador) sai nas quatro primeiras
+/// vezes e depois uma a cada 256, com a contagem.
+pub const TRACE_FAILURES: &str = "TRACEFAILURES";
+/// Cada abertura de arquivo do volume e cada consulta de atributos de um
+/// caminho que não existe vão para a serial (`[usermode] arquivo aberto:`,
+/// `[file-io] attributes absent:`).
+pub const TRACE_FILES: &str = "TRACEFILES";
 /// `timer` ou `nmi`: o perfil por amostragem do processador de boot, pelo
 /// tique do relógio ou pela NMI que o xtask injeta (`kd/sampler.rs`).
 pub const PROFILE: &str = "PROFILE";

@@ -133,6 +133,10 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    --trace-rpc (cada mensagem ALPC das portas de servidor na serial, com a
                    interface e o opnum dos pedidos LRPC e o status das respostas)
                    --heap-census (censo do heap do kernel na serial a cada 4 MB a mais de uso)
+                   --trace-failures (toda linha FALHOU dos servicos de modo usuario; sem a opcao,
+                   cada pid, servico, status e chamador sai nas 4 primeiras vezes e depois a cada 256)
+                   --trace-files (cada abertura de arquivo do volume e cada consulta de atributos
+                   de um caminho ausente)
                    --perfil[=nmi] (perfil por amostragem do processador de boot em linhas [pf]
                    da serial: pelo tique do relogio ou, com nmi, pelas NMIs que o test-boot
                    injeta pelo QMP a cada 2 ms; cargo xtask perfil SERIAL resume)
@@ -270,6 +274,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             start_driver: String::new(),
             trace_driver_api: false,
             trace_rpc: false,
+            trace_failures: false,
+            trace_files: false,
             heap_census: false,
             profile: String::new(),
             slow_service_exit: false,
@@ -347,6 +353,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--start-driver" => parsed.build.start_driver = required()?,
             "--trace-driver-api" => parsed.build.trace_driver_api = true,
             "--trace-rpc" => parsed.build.trace_rpc = true,
+            "--trace-failures" => parsed.build.trace_failures = true,
+            "--trace-files" => parsed.build.trace_files = true,
             "--heap-census" => parsed.build.heap_census = true,
             "--perfil" => parsed.build.profile = value.clone().unwrap_or_else(|| String::from("timer")),
             "--slow-service-exit" => parsed.build.slow_service_exit = true,
