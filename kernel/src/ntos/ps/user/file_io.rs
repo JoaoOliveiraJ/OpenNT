@@ -1477,7 +1477,7 @@ fn query_directory(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64
                 entries.insert(0, (String::from("."), directory_path.clone()));
             }
             let entries = entries.into_iter().filter(|(name, _)| matches(&pattern, name)).collect();
-            *user_file.enumeration.lock() = Some(file_objects::Enumeration { pattern: pattern.clone(), entries, cursor: 0 });
+            *user_file.enumeration.lock() = Some(file_objects::Enumeration { pattern: pattern.clone(), entries: Arc::new(entries), cursor: 0 });
         }
         let (entries, mut cursor) = {
             let scan = user_file.enumeration.lock();

@@ -29,8 +29,9 @@ static OPEN_FILES: SpinLock<BTreeMap<u64, Weak<UserFile>>> = SpinLock::new(BTree
 #[derive(Clone)]
 pub struct Enumeration {
     pub pattern: String,
-    /// (nome, caminho no volume).
-    pub entries: Vec<(String, String)>,
+    /// (nome, caminho no volume), lidos na primeira consulta (ou no
+    /// recomeço) e divididos com cada consulta seguinte sem cópia.
+    pub entries: Arc<Vec<(String, String)>>,
     pub cursor: usize,
 }
 
