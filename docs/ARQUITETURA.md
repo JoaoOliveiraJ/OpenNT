@@ -4448,11 +4448,15 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   - O NTFS interno lê os registros do MFT e os blocos INDX dos diretórios
     pelo cache de setores (`drivers/storage/sector_cache.rs`), como o NTFS
     do Windows os lê pelo Cache Manager: unidades alinhadas de 4 KB em
-    frames do PFN (até 16 MB, com despejo da menos usada). Toda escrita no
-    disco passa pelo `ata_pio::write_sectors` (ou a versão PIO), que tira
-    do cache as unidades cobertas antes e depois do comando; uma leitura
-    que cruzou uma escrita não entra no cache, e as escritas pendentes de
-    uma transação continuam sobrepostas pelo volume. Antes, cada `stat`,
+    frames do PFN (até 1/64 da RAM e 16 MB, com despejo da menos usada). O
+    cache é o primeiro provedor de residência: na pressão do PFN ele
+    devolve frames antes de qualquer página ir para o arquivo de paginação.
+    Toda escrita do OpenNT no disco passa pelo `ata_pio::write_sectors` (ou
+    a versão PIO), que tira do cache as unidades cobertas antes e depois do
+    comando; uma leitura que cruzou uma escrita não entra no cache, e as
+    escritas pendentes de uma transação continuam sobrepostas pelo volume.
+    Com `--storage=real` o cache se esvazia e deixa de guardar antes de o
+    atapi.sys assumir a controladora. Antes, cada `stat`,
     passo de caminho e enumeração de diretório lia o disco de novo: no boot
     até a barra de tarefas, um terço do tempo da CPU ia para o DMA dessas
     leituras.

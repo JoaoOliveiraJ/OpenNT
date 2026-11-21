@@ -56,6 +56,9 @@ pub fn init() {
     crate::ntos::kd::initialize(); // depurador do kernel (`--kd`): KdInitSystem com o transporte serial
     crate::ntos::kd::sampler::initialize(); // perfil por amostragem (`--perfil`)
     crate::ntos::mm::user_half::assert_user_only(); // trampolim desfeito: nada do kernel abaixo de MmSystemRangeStart
+    // o cache de metadados do disco: o primeiro provedor de residência, que
+    // devolve frames ao PFN antes de qualquer página ir para o disco
+    crate::drivers::storage::sector_cache::initialize().unwrap_or_else(|error| panic!("cache de metadados: {error}"));
     crate::ntos::mm::image_paging::init().unwrap_or_else(|error| panic!("image paging: {error}"));
     kernel_pool::init(); // pool executivo (paginável com apoio no NTFS)
     dump_mdl::init().unwrap_or_else(|error| panic!("dump MDL: {error}"));
