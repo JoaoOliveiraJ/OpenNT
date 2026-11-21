@@ -3643,6 +3643,34 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   chama o callback deles ou o KeBugCheckEx com o código (o win32kbase usa
   WIN32K_POWER_WATCHDOG_TIMEOUT, 0x19C, cujo estágio vai ao boot status
   data).
+- **Power Dependency Coordinator** (`po/pdc.rs`, `po/processor_power.rs`):
+  o pdc.sys real é carregado como na instalação (serviço `pdc`, início de
+  boot no grupo Boot Bus Extender, `cm/service/inbox_drivers.rs`). O kernel
+  só faz a parte dele: o NtPowerInformation 67 (só de modo kernel; entrada
+  de 0xB8 bytes e saída nula ou de 0xA0, senão STATUS_INVALID_PARAMETER)
+  com o tipo 0, o PopPdcRegister (os 22 ponteiros do pdc.sys no
+  PoPdcCallbacks e as 20 rotinas PdcPo* na saída, na ordem da tabela do
+  19041, cada uma um stub de `hal/amd64/routine_stubs.rs`), e o tipo 1, o
+  registro de cliente de kernel pelo PoPdcCallbacks+0x20 (antes do
+  registro, STATUS_NOT_IMPLEMENTED). Com isso o pdc.sys cria a `\PdcPort`,
+  o UMPDC.dll do DcomLaunch conecta, o HampManagerAllocateState do
+  PsmServiceExtHost.dll registra o cliente de ativação e os servidores RPC
+  do HAM sobem (o Lifetime Manager do sihost precisa deles). Os perfis de
+  desempenho do PPM que o pdc.sys registra (PpmRegisterProfiles: até 0x1F
+  perfis de 0x15B0 bytes com nome, índice, GUID e o BOOLEAN da entrada) e
+  aplica (PpmApplyProfile: o perfil corrente e o bit de aplicado) ficam
+  guardados. Lacunas reais, cada uma com uma linha `[po]` na primeira
+  chamada: a política de desempenho do processador e o PpmDefaultProfile
+  (os perfis não mudam nada); a ação de energia (PopExecutePowerAction); o
+  motor de políticas que refaz as políticas quando um botão aparece; a
+  gravação da transição de energia no bootstat.dat; o agregador de energia
+  e a contabilidade do connected standby (fases do PDC, saída do CS, DRIPS,
+  resiliência de rede); a coalescência profunda de E/S; o Sleep Study e o
+  log de pedidos de energia. O autoteste da fase 6
+  (`test/power_io_support.rs`) confere o nível 67: as validações, o registro
+  com um PDC sintético (quando o pdc.sys não está carregado), o cliente de
+  kernel e as rotinas da tabela, os perfis do PPM inclusive; o [[teste]]
+  `sihost` confere que o pdc.sys criou a `\PdcPort`.
 - **Desligamento e reinício** (`po/shutdown.rs`, `io/shutdown.rs`,
   `ex/shutdown.rs`, `hal/firmware_return.rs`): NtShutdownSystem e o
   NtSetSystemPowerState das ações de desligamento, de modo kernel e de

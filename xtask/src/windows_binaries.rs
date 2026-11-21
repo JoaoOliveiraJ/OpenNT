@@ -102,6 +102,10 @@ const NTFS_FILES: &[(&str, &str)] = &[
     // 05110 abaixo, o CEA.sys.
     ("MONITOR.SYS", "System32/drivers/monitor.sys"),
     ("CEA.SYS", "System32/drivers/CEA.sys"),
+    // O Power Dependency Coordinator, driver de boot da instalação no boot
+    // do processo inicial real (o serviço pdc de `cm/service/inbox_drivers.rs`),
+    // que também importa o CEA.sys; a assinatura vem embutida.
+    ("PDC.SYS", "System32/drivers/pdc.sys"),
     ("Windows/INF/monitor.inf", "INF/monitor.inf"),
     (
         "Windows/System32/CatRoot/{F750E6C3-38EE-11D1-85E5-00C04FC295EE}/Microsoft-Windows-Client-Desktop-Required-Package01~31bf3856ad364e35~amd64~~10.0.19041.6456.cat",

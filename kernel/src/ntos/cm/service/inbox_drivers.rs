@@ -89,6 +89,15 @@
 //! Parameters\UseDCLocatorSiteName) e o file system UDF (udfs, Start 4,
 //! Group "Boot File System").
 //!
+//! O Power Dependency Coordinator (pdc, Type 1, Start 0, ErrorControl 3,
+//! Group "Boot Bus Extender" na instalação) volta ao Start 0 da instalação
+//! no boot do processo inicial real e é carregado com os drivers de boot:
+//! o DriverEntry dele registra o PDC no Po (ZwPowerInformation 67,
+//! `po/pdc.rs`) e cria a porta ALPC \PdcPort, à qual o UMPDC.dll dos
+//! serviços (o gerenciador de recursos do PsmServiceExtHost.dll no
+//! BrokerInfrastructure, que sobe os servidores RPC do Host Activity
+//! Manager) conecta. Nos outros boots ele fica sob demanda.
+//!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): cada driver com os
 //! valores que o banco de serviços grava numa instalação seguidos de Group,
 //! Tag e os DWORDs próprios.
@@ -106,6 +115,7 @@ const FILE_SYSTEMS: &[&str] = &["Ntfs", "fastfat"];
 const SERVICE_RECOGNIZER_DRIVER: u32 = 8;
 /// `Npfs\Aliases`: (pipe, aliases) como REG_MULTI_SZ.
 const NPFS_ALIASES: &[(&str, &[&str])] = &[("lsass", &["protected_storage", "netlogon", "lsarpc", "samr"]), ("ntsvcs", &["svcctl"])];
+const SERVICE_BOOT_START: u32 = 0;
 const SERVICE_SYSTEM_START: u32 = 1;
 const SERVICE_DEMAND_START: u32 = 3;
 
@@ -187,6 +197,7 @@ const DRIVERS: &[InboxDriver] = &[
     InboxDriver { name: "afunix", display_name: Some("afunix"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("\\SystemRoot\\system32\\drivers\\afunix.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "PNP_TDI", tag: None, dwords: &[] },
     InboxDriver { name: "Mup", display_name: Some("@%systemroot%\\system32\\drivers\\mup.sys,-101"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("System32\\Drivers\\mup.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: None, dwords: &[] },
     InboxDriver { name: "DfsC", display_name: Some("@%systemroot%\\system32\\wkssvc.dll,-1008"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("System32\\Drivers\\dfsc.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Network", tag: None, dwords: &[] },
+    InboxDriver { name: "pdc", display_name: Some("@%SystemRoot%\\system32\\drivers\\pdc.sys,-100"), service_type: SERVICE_KERNEL_DRIVER, image_path: Some("system32\\drivers\\pdc.sys"), start: SERVICE_DEMAND_START, smss_start: Some(SERVICE_BOOT_START), error_control: 3, group: "Boot Bus Extender", tag: None, dwords: &[] },
     InboxDriver { name: "udfs", display_name: Some("udfs"), service_type: SERVICE_FILE_SYSTEM_DRIVER, image_path: Some("system32\\DRIVERS\\udfs.sys"), start: SERVICE_DEMAND_START, smss_start: None, error_control: 1, group: "Boot File System", tag: None, dwords: &[] },
 ];
 
