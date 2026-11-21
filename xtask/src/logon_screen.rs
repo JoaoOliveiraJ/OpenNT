@@ -349,10 +349,22 @@ pub fn software_keys() -> Vec<HostKey> {
         // ZoneCheckUrlExW do urlmon a política da ação na zona do arquivo, e
         // sem as zonas o urlmon responde E_FAIL com URLPOLICY_DISALLOW: o
         // ShellExecute da caixa Executar volta ERROR_CANCELLED e o programa
-        // não abre. O resto de `Internet Settings` (proxy, cache, sites do
+        // não abre. As zonas do bloqueio da máquina local
+        // (`Lockdown_Zones`, as mesmas cinco) também: o
+        // CUrlZoneManager::Initialize do urlmon (0x596f0) liga dois
+        // CRegZoneContainer, o das `Zones` e o das `Lockdown_Zones`, e o
+        // EnumerateAndLoadZones do segundo, sem a chave nem na política nem
+        // em `Internet Settings`, volta E_FAIL. Então o primeiro
+        // InternetCreateZoneManager do processo falha, o
+        // MapUrlToZoneEx2Internal devolve E_UNEXPECTED e o ZoneCheckFile
+        // recusa o .exe (o `launchtm.exe` do Ctrl+Shift+Esc saía com
+        // 0xfffffffe sem abrir o Taskmgr.exe, e o primeiro Executar de cada
+        // explorer.exe falhava); as chamadas seguintes do mesmo processo
+        // acham os dois contêineres já criados e passam. O resto de
+        // `Internet Settings` (proxy, cache, sites do
         // mapa de zonas, agente de usuário) é desta máquina e fica fora.
         let internet = "Microsoft\\Windows\\CurrentVersion\\Internet Settings";
-        for path in ["Zones", "ZoneMap\\ProtocolDefaults"] {
+        for path in ["Zones", "Lockdown_Zones", "ZoneMap\\ProtocolDefaults"] {
             registry::copy(registry::LOCAL_MACHINE, &format!("SOFTWARE\\{internet}\\{path}"), &format!("{internet}\\{path}"), true, &mut keys);
         }
     }
