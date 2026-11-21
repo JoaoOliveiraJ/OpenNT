@@ -12763,11 +12763,16 @@ fn ke_service_tables_exports(assert: Assert) {
     // SAFETY: vetores de exports dentro da imagem de teste.
     let (functions, names, ordinals) = unsafe { (nt::Field::<u32>::array_at(image + 0x240, 6), nt::Field::<u32>::array_at(image + 0x260, 6), nt::Field::<u16>::array_at(image + 0x280, 6)) };
     for (index, &(name, rva)) in exports.iter().enumerate() {
-        let name_rva = 0x2A0 + index as u32 * 0x20;
-        guest::write_bytes(image + name_rva as u64, name);
+        guest::write_bytes(image + 0x2A0 + index as u64 * 0x20, name);
         functions[index].set(rva);
-        names[index].set(name_rva);
-        ordinals[index].set(index as u16);
+    }
+    // A tabela de nomes em ordem lexical, como o PE a guarda (o
+    // RtlFindExportedRoutineByName faz a busca binária nela).
+    let mut sorted: alloc::vec::Vec<usize> = (0..exports.len()).collect();
+    sorted.sort_by_key(|&index| exports[index].0);
+    for (slot, &index) in sorted.iter().enumerate() {
+        names[slot].set(0x2A0 + index as u32 * 0x20);
+        ordinals[slot].set(index as u16);
     }
     let main_rvas = [0x600u32, 0x10, 0x7F0];
     let main_arguments = [0u8, 8, 0x34];
@@ -12795,8 +12800,10 @@ fn ke_service_tables_exports(assert: Assert) {
     let decoded = main_values.iter().zip(main_rvas.iter().zip(&main_arguments)).all(|(&value, (&rva, &bytes))| service_table::decode_entry(image + 0x400, value) == (image + rva as u64, bytes as u32 / 4));
     assert(decoded, "ke-service-tables: entradas compactadas decodificam como o KiSystemCall64 (nt_service_lookup)");
     // Sem os exports da tabela filtro: STATUS_PROCEDURE_NOT_FOUND e nada muda.
+    // O W32pServiceLimitFilter (a posição 3 da tabela em ordem) troca de
+    // nome por um que fica na mesma posição.
     names[3].set(0x2A0 + 7 * 0x20);
-    guest::write_bytes(image + 0x2A0 + 7 * 0x20, b"Outro\0");
+    guest::write_bytes(image + 0x2A0 + 7 * 0x20, b"W32pServiceLimitFilte\0");
     let missing = crate::ntos::mm::sysload::compact_service_tables(image);
     assert(matches!(missing, Ok(0xC000_007A)) && main_table[0].get() == 0x2000, "ke-service-tables: export W32p ausente devolve STATUS_PROCEDURE_NOT_FOUND");
     guest::free_bytes(image);

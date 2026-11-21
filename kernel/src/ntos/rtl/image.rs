@@ -145,10 +145,13 @@ pub fn pc_to_file_name(pc: u64, file_name: u64) -> Result<u32, crate::rtl::Kerne
     Ok(0)
 }
 
-/// RtlFindExportedRoutineByName(PVOID ImageBase, PCCH Name): varre a EDATA
-/// de uma imagem carregada e devolve o VA do export (NULL em forwarder).
+/// RtlFindExportedRoutineByName(PVOID ImageBase, PCCH Name) (19041
+/// 0x6129c0): a busca binária na tabela de nomes da EDATA de uma imagem
+/// carregada (o PE a guarda em ordem lexical), com a comparação de bytes sem
+/// sinal do strcmp; achado o nome, o ordinal dele precisa estar abaixo de
+/// NumberOfFunctions, e um endereço dentro do próprio diretório de exports
+/// (um forwarder) dá NULL.
 pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {
-    let target = crate::ntos::rtl::guest_strings::read_c_string(name_pointer);
     let size_cell = guest::alloc_bytes(4);
     let directory = directory_entry(base, true, 0, size_cell).unwrap_or(0);
     // SAFETY: célula ULONG alocada acima.
@@ -157,25 +160,46 @@ pub fn find_exported_routine_by_name(base: u64, name_pointer: u64) -> u64 {
     if directory == 0 {
         return 0;
     }
-    let export_rva = directory.wrapping_sub(base); // directory = base + export_rva
     // SAFETY: diretório de exports de uma imagem carregada (validada pelo loader).
     let exports = unsafe { ImageExportDirectory::at(directory) };
-    let number_of_names = exports.number_of_names.get() as usize;
-    let functions = base + exports.address_of_functions.get() as u64;
-    let names = guest::read_bytes(base + exports.address_of_names.get() as u64, number_of_names * 4);
-    let ordinals = guest::read_bytes(base + exports.address_of_name_ordinals.get() as u64, number_of_names * 2);
-    for index in 0..number_of_names {
-        let name_rva = u32::from_le_bytes([names[index * 4], names[index * 4 + 1], names[index * 4 + 2], names[index * 4 + 3]]) as u64;
-        if crate::ntos::rtl::guest_strings::read_c_string(base + name_rva) == target {
-            let ordinal = u16::from_le_bytes([ordinals[index * 2], ordinals[index * 2 + 1]]) as u64;
-            let function_rva = guest::read::<u32>(functions + ordinal * 4) as u64;
-            if function_rva >= export_rva && function_rva < export_rva + directory_size {
-                return 0; // forwarder
+    let names = base + exports.address_of_names.get() as u64;
+    let (mut low, mut high) = (0i64, exports.number_of_names.get() as i32 as i64 - 1);
+    while low <= high {
+        let middle = (low + high) >> 1;
+        let name = base + guest::read::<u32>(names + middle as u64 * 4) as u64;
+        match compare_c_strings(name_pointer, name) {
+            core::cmp::Ordering::Less => high = middle - 1,
+            core::cmp::Ordering::Greater => low = middle + 1,
+            core::cmp::Ordering::Equal => {
+                let ordinal = guest::read::<u16>(base + exports.address_of_name_ordinals.get() as u64 + middle as u64 * 2) as u32;
+                if ordinal >= exports.number_of_functions.get() {
+                    return 0;
+                }
+                let address = base + guest::read::<u32>(base + exports.address_of_functions.get() as u64 + ordinal as u64 * 4) as u64;
+                if address > directory && address < directory + directory_size {
+                    return 0;
+                }
+                return address;
             }
-            return base + function_rva;
         }
     }
     0
+}
+
+/// O strcmp de duas strings C de memória do kernel, byte a byte sem sinal,
+/// sem copiá-las.
+fn compare_c_strings(left: u64, right: u64) -> core::cmp::Ordering {
+    let mut offset = 0u64;
+    loop {
+        let (a, b) = (guest::read8(left + offset), guest::read8(right + offset));
+        if a != b {
+            return a.cmp(&b);
+        }
+        if a == 0 {
+            return core::cmp::Ordering::Equal;
+        }
+        offset += 1;
+    }
 }
 
 pub mod pe_metadata_reader {
