@@ -3000,7 +3000,12 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   despacha os cinco Pcw* para ele: PcwRegister, PcwUnregister,
   PcwCreateInstance, PcwCloseInstance e PcwAddInstance, as rotinas 0 a 4 da
   tabela, como no ntoskrnl 19041; sem a extensão, o status do
-  ExpPcwDisabledStatus pelo Start do serviço pcw), a autorização (id 2, o ksecdd.sys) e o BCrypt
+  ExpPcwDisabledStatus pelo Start do serviço pcw; com a extensão, a
+  notificação ExpPcwHostCallback registra no pcw.sys os conjuntos de
+  contadores do kernel, Processor Information, em
+  `ex/processor_counter_set.rs`, e FileSystem Disk Activity, em
+  `fsrtl/volume_support.rs`, com as rotinas de callback como rotinas por
+  ponteiro de `hal/amd64/routine_stubs.rs`), a autorização (id 2, o ksecdd.sys) e o BCrypt
   (id 3, o cng.sys) do Se (`se/extension_hosts.rs`) e o controle de taxa de
   rede (id 4, o tcpip.sys) do Ps (`ps/net_rate_control.rs`).
 - **Consultas de token** (`se/token/query.rs`): o NtQueryInformationToken
@@ -7942,11 +7947,18 @@ lê a lista de processos pela SystemProcessInformation (a memória de cada
 processo na aba Processos, que o teste abre com Alt+D) e consulta os
 contadores de processador pelo pcwum.dll e o `\Device\PcwDrv`
 do pcw.sys, que no boot do processo inicial real é driver de boot, como na
-instalação. Os conjuntos de contadores do próprio kernel (o
-ExpPcwHostCallback do 19041, que registra Processor Information,
-Synchronization, FileSystem Disk Activity, Thermal Zone Information e os
-do ETW quando o pcw.sys liga a extensão) ainda não existem; o Taskmgr.exe
-consulta o Processor Information e o FileSystem Disk Activity.
+instalação. Quando o pcw.sys liga a extensão, o ExpPcwHostCallback
+(`ex/pcw.rs`) registra os conjuntos de contadores do próprio kernel que o
+Taskmgr.exe consulta: Processor Information (`ex/processor_counter_set.rs`,
+o ExProcessorCounterSetCallback com uma instância por processador, uma
+por nó e a _Total, e os 0xc8 bytes do ExpQueryProcessorInformationCounters
+tirados do tempo que `ke/processor_information` cobra de cada processador
+e da KPRCB; a "% Processor Utility" dá o CPU total da aba Processos) e
+FileSystem Disk Activity (`fsrtl/volume_support.rs`, a soma dos
+KPRCB.FsCounters). O CPU de cada processo vem dos tempos da lista de
+processos. Os outros conjuntos do 19041 (Synchronization,
+SynchronizationNuma, Thermal Zone Information e os dois do ETW) ainda não
+são registrados.
 
 ## 7. O nome OpenNT nos arquivos
 

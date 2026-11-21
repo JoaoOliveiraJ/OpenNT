@@ -132,8 +132,11 @@ pub fn charge_processor_time(kernel: bool, elapsed_100ns: u64) {
 
 /// Os tempos de um processador em 100 ns, arredondados para baixo ao tick
 /// (a contagem de ticks do NT vezes o KeMaximumIncrement): (IdleTime,
-/// KernelTime, UserTime).
-fn processor_times(cpu: usize) -> (i64, i64, i64) {
+/// KernelTime, UserTime). O KernelTime inclui o ocioso, como o do
+/// PoGetIdleTimes; os contadores de desempenho do processador
+/// (`ex/processor_counter_set`) leem os mesmos valores.
+pub fn processor_times(cpu: usize) -> (i64, i64, i64) {
+    let cpu = cpu.min(MAX_CPUS - 1);
     let increment = super::clock::MAXIMUM_INCREMENT as u64;
     let ticks = |value: u64| (value / increment * increment) as i64;
     let elapsed = super::clock::uptime_100ns();

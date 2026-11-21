@@ -25,7 +25,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::hal::amd64::native_call;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{FileObject, Guid, ObjectAttributes, WorkQueueItem};
+use crate::hal::amd64::routine_stubs::Routine;
+use crate::ntos::inc::types::{FileObject, Guid, ObjectAttributes, PcwCallbackInformation, UnicodeString, WorkQueueItem};
+use crate::ntos::init::exports::Call;
 use crate::ntos::ke::pcr;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::mm::shared_user_data;
@@ -117,6 +119,74 @@ pub fn update_disk_counters(bytes_read: u64, bytes_written: u64) {
         counters.fs_bytes_written.atomic().fetch_add(bytes_written, Ordering::SeqCst);
     }
 }
+
+// ---- O conjunto de contadores "FileSystem Disk Activity" ------------------
+//
+// FsRtlDiskIOCounterSetCallback (ntoskrnl 19041, rva 0x88c150), registrado
+// pelo ExpPcwHostCallback com os dois descritores do
+// PcwpRegisterFileSystemDiskIOCounterSet (rva 0xe530): a instância única
+// "default" (id 0) com os 0x10 bytes dos FsBytesRead e FsBytesWritten. A
+// enumeração (2) a entrega sem dados (Data NULL, Size 0x10) e devolve só
+// uma falha; a coleta (3), pelo FsRtlAddDiskIOCounterInstance (0x88c07c),
+// com a soma dos KPRCB.FsCounters dos processadores ativos e o status do
+// PcwAddInstance.
+
+/// O nome do conjunto.
+pub const DISK_IO_COUNTER_SET_NAME: &str = "FileSystem Disk Activity";
+/// Os PCW_COUNTER_DESCRIPTOR: (Id, StructIndex, Offset, Size).
+pub const DISK_IO_COUNTER_DESCRIPTORS: [(u16, u16, u16, u16); 2] = [(0, 0, 0, 8), (1, 0, 8, 8)];
+const DISK_IO_INSTANCE: &str = "default";
+
+/// FsRtlDiskIOCounterSetCallback(Type, Info, Context).
+pub fn disk_io_counter_set_callback(callback_type: u32, information: &PcwCallbackInformation) -> u32 {
+    let collect = match callback_type {
+        2 => false,
+        3 => true,
+        _ => return 0,
+    };
+    let buffer = if collect { information.collect_data.buffer.get() } else { information.enumerate_instances.buffer.get() };
+    // O UNICODE_STRING, o nome, os dois contadores e o PCW_DATA.
+    let block = guest::alloc_bytes(0x40);
+    if block == 0 {
+        return 0xC000_009A;
+    }
+    let (name, text, values, data) = (block, block + 0x10, block + 0x20, block + 0x30);
+    let units: alloc::vec::Vec<u8> = DISK_IO_INSTANCE.encode_utf16().flat_map(|unit| unit.to_le_bytes()).collect();
+    guest::write_bytes(text, &units);
+    // SAFETY: o UNICODE_STRING no começo do bloco.
+    let string = unsafe { UnicodeString::at(name) };
+    string.length.set(units.len() as u16);
+    string.maximum_length.set(units.len() as u16);
+    string.buffer.set(text);
+    if collect {
+        let (mut read, mut written) = (0u64, 0u64);
+        let processors = crate::ntos::ke::processor_group::active_processor_count_ex(0xFFFF) as u32;
+        for index in 0..processors {
+            if let Some(prcb) = pcr::processor_block(index) {
+                read = read.wrapping_add(prcb.fs_counters.fs_bytes_read.get());
+                written = written.wrapping_add(prcb.fs_counters.fs_bytes_written.get());
+            }
+        }
+        guest::write64(values, read);
+        guest::write64(values + 8, written);
+    }
+    guest::write64(data, if collect { values } else { 0 });
+    guest::write64(data + 8, 0x10);
+    let status = crate::ntos::ex::pcw::add_instance(buffer, name, 0, 1, data);
+    guest::free_bytes(block);
+    if collect || status & 0x8000_0000 != 0 { status } else { 0 }
+}
+
+fn disk_io_counter_set_routine(call: &Call) -> Result<u64, KernelError> {
+    if call.arg(2) == 0 {
+        return Ok(0);
+    }
+    // SAFETY: o PCW_CALLBACK_INFORMATION que o pcw.sys passa.
+    Ok(disk_io_counter_set_callback(call.arg(1) as u32, unsafe { PcwCallbackInformation::at(call.arg(2)) }) as u64)
+}
+
+/// A rotina entregue ao pcw.sys no registro do conjunto.
+pub const ROUTINES: &[Routine] = &[Routine { name: "FsRtlDiskIOCounterSetCallback", handler: disk_io_counter_set_routine }];
 
 /// FsRtlPostStackOverflow / FsRtlPostPagingFileStackOverflow(Context, Event,
 /// StackOverflowRoutine).

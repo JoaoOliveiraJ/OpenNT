@@ -45,6 +45,7 @@ pub mod exports;
 pub mod interlocked;
 pub mod processor_usage;
 pub mod pcw;
+pub mod processor_counter_set;
 pub mod processor_feature;
 pub mod auto_expand_push_lock;
 pub mod shutdown;

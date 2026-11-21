@@ -50,9 +50,10 @@ pub struct Routine {
 /// Tabela das rotinas, na ordem dos slots. Cada assunto expõe as suas
 /// (`hal::dma`, `drivers::bus::pci_interface`, `hal::acpi_pm`,
 /// `hal::system_information`, `io::pnp::device_api`, `etw::user_registration`, `hal::pnp`,
-/// `mm::prefetcher_file_info`, `hal::dma_v3`, `po::power_request`, `etw::realtime`, `po::pdc`) e só entra aqui pela lista.
+/// `mm::prefetcher_file_info`, `hal::dma_v3`, `po::power_request`, `etw::realtime`, `po::pdc`, `ex::pcw`,
+/// `ex::processor_counter_set`, `fsrtl::volume_support`) e só entra aqui pela lista.
 fn routines() -> &'static [&'static [Routine]] {
-    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES, crate::hal::acpi_pm::ROUTINES, crate::hal::system_information::ROUTINES, crate::ntos::io::pnp::device_api::ROUTINES, crate::ntos::etw::user_registration::ROUTINES, crate::hal::pnp::ROUTINES, crate::ntos::mm::prefetcher_file_info::ROUTINES, crate::hal::dma_v3::ROUTINES, crate::ntos::po::power_request::ROUTINES, crate::ntos::etw::realtime::ROUTINES, crate::ntos::po::pdc::ROUTINES]
+    &[crate::hal::dma::ROUTINES, crate::drivers::bus::pci_interface::ROUTINES, crate::hal::acpi_pm::ROUTINES, crate::hal::system_information::ROUTINES, crate::ntos::io::pnp::device_api::ROUTINES, crate::ntos::etw::user_registration::ROUTINES, crate::hal::pnp::ROUTINES, crate::ntos::mm::prefetcher_file_info::ROUTINES, crate::hal::dma_v3::ROUTINES, crate::ntos::po::power_request::ROUTINES, crate::ntos::etw::realtime::ROUTINES, crate::ntos::po::pdc::ROUTINES, crate::ntos::ex::pcw::ROUTINES, crate::ntos::ex::processor_counter_set::ROUTINES, crate::ntos::fsrtl::volume_support::ROUTINES]
 }
 
 /// Slot global da rotina `name` (busca linear: chamada na montagem das tabelas).
