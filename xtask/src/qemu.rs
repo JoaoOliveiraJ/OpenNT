@@ -2101,9 +2101,12 @@ impl Drop for QemuProcess {
 /// Falhas na serial: pânico do Rust, exceção de kernel, autoteste (também o
 /// da pressão de memória, `MEMORY_PRESSURE FALHOU`, que antes só aparecia
 /// quando o prazo de 30 min do teste vencia), a parada fatal do KeBugCheckEx
-/// (`*** STOP`, que sempre para a máquina) e a hora do convidado longe da do
-/// hospedeiro (`*** RELOGIO`, que o test-boot acrescenta).
-pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "MEMORY_PRESSURE FALHOU", "*** STOP", "*** RELOGIO"];
+/// (`*** STOP`, que sempre para a máquina), a hora do convidado longe da do
+/// hospedeiro (`*** RELOGIO`, que o test-boot acrescenta) e a falta de zero
+/// sob demanda recusada com spin lock retido (`*** ZERO SOB DEMANDA
+/// RECUSADO`, o bugcheck IRQL_NOT_LESS_OR_EQUAL do 19041: um defeito de quem
+/// tocou a página).
+pub const FAILURE_MARKERS: &[&str] = &["*** PANIC", "*** EXCECAO", "SELFTEST FALHOU", "MEMORY_PRESSURE FALHOU", "*** STOP", "*** RELOGIO", "*** ZERO SOB DEMANDA RECUSADO"];
 
 /// O começo do motivo de um QEMU que saiu com erro sem evento SHUTDOWN do
 /// QMP: morto de fora (o dono da máquina fecha os QEMUs quando o PC fica

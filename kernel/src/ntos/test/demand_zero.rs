@@ -22,8 +22,10 @@
 //! - Spin locks: com um spin lock de outro estado retido, a sonda e o acesso
 //!   confiável a uma página não tocada são atendidos (o caso que o kernel do
 //!   OpenNT tem e o NT não); com a trava da própria região retida, a sonda
-//!   devolve STATUS_ACCESS_VIOLATION, a recusa é contada e a CPU não trava;
-//!   solta a trava, a mesma sonda é atendida.
+//!   devolve STATUS_ACCESS_VIOLATION, a recusa é contada (na conta do
+//!   autoteste, `page_fault::capture_refusals`, fora da de defeitos, que
+//!   fica como estava) e a CPU não trava; solta a trava, a mesma sonda é
+//!   atendida.
 //! - O decommit de páginas não tocadas devolve o commit delas.
 
 use crate::ntos::inc::field::NtStruct;
@@ -204,15 +206,19 @@ pub fn run(assert: Assert) {
     })
     .unwrap_or(false);
     assert(under_lock && page_fault::refused_faults() == refused && pte(root, base + 50 * PAGE) & 1 != 0 && pte(root, base + 51 * PAGE) & 1 != 0, "zero sob demanda: com um spin lock alheio retido, a sonda e o acesso confiavel sao atendidos");
-    let (blocked, retried) = process_context::with_process(process, || {
-        let blocked = {
-            let _region = private.state.lock();
-            guest::try_read::<u64>(base + 60 * PAGE).is_err()
-        };
-        (blocked, guest::try_read::<u64>(base + 60 * PAGE).is_ok_and(|value| value == 0))
-    })
-    .unwrap_or((false, false));
-    assert(blocked && retried && page_fault::refused_faults() == refused + 1, "zero sob demanda: com a trava da propria regiao retida a sonda e recusada e contada; solta a trava, e atendida");
+    // A recusa provocada de propósito fica na conta do autoteste, fora da
+    // conta de defeitos (e da serial, onde o test-boot a leria como falha).
+    let ((blocked, retried), captured) = page_fault::capture_refusals(|| {
+        process_context::with_process(process, || {
+            let blocked = {
+                let _region = private.state.lock();
+                guest::try_read::<u64>(base + 60 * PAGE).is_err()
+            };
+            (blocked, guest::try_read::<u64>(base + 60 * PAGE).is_ok_and(|value| value == 0))
+        })
+        .unwrap_or((false, false))
+    });
+    assert(blocked && retried && captured == 1 && page_fault::refused_faults() == refused, "zero sob demanda: com a trava da propria regiao retida a sonda e recusada e contada; solta a trava, e atendida");
 
     // O decommit das páginas não tocadas devolve o commit delas.
     let before = eprocess.commit_charge.get();

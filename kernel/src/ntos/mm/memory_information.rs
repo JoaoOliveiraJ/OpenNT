@@ -239,7 +239,7 @@ fn print_memory_line(event: &str, process_id: u64) {
     let heap_occupied = crate::hal::kmalloc::occupied();
     let (arena_blocks, arena_used) = crate::ntos::mm::guest_memory::usage();
     crate::debug_print!(
-        "[mm] memoria ({} {}): PFN livres {}/{} paginas, commit {}/{} paginas (maximo {}, pico {}), nao residentes {}, heap {}/{} KB (ocupado {} KB), arena {}/{} KB ({} blocos)",
+        "[mm] memoria ({} {}): PFN livres {}/{} paginas, commit {}/{} paginas (maximo {}, pico {}), nao residentes {}, heap {}/{} KB (ocupado {} KB), arena {}/{} KB ({} blocos), zero sob demanda {} (recusadas {})",
         event,
         process_id,
         partition.available,
@@ -254,7 +254,9 @@ fn print_memory_line(event: &str, process_id: u64) {
         heap_occupied / 1024,
         arena_used / 1024,
         crate::ntos::mm::guest_memory::ARENA_SIZE / 1024,
-        arena_blocks
+        arena_blocks,
+        super::page_fault::demand_zero_faults(),
+        super::page_fault::refused_faults()
     );
 }
 

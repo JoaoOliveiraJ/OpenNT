@@ -43,10 +43,14 @@
 //! o VAD e a região) estejam livres: cada uma é tentada por um tempo curto
 //! (outra CPU pode estar com ela por um instante) e o frame vem só da lista
 //! livre, sem recuperação. Com uma delas tomada (talvez pelo próprio
-//! chamador), a falta é recusada, contada e registrada
-//! (`[mm] zero sob demanda recusado`): a sonda devolve
-//! STATUS_ACCESS_VIOLATION e o acesso confiável vai ao diagnóstico da falta
-//! do anel 0.
+//! chamador), a falta é recusada: a sonda devolve STATUS_ACCESS_VIOLATION e
+//! o acesso confiável vai ao diagnóstico da falta do anel 0. A recusa é o
+//! que no 19041 seria o bugcheck: um defeito de quem tocou a página com o
+//! spin lock retido, corrigido nele (materializar ou sondar a faixa antes de
+//! travar). Ela é contada (a linha `[mm] frames por dono` e a `[mm]
+//! memoria` mostram o total) e sai na serial com o marcador
+//! `*** ZERO SOB DEMANDA RECUSADO`, uma falha para o test-boot; a sonda que a
+//! sofreu registra a linha de quem a chamou.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,7 +63,7 @@ use crate::ntos::inc::types::Eprocess;
 use crate::ntos::ps::process;
 use crate::ntos::ps::user::memory::{self, PrivateMut, PrivateRegion, Space, PAGE_GUARD};
 use crate::rtl::sync::{self, SpinLockGuard};
-use crate::rtl::KernelError;
+use crate::rtl::{KernelError, SpinLock};
 
 const PAGE: u64 = map::PAGE_SIZE;
 /// Tentativas de cada trava do caminho com spin locks retidos.
@@ -85,8 +89,11 @@ pub enum Outcome {
     NotDemandZero,
     /// A página tem frame agora (ou já tinha: outra CPU chegou antes).
     Resolved,
-    /// Uma trava do caminho continuou tomada, ou não havia frame livre.
+    /// Com spin locks retidos: uma trava do caminho continuou tomada, ou não
+    /// havia frame na lista livre (um defeito de quem tocou a página).
     Refused,
+    /// Sem spin lock retido, o PFN não deu frame nem com a recuperação.
+    NoMemory,
 }
 
 /// As faltas de zero sob demanda atendidas desde o boot.
@@ -141,11 +148,40 @@ fn lock_region(owner: &PrivateRegion, locked: bool) -> Option<SpinLockGuard<'_, 
     })
 }
 
+/// A thread de um autoteste que provoca recusas de propósito
+/// ([`capture_refusals`]) e quantas ela teve: as dela não contam como
+/// defeito nem vão à serial.
+static CAPTURE: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Roda `body` contando à parte as recusas da thread corrente (o autoteste
+/// da recusa com a trava da própria região retida); devolve o resultado e
+/// quantas houve. As das outras threads continuam defeitos.
+pub fn capture_refusals<R>(body: impl FnOnce() -> R) -> (R, u64) {
+    let outer = CAPTURE.lock().replace((process::get_current_thread(), 0));
+    let result = body();
+    let captured = core::mem::replace(&mut *CAPTURE.lock(), outer).map_or(0, |(_, count)| count);
+    (result, captured)
+}
+
+/// Uma falta recusada com spin locks retidos: no 19041 seria o bugcheck
+/// IRQL_NOT_LESS_OR_EQUAL, então é um defeito de quem tocou a página com o
+/// spin lock retido (o caminho tem de materializar ou sondar a faixa antes
+/// de travar, como o MmProbeAndLockPages). Conta e sai na serial com o
+/// marcador `*** ZERO SOB DEMANDA RECUSADO`, que o test-boot trata como
+/// falha.
 fn refuse(address: u64) -> Outcome {
+    let thread = process::get_current_thread();
+    {
+        let mut capture = CAPTURE.lock();
+        if let Some((_, count)) = capture.as_mut().filter(|(owner, _)| *owner == thread) {
+            *count += 1;
+            return Outcome::Refused;
+        }
+    }
     let count = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
     // As primeiras e depois uma a cada 64: o diagnóstico não inunda a serial.
     if count <= 16 || count % 64 == 0 {
-        crate::debug_print!("[mm] zero sob demanda recusado com spin lock: VA {:#x}, {} spin locks na CPU, processo {:#x}, thread {:#x} ({} recusas)", address, sync::spin_locks_held(), process::get_current_process(), process::get_current_thread(), count);
+        crate::debug_print!("*** ZERO SOB DEMANDA RECUSADO com spin lock: VA {:#x}, {} spin locks na CPU, processo {:#x}, thread {:#x} ({} recusas)", address, sync::spin_locks_held(), process::get_current_process(), thread, count);
     }
     Outcome::Refused
 }
@@ -194,7 +230,7 @@ fn zero_fault(root: u64, owner: &PrivateRegion, index: u64, access: Option<Acces
     let frame = if locked { pfn::try_alloc_page_for(pfn::FrameUse::PrivatePageable) } else { pfn::alloc_page_for(pfn::FrameUse::PrivatePageable) };
     if frame == 0 {
         crate::debug_print!("[mm] zero sob demanda em {:#x} sem frame livre", owner.base + index * PAGE);
-        return Outcome::Refused;
+        return if locked { Outcome::Refused } else { Outcome::NoMemory };
     }
     physical::zero(frame, PAGE as usize);
     let Some(mut state) = lock_region(owner, locked) else {
@@ -212,7 +248,7 @@ fn zero_fault(root: u64, owner: &PrivateRegion, index: u64, access: Option<Acces
     if !paging::map_page_in(root, owner.base + index * PAGE, frame, memory::private_pte(protect), MapOptions { nx: protect & 0xF0 == 0, ..MapOptions::default() }) {
         drop(state);
         pfn::free_page(frame);
-        return Outcome::Refused;
+        return Outcome::NoMemory;
     }
     state.frames.insert(index, frame);
     drop(state);
@@ -248,7 +284,7 @@ pub fn make_present(root: u64, owner: &PrivateRegion, first: u64, end: u64) -> u
         return status;
     }
     for index in first..end {
-        if zero_fault(root, owner, index, None, sync::spin_locks_held() != 0) == Outcome::Refused {
+        if matches!(zero_fault(root, owner, index, None, sync::spin_locks_held() != 0), Outcome::Refused | Outcome::NoMemory) {
             return 0xC000_009A;
         }
     }
@@ -263,7 +299,7 @@ fn fault(address: u64, error: u32) -> FaultResult {
     let access = if error & 0x10 != 0 { Access::Execute } else if error & 2 != 0 { Access::Write } else { Access::Read };
     match resolve_current(address, access) {
         Outcome::Resolved => FaultResult::Resolved,
-        Outcome::NotDemandZero | Outcome::Refused => FaultResult::NotMine,
+        Outcome::NotDemandZero | Outcome::Refused | Outcome::NoMemory => FaultResult::NotMine,
     }
 }
 
@@ -277,6 +313,6 @@ fn resolve(address: u64) -> Result<Option<u64>, KernelError> {
     }
     match resolve_current(page, Access::Read) {
         Outcome::Resolved => Ok(Some(paging::translate(page))),
-        Outcome::NotDemandZero | Outcome::Refused => Ok(None),
+        Outcome::NotDemandZero | Outcome::Refused | Outcome::NoMemory => Ok(None),
     }
 }

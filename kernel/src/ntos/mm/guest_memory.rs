@@ -391,7 +391,13 @@ fn probe(address: u64, write: bool) -> Result<u64, KernelError> {
     }
     let resolver = *PAGEABLE_RESOLVER.lock();
     if let Some(resolver) = resolver {
+        let refused = crate::ntos::mm::page_fault::refused_faults();
         resolver(address)?;
+        // Uma falta de zero sob demanda recusada com spin lock retido é um
+        // defeito de quem sondou (`mm/page_fault`): a linha dele vai junto.
+        if crate::ntos::mm::page_fault::refused_faults() != refused {
+            crate::debug_print!("*** ZERO SOB DEMANDA RECUSADO na sonda de {:#x} chamada de {}", address, Location::caller());
+        }
     }
     check_loaded_root(address);
     check_ownership(address, write)?;
