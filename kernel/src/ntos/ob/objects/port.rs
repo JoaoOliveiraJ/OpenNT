@@ -120,6 +120,10 @@ pub struct PortState {
     pub closing: bool,
     pub skip_pending_flush: bool,
     pub peer_disconnected: bool,
+    /// O LPC_PORT_CLOSED do par já entrou na fila desta porta: o
+    /// AlpcpSendCloseMessage do 19041 (0x5e1fc8) manda uma vez só a mensagem
+    /// de fechamento guardada na porta que fecha (o xchg em +0x48).
+    pub peer_close_posted: bool,
     pub server_references_held: bool,
     pub connection_state: u32,
     pub port_flags: u32,

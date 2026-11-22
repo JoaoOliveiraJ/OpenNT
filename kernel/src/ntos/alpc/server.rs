@@ -118,6 +118,7 @@ const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
 const STATUS_PORT_DISCONNECTED: u32 = 0xC000_0037;
 const STATUS_PORT_CONNECTION_REFUSED: u32 = 0xC000_0041;
 const STATUS_INVALID_PORT_HANDLE: u32 = 0xC000_0042;
+const STATUS_PORT_CLOSED: u32 = 0xC000_0700;
 const STATUS_NOT_SUPPORTED: u32 = 0xC000_00BB;
 const STATUS_INVALID_CID: u32 = 0xC000_000B;
 const STATUS_REPLY_MESSAGE_MISMATCH: u32 = 0xC000_021F;
@@ -806,7 +807,11 @@ impl Service for UserServer {
             rpc_trace::message(&Record { listener: self.listener.pointer, client_port: port.pointer, client: sender.process, server: self.listener.process_id(), message_type: LPC_PORT_CLOSED, id, ..Record::default() });
             rpc_trace::client_closed(port.pointer);
         }
-        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, sender, port_context: link.context, sequence, ..Delivery::default() });
+        // A mensagem do AlpcpSendCloseMessage (19041, 0x5e1fc8): o u1
+        // 0x300008 (8 bytes de dados, o CreateTime do processo de quem fecha)
+        // e o CLIENT_ID zerado.
+        let create_time = crate::ntos::ps::process_accessors::create_time(process::get_current_process());
+        self.enqueue(Delivery { id, message_type: LPC_PORT_CLOSED, data: Vec::from(create_time.to_le_bytes()), sender: Sender::default(), port_context: link.context, sequence, ..Delivery::default() });
     }
 }
 
@@ -966,8 +971,11 @@ fn receive_one(server: &UserServer, buffer: &Buffer, attributes: u64, options: R
     loop {
         let (id, view, data_view) = {
             let mut state = server.state.lock();
+            // A porta de conexão fechada: STATUS_PORT_CLOSED, a falha da
+            // recepção do 19041 para o estado Closed (AlpcpReceiveMessagePort,
+            // 0x5e8c18); a recepção nunca volta STATUS_PORT_DISCONNECTED.
             if state.closed {
-                return Some(STATUS_PORT_DISCONNECTED);
+                return Some(STATUS_PORT_CLOSED);
             }
             let delivery = state.queue.front()?;
             if options.connections_only && delivery.message_type & 0xFF != LPC_CONNECTION_REQUEST {
@@ -1901,7 +1909,8 @@ fn establish_with(server: &Arc<UserServer>, pending: &Arc<PendingConnection>, ou
 }
 
 /// A porta de comunicação do servidor foi desconectada (NtAlpcDisconnectPort)
-/// ou fechada: como o AlpcpDisconnectPort e o AlpcpFlushMessagesPort, os
+/// ou fechada (com o LPC_PORT_CLOSED ao cliente): como o AlpcpDisconnectPort
+/// e o AlpcpFlushMessagesPort, os
 /// pedidos que o cliente dela ainda espera terminam com
 /// STATUS_PORT_DISCONNECTED, e os envios seguintes do cliente também. O
 /// vínculo continua até o cliente fechar a porta dele (o LPC_PORT_CLOSED com
@@ -1911,6 +1920,15 @@ fn communication_disconnected(communication: &Arc<Port>, endpoint: &Arc<Port>, _
         return;
     }
     let Some((server, client)) = COMMUNICATION.lock().get(&communication.pointer).cloned() else { return };
+    // A porta de comunicação do servidor fecha (o último handle ou o
+    // objeto, como no fim do processo dele): o LPC_PORT_CLOSED vai à porta
+    // do cliente antes da limpeza (AlpcpClosePort e AlpcpDeletePort ->
+    // AlpcpSendCloseMessage). O NtAlpcDisconnectPort sozinho não manda.
+    if communication.with(|state| state.closing) {
+        if let Some(client_port) = port_objects::port_of(client) {
+            crate::ntos::ps::user::alpc::post_peer_closed(&client_port);
+        }
+    }
     let slots: Vec<ReplySlot> = {
         let mut state = server.state.lock();
         match state.links.get_mut(&client) {

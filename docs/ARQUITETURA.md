@@ -5254,7 +5254,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   (NtAlpcCreatePort com nome, a conexão que espera a decisão do servidor no
   NtAlpcAcceptConnectPort, pedidos e respostas pelo MessageId,
   NtAlpcOpenSenderProcess/Thread), com o aviso na IOCP associada, que o
-  thread pool da ntdll consome; o tick sonda as esperas de usuário paradas
+  thread pool da ntdll consome. O fim de uma comunicação segue o 19041: a
+  porta de comunicação que fecha (o último handle, como no fim do processo
+  de um lado) manda ao par o LPC_PORT_CLOSED (o AlpcpSendCloseMessage: u1
+  0x300008, CLIENT_ID zerado, o CreateTime de quem fecha nos dados), o
+  pedido assíncrono que ficou no servidor volta ao cliente como
+  LPC_CANCELED, e a recepção só falha com STATUS_PORT_CLOSED (a porta
+  dela fechou) ou STATUS_PORT_CONNECTION_REFUSED, nunca com
+  STATUS_PORT_DISCONNECTED: o cliente do RPC (LRPC_CASSOCIATION::IoCompleted)
+  encerra o processo diante de outro status, e o RPCSS é crítico. O tick
+  sonda as esperas de usuário paradas
   mesmo quando nenhuma thread de usuário está pronta
   (`ps/user/threads.rs::refresh_waiting`), porque o cliente que põe o pedido
   na fila do servidor para logo em seguida. O smss da sessão nasce por

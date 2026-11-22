@@ -34,6 +34,13 @@ pub use crate::ntos::alpc::transport::register;
 
 const AV: u32 = 0xC000_0005;
 const INVALID: u32 = 0xC000_000D;
+const STATUS_PORT_DISCONNECTED: u32 = 0xC000_0037;
+/// STATUS_PORT_CONNECTION_REFUSED e STATUS_PORT_CLOSED: as únicas falhas da
+/// recepção do 19041 (AlpcpReceiveMessagePort, 0x5e8c10: o estado da porta
+/// em +0x1a0 com Closed 0x40 dá 0xC0000700, com ConnectionRefused 0x10 dá
+/// 0xC0000041).
+const STATUS_PORT_CONNECTION_REFUSED: u32 = 0xC000_0041;
+const STATUS_PORT_CLOSED: u32 = 0xC000_0700;
 /// ALPC_PORFLG_WAITABLE_PORT.
 const WAITABLE_PORT: u32 = 0x4_0000;
 /// A flag de conexão que liga o ReturnExtendedInfo da porta do cliente.
@@ -139,6 +146,16 @@ fn queue_reply(port: &Arc<Port>, request: &Arc<Request>, result: &JobResult) -> 
         }
         (state.reserve.clone(), state.legacy_synchronous, state.synchronous, state.context)
     };
+    // O servidor saiu com o pedido assíncrono ainda nele (a porta de
+    // conexão ou a de comunicação fechou antes de o vínculo do cliente ver o
+    // fechamento): como no AlpcpFlushMessagesPort e no AlpcpCancelMessage do
+    // 19041 (0x5e301c, o tipo 0xC no PORT_MESSAGE), a mensagem volta ao
+    // cliente como LPC_CANCELED, que ele recebe com sucesso. Só quem espera
+    // a resposta sincronamente vê o STATUS_PORT_DISCONNECTED, no envio.
+    if result.status == STATUS_PORT_DISCONNECTED && !synchronous && !legacy_synchronous {
+        cancel_request(port, request);
+        return Ok(if request.state.lock().cancellation_queued { 0 } else { STATUS_PORT_DISCONNECTED });
+    }
     if let Some(reserve) = reserve.as_ref().filter(|_| result.status == 0) {
         let status = resource_reserves::ensure_payload(reserve, result.data.len() as u64)?;
         if status != 0 {
@@ -401,6 +418,14 @@ pub fn disconnect_transport(connection: &Arc<Port>, endpoint: &Arc<Port>, closin
     for request in &jobs {
         request.state.lock().server_disconnected = true;
     }
+    // A porta do par está fechando (o último handle ou a exclusão do objeto,
+    // como no fim do processo dele): o LPC_PORT_CLOSED vem antes dos
+    // cancelamentos, como o AlpcpClosePort e o AlpcpDeletePort do 19041, que
+    // mandam a mensagem de fechamento antes da limpeza da porta. O
+    // NtAlpcDisconnectPort sozinho não manda.
+    if endpoint.with(|state| state.closing) {
+        post_peer_closed(connection);
+    }
     // As respostas na fila foram emitidas pelo endpoint desconectado; o
     // cancelamento preserva o CID original.
     connection.with(|state| {
@@ -424,6 +449,31 @@ pub fn disconnect_transport(connection: &Arc<Port>, endpoint: &Arc<Port>, closin
         }
         request.state.lock().peer_unavailable = true;
     }
+}
+
+/// LPC_PORT_CLOSED (o tipo do PORT_MESSAGE).
+const LPC_PORT_CLOSED: u16 = 5;
+
+/// A porta de comunicação do par fechou (o último handle dela ou o objeto,
+/// como no fim do processo do servidor): o AlpcpClosePort e o
+/// AlpcpDeletePort do 19041 chamam o AlpcpSendCloseMessage (0x5e1fc8), que
+/// tira a mensagem de fechamento
+/// guardada na porta que fecha e a despacha ao par pelo
+/// AlpcpDispatchCloseMessage, uma vez só. A mensagem é um LPC_PORT_CLOSED
+/// com o u1 0x300008 (8 bytes de dados, 0x30 no total), o CLIENT_ID zerado
+/// e, nos dados, o CreateTime do processo de quem fecha (EPROCESS+0x468 da
+/// thread corrente). Ela entra na fila do par e avisa a IOCP dele: o cliente
+/// do RPC (o LRPC_CASSOCIATION::IoCompleted do rpcrt4) a recebe com
+/// sucesso e desfaz a associação. A recepção dele nunca volta
+/// STATUS_PORT_DISCONNECTED (o rpcrt4 encerra o processo com
+/// RpcpReportFatalError diante de qualquer status que não seja
+/// STATUS_USER_APC ou STATUS_PORT_CONNECTION_REFUSED).
+pub(crate) fn post_peer_closed(connection: &Arc<Port>) {
+    if connection.with(|state| state.closing || core::mem::replace(&mut state.peer_close_posted, true)) {
+        return;
+    }
+    let create_time = crate::ntos::ps::process_accessors::create_time(process::get_current_process());
+    let _ = post_server_message(connection, LPC_PORT_CLOSED, &create_time.to_le_bytes(), Sender::default(), |_| {});
 }
 
 /// A conexão (inclusive LPC) possui todas as mensagens e libera o
@@ -1264,7 +1314,10 @@ struct Receiver {
 impl Receiver {
     fn interrupted(&self) -> Option<u32> {
         if self.port.with(|state| state.closing) {
-            return Some(0xC000_0037);
+            // A recepção pura na porta que fechou: STATUS_PORT_CLOSED, como
+            // o AlpcpReceiveMessagePort; quem espera a resposta de um envio
+            // síncrono vê a desconexão.
+            return Some(if self.synchronous.is_some() { STATUS_PORT_DISCONNECTED } else { STATUS_PORT_CLOSED });
         }
         let request = self.synchronous.as_ref()?;
         let state = request.state.lock();
@@ -1397,8 +1450,18 @@ pub fn exchange_messages(port: &Arc<Port>, flags: u32, input: u64, send_attribut
     }
     // A desconexão bloqueia novos envios, mas não impede drenar respostas.
     let (closing, peer_disconnected, connection_state) = port.with(|state| (state.closing, state.peer_disconnected, state.connection_state));
-    if closing || (input != 0 && (port.closed() || peer_disconnected)) {
-        return Ok(Status(0xC000_0037));
+    if input == 0 {
+        // Só a recepção: a porta fechada dá STATUS_PORT_CLOSED e a conexão
+        // recusada STATUS_PORT_CONNECTION_REFUSED; com o par desconectado
+        // ela ainda drena a fila (o LPC_PORT_CLOSED e os LPC_CANCELED).
+        if closing {
+            return Ok(Status(STATUS_PORT_CLOSED));
+        }
+        if connection_state == port_objects::CONNECTION_REFUSED {
+            return Ok(Status(STATUS_PORT_CONNECTION_REFUSED));
+        }
+    } else if closing || port.closed() || peer_disconnected {
+        return Ok(Status(STATUS_PORT_DISCONNECTED));
     }
     if input != 0 && connection_state == port_objects::CONNECTION_PENDING {
         return Ok(Status(0xC000_0707));

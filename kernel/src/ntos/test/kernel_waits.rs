@@ -1304,6 +1304,204 @@ fn idle_halt(assert: Assert) {
     guest::free_bytes(dpc);
 }
 
+// ---- o fechamento do par ALPC ------------------------------------------------
+
+/// A porta dos pares que fecham. Bloco: [0] a porta do servidor, [8] a de
+/// comunicação, [0x20] a do cliente, [0x28] o evento "porta criada", [0x40]
+/// os ALPC_PORT_ATTRIBUTES, [0x880] o intervalo da pausa, [0x8A0] o evento
+/// "cliente vai receber". Resultados
+/// do servidor que sai: [0] criação, [1] conexão recebida, [2] aceite, [3] o
+/// pedido recebido (tipo e palavra), [4] e [5] os ZwClose da porta de
+/// conexão e da de comunicação; do cliente: [6] conexão, [7] o envio
+/// assíncrono, [8] e [11] o status das duas recepções, [9] e [12] o tipo e o
+/// u1 delas, [10] e [13] o CLIENT_ID delas (processo | thread).
+const ALPC_CLOSE_NAME: &str = "\\OpenNtAlpcFecho";
+const LPC_PORT_CLOSED: u64 = 5;
+const LPC_CANCELED: u64 = 12;
+
+/// Uma pausa de `milliseconds` pelo KeDelayExecutionThread (o intervalo no
+/// bloco).
+fn pause(block: u64, milliseconds: i64) {
+    guest::write64(block + 0x880, (-milliseconds * 10_000) as u64);
+    call_export("KeDelayExecutionThread", &[0, 0, block + 0x880]);
+}
+
+/// Tipo (byte baixo) e u1 da mensagem recebida, e o CLIENT_ID dela.
+fn kind_and_header(message: u64) -> (u64, u64) {
+    ((guest::read16(message + 4) as u64 & 0xFF) << 32 | guest::read32(message) as u64, guest::read64(message + 8) | guest::read64(message + 0x10))
+}
+
+/// O servidor recebe a conexão e o pedido assíncrono do cliente e sai sem
+/// responder, fechando a porta de conexão antes da de comunicação, como
+/// num fim de processo em que o handle dela fecha primeiro.
+extern "win64" fn alpc_closing_server(block: u64) {
+    let (server_out, communication_out, length, attributes, receive) = (block, block + 8, block + 0x10, block + 0x40, block + 0x100);
+    let object_attributes = object_attributes_for(block + 0x700, ALPC_CLOSE_NAME, 0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, object_attributes, attributes]).unwrap_or(u64::MAX);
+    record(block, 0, created);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    let next = || {
+        guest::write64(length, 0x200);
+        call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX)
+    };
+    record(block, 1, next());
+    let unnamed = kernel_handle_attributes();
+    record(block, 2, call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, unnamed, 0, 0xC0DE, receive, 0, 1]).unwrap_or(u64::MAX));
+    guest::free_bytes(unnamed);
+    let request = next();
+    record(block, 3, if request == 0 { type_and_word(receive) } else { request });
+    // O cliente já está (ou vai estar) parado na recepção.
+    call_export("KeWaitForSingleObject", &[block + 0x8A0, 0, 0, 0, 0]);
+    pause(block, 50);
+    record(block, 4, call_export("ZwClose", &[server]).unwrap_or(u64::MAX));
+    pause(block, 50);
+    record(block, 5, call_export("ZwClose", &[guest::read64(communication_out)]).unwrap_or(u64::MAX));
+}
+
+/// O cliente manda o pedido assíncrono e fica na recepção pura enquanto o
+/// servidor sai.
+extern "win64" fn alpc_waiting_client(block: u64) {
+    let (client_out, length, attributes, connect, exchange, receive) = (block + 0x20, block + 0x18, block + 0x40, block + 0x400, block + 0x500, block + 0x600);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 6, ready | 0x1_0000_0000);
+        call_export("KeSetEvent", &[block + 0x8A0, 0, 0]);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    port_message_with(connect, b"HELO");
+    guest::write64(length, 0x100);
+    let connected = call_export("ZwAlpcConnectPort", &[client_out, name, 0, attributes, 0x2_0000, 0, connect, length, 0, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 6, connected);
+    if connected != 0 {
+        call_export("KeSetEvent", &[block + 0x8A0, 0, 0]);
+        return;
+    }
+    let client = guest::read64(client_out);
+    port_message_with(exchange, b"PING");
+    record(block, 7, call_export("ZwAlpcSendWaitReceivePort", &[client, 0, exchange, 0, 0, 0, 0, 0]).unwrap_or(u64::MAX));
+    call_export("KeSetEvent", &[block + 0x8A0, 0, 0]);
+    for (status_index, kind_index, client_id_index) in [(8, 9, 10), (11, 12, 13)] {
+        guest::write_bytes(receive, &[0u8; 0x40]);
+        guest::write64(length, 0x200);
+        let status = call_export("ZwAlpcSendWaitReceivePort", &[client, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX);
+        record(block, status_index, status);
+        let (kind, client_id) = kind_and_header(receive);
+        record(block, kind_index, kind);
+        record(block, client_id_index, client_id);
+    }
+    call_export("ZwClose", &[client]);
+}
+
+/// O cliente sai enquanto o servidor espera na recepção. Resultados: [0]
+/// criação, [1] conexão recebida, [2] aceite, [3] o status da recepção, [4]
+/// o tipo e o u1 dela, [5] o CLIENT_ID dela, [6] a conexão do cliente, [7] o
+/// ZwClose dele.
+extern "win64" fn alpc_waiting_server(block: u64) {
+    let (server_out, communication_out, length, attributes, receive) = (block, block + 8, block + 0x10, block + 0x40, block + 0x100);
+    let object_attributes = object_attributes_for(block + 0x700, ALPC_CLOSE_NAME, 0x200);
+    let created = call_export("ZwAlpcCreatePort", &[server_out, object_attributes, attributes]).unwrap_or(u64::MAX);
+    record(block, 0, created);
+    call_export("KeSetEvent", &[block + 0x28, 0, 0]);
+    if created != 0 {
+        return;
+    }
+    let server = guest::read64(server_out);
+    guest::write64(length, 0x200);
+    record(block, 1, call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX));
+    let unnamed = kernel_handle_attributes();
+    record(block, 2, call_export("ZwAlpcAcceptConnectPort", &[communication_out, server, 0, unnamed, 0, 0xC0DE, receive, 0, 1]).unwrap_or(u64::MAX));
+    guest::free_bytes(unnamed);
+    guest::write_bytes(receive, &[0u8; 0x40]);
+    guest::write64(length, 0x200);
+    record(block, 3, call_export("ZwAlpcSendWaitReceivePort", &[server, 0, 0, 0, receive, length, 0, 0]).unwrap_or(u64::MAX));
+    let (kind, client_id) = kind_and_header(receive);
+    record(block, 4, kind);
+    record(block, 5, client_id);
+    call_export("ZwClose", &[guest::read64(communication_out)]);
+    call_export("ZwClose", &[server]);
+}
+
+extern "win64" fn alpc_closing_client(block: u64) {
+    let (client_out, length, attributes, connect) = (block + 0x20, block + 0x18, block + 0x40, block + 0x400);
+    let ready = call_export("KeWaitForSingleObject", &[block + 0x28, 0, 0, 0, 0]).unwrap_or(u64::MAX);
+    if ready != 0 || guest::read64(block + RESULTS) != 0 {
+        record(block, 6, ready | 0x1_0000_0000);
+        return;
+    }
+    let name = guest::read64(block + 0x800);
+    port_message_with(connect, b"HELO");
+    guest::write64(length, 0x100);
+    let connected = call_export("ZwAlpcConnectPort", &[client_out, name, 0, attributes, 0x2_0000, 0, connect, length, 0, 0, 0]).unwrap_or(u64::MAX);
+    record(block, 6, connected);
+    if connected != 0 {
+        return;
+    }
+    // O servidor fica parado na recepção antes do fechamento.
+    pause(block, 50);
+    record(block, 7, call_export("ZwClose", &[guest::read64(client_out)]).unwrap_or(u64::MAX));
+}
+
+/// Roda o par num bloco novo e devolve se as duas threads terminaram e os
+/// resultados.
+fn alpc_close_round(server_routine: StartRoutine, client_routine: StartRoutine, count: u64) -> (bool, Vec<u64>) {
+    let block = guest::alloc_bytes(0xA00);
+    guest::write_bytes(block, &alloc::vec![0; 0xA00]);
+    for index in 0..count {
+        record(block, index, PENDING_RESULT);
+    }
+    dispatcher::initialize_event(block + 0x28, 0, false);
+    dispatcher::initialize_event(block + 0x8A0, 0, false);
+    // SAFETY: ALPC_PORT_ATTRIBUTES do teste.
+    unsafe { crate::ntos::inc::types::AlpcPortAttributes::at(block + 0x40) }.max_message_length.set(0x200);
+    let name = unicode_string_for(ALPC_CLOSE_NAME);
+    guest::write64(block + 0x800, name);
+    let (server_handle, server) = start(server_routine, block);
+    let (client_handle, client) = start(client_routine, block);
+    let finished = server != 0 && client != 0 && pump(20_000, &|| kernel_threads::is_terminated(server) && kernel_threads::is_terminated(client));
+    let results: Vec<u64> = (0..count).map(|index| guest::read64(block + RESULTS + index * 8)).collect();
+    for handle in [server_handle, client_handle] {
+        let _ = object_manager::close(handle as u32);
+    }
+    guest::free_bytes(name);
+    if finished {
+        guest::free_bytes(block);
+    }
+    (finished, results)
+}
+
+/// O fechamento do par de uma comunicação ALPC, como no 19041: a recepção
+/// só falha com STATUS_PORT_CLOSED ou STATUS_PORT_CONNECTION_REFUSED
+/// (AlpcpReceiveMessagePort), o pedido assíncrono que ficou no servidor
+/// volta ao cliente como LPC_CANCELED (AlpcpCancelMessage) e a porta de
+/// comunicação que fecha manda ao par o LPC_PORT_CLOSED, com 8 bytes de
+/// dados e o CLIENT_ID zerado (AlpcpSendCloseMessage).
+fn alpc_peer_close(assert: Assert) {
+    let word = |bytes: &[u8; 4]| u32::from_le_bytes(*bytes) as u64;
+    let close_header = LPC_PORT_CLOSED << 32 | 0x0030_0008;
+    // O servidor sai com o pedido assíncrono do cliente sem resposta.
+    let (finished, results) = alpc_close_round(alpc_closing_server, alpc_waiting_client, 14);
+    debug_print!("[kwait] servidor ALPC que sai: {:x?}", results);
+    let kinds = [results[9], results[12]];
+    let closed = kinds.iter().position(|&kind| kind == close_header);
+    let canceled = kinds.iter().position(|&kind| kind >> 32 == LPC_CANCELED);
+    assert(
+        finished && results[..3] == [0, 0, 0] && results[3] == (0x2001 << 32 | word(b"PING")) && results[4] == 0 && results[5] == 0 && results[6] == 0 && results[7] == 0 && results[8] == 0 && results[11] == 0 && closed.is_some() && canceled.is_some() && closed != canceled && closed.is_some_and(|index| [results[10], results[13]][index] == 0),
+        "kwait: o servidor ALPC sai com o pedido assincrono pendente e o cliente parado na recepcao recebe, com sucesso, o LPC_CANCELED do pedido e o LPC_PORT_CLOSED (u1 0x300008, CLIENT_ID zerado), nunca STATUS_PORT_DISCONNECTED",
+    );
+    // O cliente sai com o servidor parado na recepção.
+    let (finished, results) = alpc_close_round(alpc_waiting_server, alpc_closing_client, 8);
+    debug_print!("[kwait] cliente ALPC que sai: {:x?}", results);
+    assert(
+        finished && results[..3] == [0, 0, 0] && results[3] == 0 && results[4] == close_header && results[5] == 0 && results[6] == 0 && results[7] == 0,
+        "kwait: o cliente ALPC fecha a porta e o servidor parado na recepcao recebe o LPC_PORT_CLOSED (u1 0x300008, CLIENT_ID zerado)",
+    );
+}
+
 pub fn run(assert: Assert) {
     pulse_polled_waits(assert);
     reset_polled_waits(assert);
@@ -1316,6 +1514,7 @@ pub fn run(assert: Assert) {
     alpc_answer_pair(assert);
     alpc_refused_extended_info(assert);
     alpc_reply_handle_pair(assert);
+    alpc_peer_close(assert);
     shared_queue_waiters(assert, true);
     shared_queue_waiters(assert, false);
 }
