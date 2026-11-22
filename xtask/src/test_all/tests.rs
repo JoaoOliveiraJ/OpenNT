@@ -211,6 +211,50 @@ fn a_guest_must_share_the_whole_boot_of_its_host() {
     assert!(plan::check_hosts(&chained).unwrap_err().contains("ja roda na execucao de outro"));
 }
 
+/// Os testes com `--primeiro-logon-feito` ganham um gerador por máquina, que
+/// roda uma vez, antes deles na pasta de imagens, com o comando sem o que
+/// só vale no teste; o teste do volume novo não espera nada.
+#[test]
+fn first_logon_tests_wait_for_one_producer_per_machine() {
+    let desktop = "USER_INITIALIZED 1800000 --initial-process=smss --display=basic --conta-de-teste";
+    let mut tests = vec![
+        test("fresco", &format!("{desktop} --smp=1 --watch-screen --expect=DESKTOP_OK"), None, false),
+        test("barra", &format!("{desktop} --primeiro-logon-feito --smp=1 --watch-screen --expect=DESKTOP_OK --expect=TASKBAR_OK"), None, false),
+        test("cmd", &format!("{desktop} --primeiro-logon-feito --smp=1 --kd=com2 --watch-screen --expect=DESKTOP_OK --run=DESKTOP_OK+5000:cmd --expect=WINDOW_OPENED_OK"), None, false),
+        test("duas", &format!("{desktop} --primeiro-logon-feito --smp=2 --user-smp --expect=DESKTOP_OK"), None, false),
+    ];
+    assert_eq!(tests[1].first_logon, tests[2].first_logon, "o depurador e a entrada nao mudam o gerador");
+    assert_ne!(tests[1].first_logon, tests[3].first_logon, "outra maquina, outro gerador");
+    assert_eq!(tests[0].image_key, tests[2].image_key, "a entrada nao muda o volume da conta de teste");
+    let mut booted = vec![0, 1, 2, 3];
+    let producers = plan::add_producers(&mut tests, &booted).unwrap();
+    assert_eq!(producers, [4, 5]);
+    assert_eq!((tests[4].id.as_str(), tests[5].id.as_str()), ("primeiro-logon", "primeiro-logon-2"));
+    assert_eq!(tests[4].arguments, ["USER_INITIALIZED", "2100000", "--initial-process=smss", "--display=basic", "--conta-de-teste", "--smp=1", "--gerar-primeiro-logon"]);
+    assert!(tests[5].arguments.contains(&String::from("--user-smp")));
+    assert_eq!(tests[4].produces, tests[1].first_logon);
+    booted.extend(&producers);
+    let guests = vec![Vec::new(); booted.len()];
+    let runs = plan::runs(&tests, &booted, &guests, 2);
+    let names: Vec<(&str, Option<usize>)> = runs.iter().map(|run| (run.name.as_str(), run.waits_for)).collect();
+    assert_eq!(names[0], ("primeiro-logon", None), "o gerador abre a pasta de imagens");
+    assert_eq!(names[1], ("primeiro-logon-2", None));
+    assert_eq!(runs.iter().filter(|run| tests[run.test].produces.is_some()).count(), 2, "o gerador roda uma vez com --repeat");
+    for run in &runs {
+        let expected = match tests[run.test].id.as_str() {
+            "barra" | "cmd" => Some(4),
+            "duas" => Some(5),
+            _ => None,
+        };
+        assert_eq!(run.waits_for, expected, "{}", run.name);
+    }
+    assert!(runs.iter().all(|run| run.image == 0));
+    // Um convidado não mistura o volume novo e o já logado com o anfitrião.
+    let host = test("fresco", &format!("{desktop} --smp=1"), None, false);
+    let guest = test("g", &format!("{desktop} --smp=1 --primeiro-logon-feito"), Some("fresco"), false);
+    assert!(plan::check_hosts(&[host, guest]).unwrap_err().contains("primeiro logon"));
+}
+
 /// O veredito de um convidado na serial do anfitrião: a cadeia em ordem,
 /// as `--expect-any` em qualquer ponto, e um marcador de falha antes de um
 /// texto reprova.

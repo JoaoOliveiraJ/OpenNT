@@ -40,6 +40,13 @@
 //! texto dentro do prazo dele. Com `--only` só do convidado, como num
 //! `espera_falha` e no `capturas`, ele sobe o próprio QEMU.
 //!
+//! Os testes com `--primeiro-logon-feito` sobem do volume do primeiro logon
+//! feito (`crate::first_logon`): a rodada ganha um gerador para cada boot de
+//! gerador que eles pedem (`plan::add_producers`), a execução
+//! `primeiro-logon` (`test-boot --gerar-primeiro-logon`), a primeira da pasta
+//! de imagens dela. As execuções que sobem o volume esperam o gerador
+//! ([`Gate`]); se ele falha, elas falham com o motivo dele, sem QEMU.
+//!
 //! Um build ou um QEMU morto de fora (o dono da máquina fecha o rustc e os
 //! QEMUs quando o PC fica lento) não é falha: o build sem diagnóstico e o
 //! QEMU que saiu com erro antes da saída esperada, sem marcador de falha na
@@ -67,7 +74,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -241,9 +248,39 @@ struct Context {
     capture: Option<PathBuf>,
     /// O acelerador dos testes sem a chave `acelerador`.
     accelerator: String,
+    /// O resultado de cada gerador do primeiro logon feito (pelo índice do
+    /// teste dele), que as execuções que sobem o volume esperam.
+    gates: Vec<(usize, Gate)>,
+}
+
+/// O resultado de um gerador do primeiro logon feito: vazio até ele
+/// terminar.
+#[derive(Default)]
+struct Gate {
+    result: Mutex<Option<Result<(), String>>>,
+    done: Condvar,
 }
 
 impl Context {
+    /// Espera o gerador `producer` terminar e devolve o resultado dele.
+    fn wait_gate(&self, producer: usize) -> Result<(), String> {
+        let Some((_, gate)) = self.gates.iter().find(|(index, _)| *index == producer) else {
+            return Err(String::from("a rodada nao tem o gerador do primeiro logon feito"));
+        };
+        let mut result = gate.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while result.is_none() {
+            result = gate.done.wait(result).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        result.clone().unwrap_or(Ok(()))
+    }
+
+    /// Anota o resultado do gerador `producer` e solta quem o espera.
+    fn open_gate(&self, producer: usize, outcome: Result<(), String>) {
+        if let Some((_, gate)) = self.gates.iter().find(|(index, _)| *index == producer) {
+            *gate.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+            gate.done.notify_all();
+        }
+    }
     fn directory(&self, run: &Run) -> PathBuf {
         self.root.join(OUTPUT_DIR).join(&run.name)
     }
@@ -283,7 +320,8 @@ impl Context {
             command.arg(format!("--image-dir={}", images.display()));
             command.arg(format!("--accel={}", self.accelerator(test)));
         }
-        if let (Some(capture), "--no-build") = (&self.capture, stage) {
+        // O gerador do primeiro logon feito não tem tela de teste.
+        if let (Some(capture), "--no-build", None) = (&self.capture, stage, &test.produces) {
             command.arg(format!("--capture={}", capture.join(format!("{}.png", test.id)).display()));
         }
         command
@@ -454,12 +492,19 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
         let test = &context.tests[run.test];
         let directory = context.directory(run);
         let width = context.width;
-        let (passed, build, time, reason, excerpt, log) = match prepared.build {
-            Err(error) => {
+        // A execução sobre o volume do primeiro logon feito espera o gerador
+        // dele; sem o volume, ela não sobe.
+        let missing_volume = run.waits_for.and_then(|producer| context.wait_gate(producer).err().map(|reason| (producer, reason)));
+        let (passed, build, time, reason, excerpt, log) = match (prepared.build, missing_volume) {
+            (_, Some((producer, reason))) => {
+                let log = context.runs.iter().find(|other| other.test == producer).map(|other| context.relative(other, "test-boot.log")).unwrap_or_default();
+                (false, None, None, reason, Vec::new(), log)
+            }
+            (Err(error), None) => {
                 let text = report::read_lossy(&context.image_directory(run.image).join("build.log")).unwrap_or_default();
                 (false, None, None, error, report::build_excerpt(&text), format!("{}/build.log", Context::image_relative(run.image)))
             }
-            Ok(build) => {
+            (Ok(build), None) => {
                 let started = Instant::now();
                 // Um QEMU morto de fora roda de novo (`report::qemu_killed`).
                 let mut attempt = 1;
@@ -488,10 +533,12 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
                         context.console.say(&format!("{:<14} {}", run.name, line.trim()));
                     }
                 }
-                // A serial do test-boot; sem ela (processo morto), a saída
-                // dele, que também traz a serial.
-                let serial = report::read_lossy(&directory.join("serial.log"));
-                let log = if serial.is_some() { context.relative(run, "serial.log") } else { context.relative(run, "test-boot.log") };
+                // A serial do test-boot (a do boot do gerador, na pasta dele);
+                // sem ela (processo morto), a saída dele, que também traz a
+                // serial.
+                let serial_file = if test.produces.is_some() { format!("{}/serial.log", crate::first_logon::WORK_DIR) } else { String::from("serial.log") };
+                let serial = report::read_lossy(&directory.join(&serial_file));
+                let log = if serial.is_some() { context.relative(run, &serial_file) } else { context.relative(run, "test-boot.log") };
                 let excerpt = report::serial_excerpt(serial.as_deref().unwrap_or(&console));
                 match result {
                     Ok((passed, _)) => (passed, Some(build), Some(time), report::failure_reason(&console), excerpt, log),
@@ -500,6 +547,9 @@ fn lane(context: &Context, ready: &Mutex<Receiver<Prepared>>, outcomes: &Mutex<V
             }
         };
         let verdict = verdict_of(passed, test.expected_failure);
+        if test.produces.is_some() {
+            context.open_gate(run.test, if passed { Ok(()) } else { Err(format!("o volume do primeiro logon feito nao foi gerado ({}: {reason})", run.name)) });
+        }
         let repeat_flags = format!("--no-build --image-dir={} --accel={}", Context::image_relative(run.image), context.accelerator(test));
         let repeat_command = match build {
             Some(_) => test.command_line(&format!("{OUTPUT_DIR}/{}", run.name), [plan::quoted(&run.extra), repeat_flags.clone()].join(" ").trim()),
@@ -586,8 +636,14 @@ fn guest_outcomes(context: &Context, run: &Run, booted: bool, host_time: Option<
 
 fn list(context: &Context, chosen: &[usize]) {
     for (index, test) in context.tests.iter().enumerate() {
-        let mark = if chosen.contains(&index) { "x" } else { " " };
+        let mark = if chosen.contains(&index) || test.produces.is_some() { "x" } else { " " };
         let mut notes = Vec::new();
+        if test.produces.is_some() {
+            notes.push(String::from("gera o volume do primeiro logon feito"));
+        }
+        if let Some(run) = context.runs.iter().find(|run| run.test == index).and_then(|run| run.waits_for) {
+            notes.push(format!("sobre o volume de {}", context.tests[run].id));
+        }
         if test.expected_failure {
             notes.push(String::from("espera falha"));
         }
@@ -608,7 +664,7 @@ fn list(context: &Context, chosen: &[usize]) {
     }
     println!(
         "{} de {} testes selecionados ([x]), {} com QEMU proprio",
-        chosen.len(),
+        chosen.len() + context.tests.iter().filter(|test| test.produces.is_some()).count(),
         context.tests.len(),
         context.runs.iter().map(|run| run.test).collect::<std::collections::BTreeSet<_>>().len()
     );
@@ -627,7 +683,7 @@ pub fn capture(arguments: &[String]) -> Result<(), String> {
 
 fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     let root = build::workspace_root();
-    let tests = plan::load(&root)?;
+    let mut tests = plan::load(&root)?;
     if capture && options.only.is_empty() {
         // Todos os [[teste]], inclusive os que só as suítes rodam.
         options.only = tests.iter().filter(|test| !test.suite).map(|test| test.id.clone()).collect();
@@ -636,7 +692,14 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
     if capture && chosen.iter().any(|&index| tests[index].suite) {
         return Err("as suites nao tem captura: escolha ids de [[teste]]".into());
     }
-    let (booted, guests) = plan::split_guests(&tests, &chosen, capture);
+    let (mut booted, mut guests) = plan::split_guests(&tests, &chosen, capture);
+    // Os testes sobre o volume do primeiro logon feito ganham o gerador
+    // dele, uma execução própria antes deles.
+    let producers = plan::add_producers(&mut tests, &booted)?;
+    for &producer in &producers {
+        booted.push(producer);
+        guests.push(Vec::new());
+    }
     let runs = plan::runs(&tests, &booted, &guests, options.repeat);
     let results: Vec<(String, usize, usize)> = runs
         .iter()
@@ -668,6 +731,7 @@ fn run_with(mut options: Options, capture: bool) -> Result<(), String> {
         running: AtomicUsize::new(0),
         capture: capture.then(|| build::workspace_root().join(CAPTURE_DIR)),
         accelerator,
+        gates: producers.iter().map(|&producer| (producer, Gate::default())).collect(),
     };
     if options.list {
         list(&context, &chosen);
@@ -781,7 +845,7 @@ fn capture_report(context: &Context, directory: &Path) -> Result<(), String> {
     let mut seen: Vec<&str> = Vec::new();
     for run in &context.runs {
         let id = context.tests[run.test].id.as_str();
-        if seen.contains(&id) {
+        if seen.contains(&id) || context.tests[run.test].produces.is_some() {
             continue;
         }
         seen.push(id);

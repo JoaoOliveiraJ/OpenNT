@@ -91,6 +91,14 @@ pub struct Test {
     /// As opções do comando que só valem num QEMU próprio (entrada pelo
     /// monitor, espera do fim, depurador, desligamento, parada esperada).
     own_qemu: Vec<&'static str>,
+    /// `--primeiro-logon-feito`: o boot que gera o volume do primeiro logon
+    /// feito para o teste (as imagens, a máquina, o acelerador e as opções
+    /// de carga do gerador, `first_logon::producer_options`). Os testes com
+    /// o mesmo dividem um gerador ([`add_producers`]).
+    pub first_logon: Option<String>,
+    /// O gerador da rodada para os testes com este `first_logon`
+    /// (`test-boot --gerar-primeiro-logon`, [`producer`]).
+    pub produces: Option<String>,
 }
 
 impl Test {
@@ -140,6 +148,20 @@ impl Test {
         .collect();
         let mut chain = vec![marker];
         chain.extend(parsed.expect.iter().cloned());
+        let first_logon = parsed.first_logon_done.then(|| {
+            let producer = crate::first_logon::producer_options(&options);
+            format!(
+                "{} | smp={} memoria={} usb={} rede={} tpm={} acelerador={} | {}",
+                options.image_key(),
+                machine.smp,
+                machine.memory_mb,
+                machine.usb,
+                machine.net,
+                machine.tpm,
+                accelerator.as_deref().unwrap_or("o da rodada"),
+                producer.load_options().unwrap_or_default()
+            )
+        });
         Ok(Test {
             id: id.to_string(),
             arguments,
@@ -158,6 +180,8 @@ impl Test {
             timeout: Duration::from_millis(timeout_ms),
             boot,
             own_qemu,
+            first_logon,
+            produces: None,
         })
     }
 
@@ -273,7 +297,7 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
         let id = entry.string("id").ok_or_else(|| format!("{COMPONENTS}: [[teste]] sem id"))?;
         let command = entry.string("comando").ok_or_else(|| format!("teste {id}: sem comando"))?;
         let words = split_words(command).map_err(|error| format!("teste {id}: {error}"))?;
-        let arguments = match words.as_slice() {
+        let arguments: Vec<String> = match words.as_slice() {
             [cargo, xtask, test_boot, rest @ ..] if cargo == "cargo" && xtask == "xtask" && test_boot == "test-boot" => {
                 rest.iter().filter(|word| !word.starts_with("--build-dir=")).cloned().collect()
             }
@@ -293,6 +317,12 @@ pub fn load(root: &Path) -> Result<Vec<Test>, String> {
         };
         if tests.iter().any(|test: &Test| test.id == id) {
             return Err(format!("{COMPONENTS}: id de teste repetido: {id}"));
+        }
+        if arguments.iter().any(|word| word == "--gerar-primeiro-logon") {
+            return Err(format!("teste {id}: o gerador do primeiro logon sai sozinho dos testes com --primeiro-logon-feito (--gerar-primeiro-logon e do test-all)"));
+        }
+        if id.starts_with(PRODUCER_ID) {
+            return Err(format!("teste {id}: o id {PRODUCER_ID} e do gerador do primeiro logon feito"));
         }
         tests.push(Test::new(id, arguments, false, expected_failure, covered_by_suite, accelerator, host)?);
     }
@@ -333,8 +363,81 @@ pub fn check_hosts(tests: &[Test]) -> Result<(), String> {
         if guest.timeout > host.timeout {
             return fail(format!("o prazo de {} s passa o do anfitriao ({} s)", guest.timeout.as_secs(), host.timeout.as_secs()));
         }
+        if guest.first_logon != host.first_logon {
+            return fail("um dos dois sobe o volume do primeiro logon feito (--primeiro-logon-feito) e o outro nao".into());
+        }
     }
     Ok(())
+}
+
+/// O id do gerador do volume do primeiro logon feito (`primeiro-logon`, e
+/// `primeiro-logon-2`... quando a rodada tem mais de um).
+pub const PRODUCER_ID: &str = "primeiro-logon";
+
+/// As opções do comando de um teste que não valem no gerador: a cadeia
+/// esperada, a entrada pelo monitor, o depurador, a espera, a vigia e o
+/// desligamento do teste (o gerador tem os dele).
+const PRODUCER_DROPS: &[&str] = &[
+    "--expect",
+    "--expect-any",
+    "--keys",
+    "--send",
+    "--dismiss",
+    "--mouse",
+    "--start-menu",
+    "--start-click",
+    "--context-menu",
+    "--double-click",
+    "--run",
+    "--open",
+    "--type",
+    "--command",
+    "--hold",
+    "--kd",
+    "--script",
+    "--watch-screen",
+    "--capture-every",
+    "--manual-crash",
+    "--expect-stop",
+    "--expect-poweroff",
+    "--power-cycles",
+    "--allow-reboot",
+    "--primeiro-logon-feito",
+];
+
+/// O gerador do volume do primeiro logon feito dos testes como `consumer`
+/// (o `number`º da rodada): o comando dele sem o marcador, o prazo e as
+/// [`PRODUCER_DROPS`], com o prazo do gerador e `--gerar-primeiro-logon`.
+/// As imagens, a máquina e o acelerador são os do teste.
+pub fn producer(consumer: &Test, number: usize) -> Result<Test, String> {
+    let id = if number == 1 { String::from(PRODUCER_ID) } else { format!("{PRODUCER_ID}-{number}") };
+    let mut arguments = vec![String::from("USER_INITIALIZED"), crate::first_logon::PRODUCER_TIMEOUT.as_millis().to_string()];
+    arguments.extend(consumer.arguments.iter().filter(|word| word.starts_with("--") && !PRODUCER_DROPS.contains(&word.split('=').next().unwrap_or(word))).cloned());
+    arguments.push(String::from("--gerar-primeiro-logon"));
+    let mut test = Test::new(&id, arguments, false, false, false, consumer.accelerator.clone(), None)?;
+    test.produces = consumer.first_logon.clone();
+    Ok(test)
+}
+
+/// Um gerador para cada boot do primeiro logon feito que os testes de
+/// `booted` pedem, no fim de `tests`. Devolve os índices deles.
+pub fn add_producers(tests: &mut Vec<Test>, booted: &[usize]) -> Result<Vec<usize>, String> {
+    let mut consumers: Vec<usize> = Vec::new();
+    for &index in booted {
+        if tests[index].first_logon.is_some() && !consumers.iter().any(|&other| tests[other].first_logon == tests[index].first_logon) {
+            consumers.push(index);
+        }
+    }
+    let mut added = Vec::new();
+    for (position, consumer) in consumers.into_iter().enumerate() {
+        let producer = producer(&tests[consumer], position + 1)?;
+        if producer.image_key != tests[consumer].image_key {
+            return Err(format!("gerador do primeiro logon de {}: as imagens dele diferem das do teste", tests[consumer].id));
+        }
+        tests.push(producer);
+        added.push(tests.len() - 1);
+    }
+    Ok(added)
 }
 
 /// Os convidados que rodam na execução de cada teste escolhido: um teste
@@ -453,6 +556,9 @@ pub struct Run {
     pub guests: Vec<(usize, String)>,
     /// O que o anfitrião passa a mais ao `test-boot` ([`host_arguments`]).
     pub extra: Vec<String>,
+    /// O gerador do volume do primeiro logon feito que a execução espera
+    /// (o índice do teste dele, [`add_producers`]).
+    pub waits_for: Option<usize>,
 }
 
 /// As execuções na ordem em que vão para as pistas: as de mesmas imagens
@@ -481,13 +587,19 @@ pub fn runs(tests: &[Test], booted: &[usize], guests: &[Vec<usize>], repeat: usi
     };
     let mut runs = Vec::new();
     for (image, (_, mut members)) in groups.into_iter().enumerate() {
-        members.sort_by_key(|&index| std::cmp::Reverse(tests[index].limit));
+        // O gerador do primeiro logon feito vai antes dos testes que o
+        // esperam.
+        members.sort_by_key(|&index| (tests[index].produces.is_none(), std::cmp::Reverse(tests[index].limit)));
         for index in members {
             let own: &[usize] = booted.iter().position(|&host| host == index).and_then(|at| guests.get(at)).map_or(&[], Vec::as_slice);
             let extra = host_arguments(tests, index, own);
-            for round in 1..=repeat {
+            let waits_for = tests[index].first_logon.as_ref().and_then(|signature| tests.iter().position(|producer| producer.produces.as_ref() == Some(signature)));
+            // O gerador roda uma vez: as repetições usam o mesmo volume.
+            let rounds = if tests[index].produces.is_some() { 1 } else { repeat };
+            for round in 1..=rounds {
                 let guests = own.iter().map(|&guest| (guest, name(guest, round))).collect();
-                runs.push(Run { name: name(index, round), test: index, image, guests, extra: extra.clone() });
+                let run_name = if tests[index].produces.is_some() { tests[index].id.clone() } else { name(index, round) };
+                runs.push(Run { name: run_name, test: index, image, guests, extra: extra.clone(), waits_for });
             }
         }
     }
