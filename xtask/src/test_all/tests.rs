@@ -71,8 +71,8 @@ fn the_whole_round_compiles_one_kernel() {
     // Cada pasta de imagens é um volume: o processo inicial, o processo de
     // console, a conta de teste, as contas embutidas desligadas, o gancho
     // que desliga a cadeia, o escopo e-process (que leva os programas do
-    // boot do smss ao volume) e o volume do sistema no ntfs.sys (o disco
-    // particionado).
+    // boot do smss ao volume), o volume do sistema no ntfs.sys (o disco
+    // particionado) e o WoW64 (a camada de System32 e SysWOW64).
     let volume = |test: &Test| {
         let mut command = vec![String::from("test-boot")];
         command.extend(test.arguments.iter().cloned());
@@ -80,9 +80,9 @@ fn the_whole_round_compiles_one_kernel() {
         // Com a conta de teste, as contas embutidas desligadas não mudam o
         // volume (o gancho da conta já as desliga).
         let builtin = options.builtin_accounts_off && !options.test_account;
-        (options.initial_process.clone(), options.console_process, options.test_account, builtin, options.shutdown_chain, options.kernel_test_scope == "e-process", !options.system_volume.is_empty())
+        (options.initial_process.clone(), options.console_process, options.test_account, builtin, options.shutdown_chain, options.kernel_test_scope == "e-process", !options.system_volume.is_empty(), options.wow64)
     };
-    let mut volumes: Vec<(String, bool, bool, bool, bool, bool, bool)> = Vec::new();
+    let mut volumes: Vec<(String, bool, bool, bool, bool, bool, bool, bool)> = Vec::new();
     for run in &runs {
         let found = volume(&tests[run.test]);
         if !volumes.contains(&found) {
@@ -95,20 +95,23 @@ fn the_whole_round_compiles_one_kernel() {
     // teste (com ou sem entrada: o --start-menu do menu-iniciar e o --run
     // do prompt-de-comando ligam o gancho das contas embutidas, que o da
     // conta já cobre) e o da conta de teste com o gancho que desliga a
-    // cadeia (o desligamento-cadeia), mais o do e-process e os do
-    // volume-sistema (o boot comum e o da cadeia do smss).
+    // cadeia (o desligamento-cadeia), mais o do e-process, os do
+    // volume-sistema (o boot comum e o da cadeia do smss) e os do WoW64 (o
+    // processo de console e a conta de teste).
     let expected = [
-        ("", false, false, false, false, false, false),
-        ("", false, false, false, false, false, true),
-        ("", false, false, false, false, true, false),
-        ("", true, false, false, false, false, false),
-        ("smss", false, false, false, false, false, false),
-        ("smss", false, false, false, false, false, true),
-        ("smss", false, false, true, false, false, false),
-        ("smss", false, true, false, false, false, false),
-        ("smss", false, true, false, true, false, false),
+        ("", false, false, false, false, false, false, false),
+        ("", false, false, false, false, false, true, false),
+        ("", false, false, false, false, true, false, false),
+        ("", true, false, false, false, false, false, false),
+        ("", true, false, false, false, false, false, true),
+        ("smss", false, false, false, false, false, false, false),
+        ("smss", false, false, false, false, false, true, false),
+        ("smss", false, false, true, false, false, false, false),
+        ("smss", false, true, false, false, false, false, false),
+        ("smss", false, true, false, false, false, false, true),
+        ("smss", false, true, false, true, false, false, false),
     ];
-    assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain, e_process, system_volume)| (String::from(process), console, account, builtin, chain, e_process, system_volume)), "volumes da rodada");
+    assert_eq!(volumes, expected.map(|(process, console, account, builtin, chain, e_process, system_volume, wow64)| (String::from(process), console, account, builtin, chain, e_process, system_volume, wow64)), "volumes da rodada");
     let images = runs.iter().map(|run| run.image + 1).max().unwrap_or(0);
     assert_eq!(images, volumes.len(), "uma pasta de imagens por volume");
     // As execuções de uma pasta vêm juntas, e a de cada teste é a da chave dele.

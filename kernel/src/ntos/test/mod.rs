@@ -35,6 +35,7 @@ pub mod minifilters;
 pub mod minifilter_support;
 pub mod console_driver;
 pub mod console_process;
+pub mod wow64;
 pub mod kernel_waits;
 pub mod unwait_boost;
 pub mod extended_state;

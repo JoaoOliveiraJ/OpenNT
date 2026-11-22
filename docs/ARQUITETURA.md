@@ -52,7 +52,9 @@ kernel/src/
 │   │   ├── context/   contexto de thread (psctx)
 │   │   ├── notify/    rotinas de notificação (psnotify)
 │   │   ├── silo/      silos de servidor
-│   │   └── user/      serviços Nt* chamados pelo modo usuário
+│   │   ├── user/      serviços Nt* chamados pelo modo usuário
+│   │   └── wow64/     suporte aos programas x86 (EWOW64PROCESS, ntdll de 32
+│   │                  bits, área de CPU e contexto x86)
 │   ├── se/            segurança: descritores, ACLs, SIDs, SDDL, integridade de
 │   │                  código e níveis de assinatura
 │   │   ├── token/     tokens de acesso
@@ -4788,6 +4790,79 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   acorda. Teste: `ntos/test/multiprocess/create_user_process.rs`, um pai
   real no anel 3 que chama o handler com tudo na memória dele, imprime
   `MULTIPROCESS_OK`.
+- **WoW64: os programas x86** (`ps/wow64/`, `mm/peb_teb.rs`,
+  `mm/process_address_space.rs`, `hal/amd64/usermode.rs`): como no Windows
+  10 x64, um programa de 32 bits roda pela camada WoW64 da Microsoft
+  (wow64.dll, wow64win.dll e wow64cpu.dll de System32, a ntdll de 32 bits
+  e o resto de SysWOW64), e o kernel só dá o suporte do 19041:
+  - **a CPU**: a GDT de cada CPU tem os descritores de usuário do NT x64,
+    o código de 32 bits KGDT64_R3_CMCODE (0x23, D=1), os dados planos de 4
+    GB com B=1 (0x2B, o SS e o DS do código de 32 bits), o código de 64 bits
+    (0x33) e o KGDT64_R3_CMTEB (0x53, 0x3C00 bytes); DS/ES ficam em 0x2B e
+    FS em 0x53, como o KiSystemStartup deixa. A entrada de cada intervalo
+    de usuário faz a parte de segmentos do SwapContext (a base do CMTEB é
+    a TEB de 32 bits, TEB + 0x2000, numa thread de processo WoW64, senão o
+    ETHREAD.UserFsBase; o FS recarrega 0x53 e o IA32_FS_BASE recebe o
+    UserFsBase), e a saída guarda o IA32_FS_BASE de uma thread WoW64 no
+    UserFsBase. Os stubs de interrupção reconhecem o anel 3 pelo RPL do CS
+    (0x23 também) e salvam SegCs/SegSs no CONTEXT do intervalo; a retomada
+    volta ao modo de compatibilidade quando o CONTEXT tem CS 0x23. A
+    syscall vem sempre do código de 64 bits (o wow64cpu volta a ele por um
+    `jmp far 0x33`), e o CONTEXT dela fica com CS 0x33; a entrega ao
+    KiUserExceptionDispatcher também (o CS de 32 bits fica no CONTEXT e no
+    machine frame que o wow64.dll lê);
+  - **as imagens**: a seção de imagem e o carregador de PE aceitam o PE32
+    i386 (`mm/section/image_header.rs`, `mm/pe_loader.rs`: a ImageBase de
+    32 bits, o diretório de dados em +96, a relocação HIGHLOW), com a
+    SECTION_IMAGE_INFORMATION de 32 bits; uma imagem PE32 é sempre de modo
+    usuário, sem imports nem cookie pelo kernel;
+  - **o processo** (`ps/wow64/process.rs`): uma imagem i386 com a ntdll de
+    32 bits presente (o PsWow64IsMachineSupported) ganha o EWOW64PROCESS
+    (Machine, NtdllType PsWowX86SystemDll); o MiComputeProcessUserVa grava o
+    EPROCESS.HighestUserAddress (2 GB numa imagem sem
+    LARGE_ADDRESS_AWARE, 4 GB num WoW64 com ela, com o Wow64VaSpace4Gb), e
+    a escolha de VA do processo não passa dele; a PEB de 32 bits (o
+    MiInitializeWowPeb) e o bloco de parâmetros de 32 bits (o
+    PspWow64ThunkProcessParameters) ficam abaixo do limite, com cópias
+    baixas do apiset e do NLS para os ponteiros de 32 bits;
+  - **a ntdll de 32 bits** (`ps/wow64/system_dll.rs`): a de SysWOW64,
+    mapeada uma vez na raiz do System, na ImageBase dela, e copiada em
+    cada processo WoW64 (só nele), com o PsWowX86SharedInformation e o
+    LdrSystemDllInitBlock das duas ntdll (o Wow64SharedInformation que o
+    ProcessInit do wow64.dll lê);
+  - **a thread** (`ps/wow64/thread.rs`): a pilha nativa de 256 KB com a área
+    de CPU no topo (o PspWow64SetupCpuArea), a pilha de 32 bits (o
+    RtlpWow64CreateUserStack), a TEB de 32 bits depois da nativa (o
+    WowTebOffset que liga o UseWOW64 da ntdll nativa) e o contexto x86
+    inicial do PspWow64InitThreadGuestx86 (EIP no RtlUserThreadStart de 32
+    bits, EAX a rotina, EBX o argumento, que é a PEB de 32 bits na primeira
+    thread), no create_user_process e no NtCreateThreadEx;
+  - **o contexto x86 de outra thread** (`ps/wow64/context.rs`): a classe
+    ThreadWow64Context do NtQuery/SetInformationThread, que o wow64cpu usa
+    no Get/SetThreadContext de 32 bits (o PspWow64Get/SetContextThread):
+    parada no código de 32 bits, os registradores x86 estão no CONTEXT
+    nativo; no código de 64 bits, os de controle, os inteiros e XMM0-5 estão
+    na área de CPU e o x87, o MXCSR e os de depuração no nativo (com a
+    conversão FXSAVE/FNSAVE do x87). O NtSetContextThread não troca o CS de
+    32 bits de uma thread WoW64 (o KiVerifyContextRecord);
+  - **as opções de execução** (`ke/execute_options.rs`): a
+    ProcessExecuteFlags (o KeGet/SetExecuteOptions), que só um processo
+    WoW64 tem; um nativo responde NX permanente;
+  - **as consultas**: ProcessWow64Information (a PEB de 32 bits),
+    SystemEmulationBasicInformation (o HighestUserAddress do processo e a
+    máscara dos processadores em 32 bits) e
+    SystemSupportedProcessorArchitectures (a i386 de modo usuário).
+  O redirecionamento de arquivos e de registro é do wow64.dll; o Cm só
+  tira os bits KEY_WOW64_* do acesso, como o 19041. O volume só leva o
+  WoW64 com `--wow64` (a camada de System32, os programas x86 de SysWOW64
+  com o fecho dos imports e os assemblies x86 de WinSxS); sem a ntdll de 32
+  bits no volume não há WoW64. O `\KnownDlls32` da ntdll de 32 bits é do
+  smss.exe na cadeia real; só no boot sem o smss (o `wow64-console`) o
+  kernel o cria e o provisiona de SysWOW64, como já faz com o `\KnownDlls`.
+  Testes: `ntos/test/wow64.rs` (a GDT, o modo de compatibilidade no anel 3
+  com a preempção, o PE32, o limite de VA, a área de CPU, as opções de
+  execução, o `\KnownDlls32` só sem o smss, a junção do contexto x86 e o
+  x87), `wow64-console` e `wow64-bloco-de-notas` (na cadeia do smss).
 - **Memória de usuário de outro processo**: o kernel só toca a memória de
   usuário do processo corrente; para a de outro, anexa ao dono antes, como
   o KeStackAttachProcess do NT. O escopo é `ps/process_context.rs::
@@ -5833,7 +5908,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   NtAlpcAcceptConnectPort volta em *PortHandle junto com
   STATUS_PORT_CONNECTION_REFUSED (o UMPDC.dll conecta assim à `\PdcPort` e
   lê ali o motivo da recusa do pdc.sys). A mensagem de 32 bits
-  (ALPC_MSGFLG_WOW64_CALL) não existe: STATUS_NOT_SUPPORTED, com registro.
+  (ALPC_MSGFLG_WOW64_CALL, de um processo WoW64 x86) é convertida na
+  fronteira do serviço (`alpc/message/wow64.rs`): o PORT_MESSAGE32 e os
+  atributos de 32 bits viram a forma nativa numa cópia no processo de quem
+  chama e voltam à forma de 32 bits na saída (no 19041 a conversão é dos
+  AlpcpProbeAndCaptureMessageHeader e AlpcpCapture/Expose*Attribute32).
   O autoteste `kwait` recusa uma conexão com e sem a 0x80000. O
   NtQueryInformationPort só confere o handle e zera o ReturnLength.
   NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION

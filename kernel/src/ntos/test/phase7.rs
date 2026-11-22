@@ -7675,6 +7675,7 @@ pub fn run(assert: Assert) {
     user_syscalls_core(assert);
     user_index(assert);
     user_ring3(assert);
+    super::wow64::run(assert);
     user_address_floor(assert);
     user_tokens(assert);
     user_create_token(assert);

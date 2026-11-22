@@ -90,9 +90,10 @@ pub const WOW64: &str = "WOW64";
 /// a opção, cada (pid, serviço, status, chamador) sai nas quatro primeiras
 /// vezes e depois uma a cada 256, com a contagem.
 pub const TRACE_FAILURES: &str = "TRACEFAILURES";
-/// Cada abertura de arquivo do volume e cada consulta de atributos de um
-/// caminho que não existe vão para a serial (`[usermode] arquivo aberto:`,
-/// `[file-io] attributes absent:`).
+/// Cada abertura de arquivo do volume e cada abertura ou consulta de
+/// atributos de um caminho que não existe vão para a serial (`[usermode]
+/// arquivo aberto:`, `[file-io] open absent:`, `[file-io] attributes
+/// absent:`).
 pub const TRACE_FILES: &str = "TRACEFILES";
 /// `timer` ou `nmi`: o perfil por amostragem do processador de boot, pelo
 /// tique do relógio ou pela NMI que o xtask injeta (`kd/sampler.rs`).

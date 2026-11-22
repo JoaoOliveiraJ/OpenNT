@@ -553,7 +553,7 @@ fn seed_of(key: crate::host_language::HostKey) -> cm::seed::SeedKey {
 /// arquivo: SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT. `smss_boot`: o boot
 /// do processo inicial real (`--initial-process=smss`). `setup_command`: o
 /// gancho de primeiro boot do `--conta-de-teste`.
-pub fn machine_hives(smss_boot: bool, system_volume: bool, setup_command: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
+pub fn machine_hives(smss_boot: bool, system_volume: bool, setup_command: Option<&str>, wow64: bool) -> Vec<(&'static str, Vec<u8>)> {
     let mut system = cm::seed::system_keys(smss_boot);
     let mut software = cm::seed::software_keys(smss_boot);
     let mut default = cm::seed::default_keys();
@@ -588,6 +588,10 @@ pub fn machine_hives(smss_boot: bool, system_volume: bool, setup_command: Option
         // SYSTEM) e as classes COM e WinRT que o LogonUI ativa
         // (`logon_screen`).
         software.extend(crate::side_by_side::software_keys(&crate::windows_binaries::windows_directory()).into_iter().map(seed_of));
+        // Com o WoW64 (`--wow64`), os assemblies x86 dos programas de 32 bits.
+        if wow64 {
+            software.extend(crate::side_by_side::wow64_software_keys(&crate::windows_binaries::windows_directory()).into_iter().map(seed_of));
+        }
         software.extend(crate::fonts::software_keys().into_iter().map(seed_of));
         system.extend(crate::fonts::system_keys(&control_set).into_iter().map(seed_of));
         software.extend(crate::logon_screen::software_keys().into_iter().map(seed_of));

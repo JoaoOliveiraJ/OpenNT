@@ -572,6 +572,66 @@ const SERVICE_CHAIN_PROGRAMS: &[&str] = &["umpo.dll", "psmsrv.dll", "SystemEvent
 /// o shutdown.exe (o InitiateShutdownW do `--shutdown-test=cadeia`).
 const CONSOLE_PROGRAMS: &[&str] = &["conhost.exe", "cmd.exe", "cmdext.dll", "net.exe", "net1.exe", "reg.exe", "mpr.dll", "netmsg.dll", "neth.dll", "winmm.dll", "secinit.exe", "netjoin.dll", "netbios.dll", "shutdown.exe"];
 
+/// A camada WoW64 da Microsoft em System32 (`--wow64`): o wow64.dll, que a
+/// ntdll nativa carrega num processo x86, o wow64win.dll dos serviços do
+/// win32k e o wow64cpu.dll, que troca entre o código de 32 e o de 64 bits.
+const WOW64_LAYER: &[&str] = &["wow64.dll", "wow64win.dll", "wow64cpu.dll"];
+
+/// Os programas x86 de SysWOW64 (`--wow64`), em `\Windows\SysWOW64`: o
+/// cmd.exe e o notepad.exe de 32 bits, as cargas atrasadas do notepad
+/// (shell32, comdlg32, propsys, urlmon, winspool.drv), o que o user32 e o
+/// controle de edição carregam na janela (uxtheme, imm32 e a pilha de
+/// entrada de texto: msctf, textinputframework, coremessaging e
+/// coreuicomponents, com ole32, oleaut32 e clbcatq), e o fecho dos imports
+/// estáticos de todos pelos API sets desta máquina (a ntdll de 32 bits, que
+/// o kernel mapeia em todo processo WoW64, entre eles).
+const SYSWOW64_PROGRAMS: &[&str] = &[
+    "cmd.exe",
+    "notepad.exe",
+    "ntdll.dll",
+    "kernel32.dll",
+    "kernelbase.dll",
+    "kernel.appcore.dll",
+    "msvcrt.dll",
+    "ucrtbase.dll",
+    "msvcp_win.dll",
+    "combase.dll",
+    "rpcrt4.dll",
+    "advapi32.dll",
+    "sechost.dll",
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "comctl32.dll",
+    "gdi32.dll",
+    "gdi32full.dll",
+    "user32.dll",
+    "win32u.dll",
+    "shcore.dll",
+    "shlwapi.dll",
+    "shell32.dll",
+    "windows.storage.dll",
+    "wldp.dll",
+    "comdlg32.dll",
+    "propsys.dll",
+    "urlmon.dll",
+    "iertutil.dll",
+    "srvcli.dll",
+    "netutils.dll",
+    "winspool.drv",
+    "uxtheme.dll",
+    "imm32.dll",
+    "msctf.dll",
+    "textinputframework.dll",
+    "coremessaging.dll",
+    "coreuicomponents.dll",
+    "wintypes.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "clbcatq.dll",
+    "ntmarta.dll",
+    "ws2_32.dll",
+];
+
 /// A tela de logon da sessão 1: o dwm.exe que o dwminit.dll do winlogon
 /// cria e o LogonUI.exe do StartLogonUI, com o fecho dos imports estáticos
 /// deles (pelos API sets desta máquina) e as cargas sob demanda do caminho
@@ -1470,6 +1530,47 @@ impl Staged {
     }
 }
 
+/// Os arquivos do WoW64 (`--wow64`): a camada de System32
+/// ([`WOW64_LAYER`]) na raiz do volume, como o resto de System32, e os
+/// programas x86 ([`SYSWOW64_PROGRAMS`]) em `SYSWOW64/`, com os `.mui` de
+/// `SysWOW64\<idioma>` (no idioma de fallback quando o de interface não
+/// tem): a versão que o `ver` do cmd.exe escreve vem do cmd.exe.mui.
+pub fn wow64_files() -> Result<Vec<Staged>, String> {
+    let windows = windows_directory();
+    let (system32, syswow64) = (windows.join("System32"), windows.join("SysWOW64"));
+    let mut files = Vec::new();
+    for &name in WOW64_LAYER {
+        let source = system32.join(name);
+        let bytes = fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+        files.push(Staged::copied(name.to_uppercase(), bytes, &source));
+    }
+    let languages = crate::host_language::ui_languages();
+    let fallbacks = crate::host_language::fallback_languages(&languages);
+    let mut resources = 0;
+    for &name in SYSWOW64_PROGRAMS {
+        let source = syswow64.join(name);
+        let bytes = fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
+        files.push(Staged::copied(format!("SYSWOW64/{}", name.to_uppercase()), bytes, &source));
+        for (path, source) in crate::host_language::mui_files(&syswow64, name, &languages, &fallbacks) {
+            if let Ok(bytes) = fs::read(&source) {
+                files.push(Staged::copied(format!("SYSWOW64/{path}"), bytes, &source));
+                resources += 1;
+            }
+        }
+    }
+    // Os assemblies x86 de WinSxS (o comctl32.dll da versão 6 do notepad.exe
+    // de 32 bits), ao lado dos de amd64.
+    let mut assemblies = 0;
+    for (path, source) in crate::side_by_side::wow64_assembly_files(&windows) {
+        if let Ok(bytes) = fs::read(&source) {
+            files.push(Staged::copied(path, bytes, &source));
+            assemblies += 1;
+        }
+    }
+    println!("WoW64 no volume NTFS: {} de System32, {} de SysWOW64, {resources} recursos .mui e {assemblies} arquivos de WinSxS x86", WOW64_LAYER.len(), SYSWOW64_PROGRAMS.len());
+    Ok(files)
+}
+
 /// Arquivos do volume NTFS que existem nesta máquina, mais o PE do kernel
 /// gerado (`NTOSKRNL.EXE` e o caminho canônico em System32) e, com
 /// `initial_process == "smss"`, os programas de [`SMSS_PROGRAMS`]; cada um
@@ -1985,5 +2086,35 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "imports estáticos fora do volume: {missing:?}");
+    }
+
+    /// Todo import estático dos programas x86 de SysWOW64 resolve, pelos API
+    /// sets desta máquina, para outro programa de SysWOW64 do volume; os da
+    /// camada WoW64 de System32, para ela mesma ou para a ntdll nativa.
+    #[cfg(windows)]
+    #[test]
+    fn wow64_programs_close_under_static_imports() {
+        let windows = super::windows_directory();
+        let sets = api_sets(&std::fs::read(windows.join("System32").join("apisetschema.dll")).expect("apisetschema.dll"));
+        let staged: Vec<String> = super::SYSWOW64_PROGRAMS.iter().map(|name| name.to_ascii_lowercase()).collect();
+        let mut missing = Vec::new();
+        for name in super::SYSWOW64_PROGRAMS {
+            let importer = name.to_ascii_lowercase();
+            let bytes = std::fs::read(windows.join("SysWOW64").join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+            for import in static_imports(&bytes) {
+                if let Some(host) = host_of(&sets, &import, &importer).filter(|host| !staged.contains(host)) {
+                    missing.push(format!("{importer} -> {import} ({host})"));
+                }
+            }
+        }
+        for name in super::WOW64_LAYER {
+            let bytes = std::fs::read(windows.join("System32").join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+            for import in static_imports(&bytes) {
+                if import != "ntdll.dll" && !super::WOW64_LAYER.contains(&import.as_str()) {
+                    missing.push(format!("{name} -> {import}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "imports estáticos fora do WoW64 do volume: {missing:?}");
     }
 }

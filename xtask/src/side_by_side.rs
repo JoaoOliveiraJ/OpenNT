@@ -65,9 +65,10 @@ fn attribute(element: &str, name: &str) -> Option<String> {
     Some(String::from(&element[start..end]))
 }
 
-/// As dependências obrigatórias de amd64 de um manifesto: (nome em
+/// As dependências obrigatórias da arquitetura `architecture` (`amd64`, ou
+/// `x86` nos assemblies dos programas de SysWOW64) de um manifesto: (nome em
 /// minúsculas, token).
-fn dependencies(manifest: &str) -> Vec<(String, String)> {
+fn dependencies(manifest: &str, architecture: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for block in manifest.split("<dependency").skip(1) {
         let block = block.split("</dependency>").next().unwrap_or("");
@@ -76,8 +77,8 @@ fn dependencies(manifest: &str) -> Vec<(String, String)> {
             continue;
         }
         let Some(identity) = block.split("<assemblyIdentity").nth(1).and_then(|rest| rest.split('>').next()) else { continue };
-        let architecture = attribute(identity, "processorArchitecture").unwrap_or_default();
-        if !(architecture.eq_ignore_ascii_case("amd64") || architecture == "*") {
+        let wanted = attribute(identity, "processorArchitecture").unwrap_or_default();
+        if !(wanted.eq_ignore_ascii_case(architecture) || wanted == "*") {
             continue;
         }
         if let (Some(name), Some(token)) = (attribute(identity, "name"), attribute(identity, "publicKeyToken")) {
@@ -97,9 +98,10 @@ fn payload(manifest: &str) -> Vec<String> {
         .collect()
 }
 
-/// Os assemblies de [`ROOTS`] e as dependências obrigatórias deles, com as
-/// chaves de Winners, os manifestos e os arquivos desta máquina.
-fn resolve(windows: &Path) -> Resolved {
+/// Os assemblies de [`ROOTS`] da arquitetura `architecture` e as
+/// dependências obrigatórias deles, com as chaves de Winners, os manifestos e
+/// os arquivos desta máquina.
+fn resolve(windows: &Path, architecture: &str) -> Resolved {
     let mut resolved = Resolved { keys: Vec::new(), files: Vec::new() };
     #[cfg(windows)]
     {
@@ -111,7 +113,7 @@ fn resolve(windows: &Path) -> Resolved {
         let mut pending: Vec<(String, String)> = ROOTS.iter().map(|(name, token)| (String::from(*name), String::from(*token))).collect();
         let mut seen = BTreeSet::new();
         while let Some((name, token)) = pending.pop() {
-            let prefix = format!("amd64_{}_{token}_none_", abbreviated(&name));
+            let prefix = format!("{architecture}_{}_{token}_none_", abbreviated(&name));
             if !seen.insert(prefix.clone()) {
                 continue;
             }
@@ -122,14 +124,14 @@ fn resolve(windows: &Path) -> Resolved {
             let versions: Vec<String> = keys.iter().filter_map(|key| key.values.iter().find(|(value, kind, _)| value.is_empty() && *kind == 1).map(|(_, _, data)| String::from_utf16_lossy(&data.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<u16>>()).trim_end_matches('\0').to_string())).collect();
             resolved.keys.extend(keys);
             for version in versions {
-                let manifest = format!("amd64_{}_{token}_{version}_none_", abbreviated(&name));
+                let manifest = format!("{architecture}_{}_{token}_{version}_none_", abbreviated(&name));
                 for file in files.iter().filter(|file| file.to_lowercase().starts_with(&manifest) && file.to_lowercase().ends_with(".manifest")) {
                     let source = directory.join(file);
                     // A pasta do componente tem o nome do manifesto sem a
                     // extensão.
                     let component = &file[..file.len() - ".manifest".len()];
                     if let Ok(text) = std::fs::read_to_string(&source) {
-                        pending.extend(dependencies(&text));
+                        pending.extend(dependencies(&text, architecture));
                         for name in payload(&text) {
                             let payload = windows.join("WinSxS").join(component).join(&name);
                             if payload.is_file() {
@@ -146,7 +148,7 @@ fn resolve(windows: &Path) -> Resolved {
         }
     }
     #[cfg(not(windows))]
-    let _ = windows;
+    let _ = (windows, architecture);
     resolved
 }
 
@@ -163,7 +165,7 @@ const SETTINGS: &str = "Microsoft\\Windows\\CurrentVersion\\SMI";
 /// SOFTWARE.
 pub fn software_keys(windows: &Path) -> Vec<HostKey> {
     #[allow(unused_mut)]
-    let mut keys = resolve(windows).keys;
+    let mut keys = resolve(windows, "amd64").keys;
     #[cfg(windows)]
     crate::host_language::registry::copy(crate::host_language::registry::LOCAL_MACHINE, &format!("SOFTWARE\\{SETTINGS}"), SETTINGS, true, &mut keys);
     keys
@@ -172,7 +174,23 @@ pub fn software_keys(windows: &Path) -> Vec<HostKey> {
 /// Os manifestos dos assemblies e os arquivos deles: (caminho no volume,
 /// arquivo de origem).
 pub fn assembly_files(windows: &Path) -> Vec<(String, PathBuf)> {
-    let mut files = resolve(windows).files;
+    let mut files = resolve(windows, "amd64").files;
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Os assemblies x86 dos programas de SysWOW64 (`--wow64`): o contexto de
+/// ativação de um processo WoW64 resolve os mesmos [`ROOTS`] com
+/// `processorArchitecture` x86 (o comctl32.dll da versão 6 do notepad.exe de
+/// 32 bits); as subchaves de Winners deles.
+pub fn wow64_software_keys(windows: &Path) -> Vec<HostKey> {
+    resolve(windows, "x86").keys
+}
+
+/// Os manifestos e os arquivos dos assemblies x86 de [`wow64_software_keys`].
+pub fn wow64_assembly_files(windows: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = resolve(windows, "x86").files;
     files.sort();
     files.dedup();
     files

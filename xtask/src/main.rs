@@ -164,6 +164,8 @@ opcoes de build:   --release --build-dir=DIR --user-program=shell
                    sobre o arquivo de paginacao)
                    --console-process (boot comum: o cmd.exe real com um console sem janela;
                    o volume leva os programas de modo usuario do smss)
+                   --wow64 (o volume leva a camada WoW64 e os programas x86 de SysWOW64;
+                   com --console-process, o cmd.exe do console e o de 32 bits)
                    --conta-de-teste (com --initial-process=smss: o winlogon cria no primeiro boot
                    a conta local Usuario, sem senha, no grupo Administradores)
                    --desligar-contas-embutidas (com --initial-process=smss: o winlogon desabilita
@@ -327,6 +329,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             memory_pressure: false,
             tpm: false,
             console_process: false,
+            wow64: false,
             test_account: false,
             builtin_accounts_off: false,
             shutdown_chain: false,
@@ -399,6 +402,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--fast-service-exit" => {}
             "--memory-pressure" => parsed.build.memory_pressure = true,
             "--console-process" => parsed.build.console_process = true,
+            "--wow64" => parsed.build.wow64 = true,
             "--conta-de-teste" => parsed.build.test_account = true,
             "--desligar-contas-embutidas" => parsed.build.builtin_accounts_off = true,
             "--initial-process" => parsed.build.initial_process = required()?,

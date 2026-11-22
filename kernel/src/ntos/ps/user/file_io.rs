@@ -408,6 +408,10 @@ pub fn create(out: u64, name: &str, iosb: u64, disposition: u32, request: &OpenR
         }
         Ok(status)
     })?;
+    // Com TRACEFILES, também a abertura de um caminho que não existe.
+    if reparse.is_none() && matches!(status, 0xC000_0034 | 0xC000_003A) && crate::ntos::init::boot_config::trace_files() {
+        debug_print!("[file-io] open absent: {} ({:#x})", name, status);
+    }
     Ok(match reparse {
         Some(found) => Created::Reparse(found),
         None => Created::Done(status),

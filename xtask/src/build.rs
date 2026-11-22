@@ -155,6 +155,10 @@ pub struct BuildOptions {
     /// volume NTFS, que leva os programas de modo usuário do boot do smss
     /// (o cmd.exe, o conhost.exe e as DLLs deles); o kernel é o mesmo.
     pub console_process: bool,
+    /// `--wow64`: o volume leva a camada WoW64 de System32 e os programas
+    /// x86 de SysWOW64 (`windows_binaries::wow64_files`), e o kernel recebe
+    /// `WOW64`: com `--console-process`, o cmd.exe do console é o de 32 bits.
+    pub wow64: bool,
 }
 
 impl BuildOptions {
@@ -227,6 +231,9 @@ impl BuildOptions {
         }
         if self.console_process {
             words.push(String::from(name::CONSOLE_PROCESS));
+        }
+        if self.wow64 {
+            words.push(String::from(name::WOW64));
         }
         Ok(words.join(" "))
     }
@@ -316,6 +323,7 @@ impl BuildOptions {
         options.kernel_test_scope = String::from("none");
         options.system_volume.clear();
         options.console_process = false;
+        options.wow64 = false;
         options.test_account = false;
         options.builtin_accounts_off = false;
         options.shutdown_chain = false;
@@ -488,7 +496,10 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // cfgmgr32 do programa Win32 do teste); as hives e o espaço livre seguem
     // os do boot comum.
     let staged_programs = if options.console_process || options.kernel_test_scope == "e-process" { "smss" } else { options.initial_process.as_str() };
-    let staged = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
+    let mut staged = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
+    if options.wow64 {
+        staged.extend(crate::windows_binaries::wow64_files()?);
+    }
     // O volume do sistema no ntfs.sys guarda cada arquivo no caminho real da
     // instalação (o ntfs.sys não conhece os aliases do NTFS do kernel).
     let staged = if options.real_layout() { crate::windows_binaries::real_layout(staged) } else { staged };
@@ -514,7 +525,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     }
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
-    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", !options.system_volume.is_empty(), setup_command.as_deref()) {
+    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", !options.system_volume.is_empty(), setup_command.as_deref(), options.wow64) {
         let path = format!("Windows/System32/config/{name}");
         origins.push((path.clone(), None));
         ntfs_files.push((path, image));
@@ -605,6 +616,7 @@ mod tests {
             memory_pressure: false,
             tpm: false,
             console_process: false,
+            wow64: false,
             test_account: false,
             builtin_accounts_off: false,
             shutdown_chain: false,
