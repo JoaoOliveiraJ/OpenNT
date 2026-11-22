@@ -26,8 +26,9 @@
 //! [`inherit_handles`]), o VAD, a raiz das tabelas de páginas (`directory_table_base`,
 //! gravada por `mm::process_address_space`), as threads de usuário e o
 //! início do laço (`threads`, `started`), os módulos do loader do kernel, a
-//! imagem principal e as cópias privadas da ntdll, do apiset e do NLS na
-//! raiz própria, e a parte da identidade do processo de usuário que não cabe
+//! imagem principal e as páginas da ntdll, do apiset e do NLS na raiz
+//! própria (divididas ou em cópias privadas), e a parte da identidade do
+//! processo de usuário que não cabe
 //! no EPROCESS (caminho da imagem, PEB_LDR_DATA do kernel, exports das
 //! imagens mapeadas); PID, PEB e cookie são do próprio EPROCESS. O resto do
 //! estado global de `state.rs` entra aqui à medida que sai de lá.
@@ -97,9 +98,10 @@ pub struct ProcessState {
     /// das seções: a imagem principal (o papel da vista da seção de imagem
     /// no VAD do NT), desfeita na raiz dele no término.
     images: SpinLock<Vec<PeImage>>,
-    /// As cópias privadas das faixas de sistema (ntdll, apiset, NLS) na raiz
-    /// própria do processo, (VA, frame); vazio na raiz do System.
-    system_pages: SpinLock<Vec<(u64, u64)>>,
+    /// As páginas das faixas de sistema (ntdll, apiset, NLS) na raiz própria
+    /// do processo, pela VA: as divididas da fotografia e as cópias
+    /// privadas; vazio na raiz do System.
+    system_pages: SpinLock<BTreeMap<u64, memory::SystemPage>>,
     /// O bloco do diagnóstico de falhas já impresso (`crash_report`): 0, ou
     /// o bit 32 com o código da falha.
     pub crash_reported: AtomicU64,
@@ -134,13 +136,35 @@ impl ProcessState {
     }
 
     /// O processo passa a possuir as cópias privadas de sistema.
-    pub fn adopt_system_pages(&self, pages: Vec<(u64, u64)>) {
+    pub fn adopt_system_pages(&self, pages: BTreeMap<u64, memory::SystemPage>) {
         self.system_pages.lock().extend(pages);
     }
 
-    /// Quantas páginas de cópia de sistema o processo tem.
+    /// Quantas páginas de sistema o processo tem em cópias privadas.
     pub fn system_page_count(&self) -> usize {
-        self.system_pages.lock().len()
+        self.system_pages.lock().values().filter(|page| page.private()).count()
+    }
+
+    /// Quantas páginas de sistema o processo divide com os outros.
+    pub fn shared_system_page_count(&self) -> usize {
+        self.system_pages.lock().values().filter(|page| !page.private()).count()
+    }
+
+    /// A página de sistema da VA (frame e proteção correntes).
+    pub fn system_page(&self, va: u64) -> Option<memory::SystemPage> {
+        self.system_pages.lock().get(&(va & !0xFFF)).cloned()
+    }
+
+    /// A proteção e o frame novos de uma página de sistema reprotegida.
+    pub fn record_system_protect(&self, va: u64, protect: u32) -> bool {
+        self.system_pages.lock().get_mut(&(va & !0xFFF)).map(|page| page.protect = protect).is_some()
+    }
+
+    /// A cópia privada de uma página de sistema dividida que vai ficar
+    /// gravável (`memory::system_write_copy`): `None` sem página ou já
+    /// privada.
+    pub fn system_write_copy(&self, va: u64) -> Option<Result<u64, u32>> {
+        memory::system_write_copy(&self.system_pages, va)
     }
 }
 
@@ -164,7 +188,7 @@ pub fn create(process: u64, process_id: u64) -> Result<Arc<ProcessState>, Kernel
         started: AtomicBool::new(false),
         modules: SpinLock::new(BTreeMap::new()),
         images: SpinLock::new(Vec::new()),
-        system_pages: SpinLock::new(Vec::new()),
+        system_pages: SpinLock::new(BTreeMap::new()),
         crash_reported: AtomicU64::new(0),
         address_creation: SharedLock::new(),
     });
@@ -261,7 +285,7 @@ pub fn destroy(process: u64) -> bool {
             }
         }
         let root = removed.directory_table_base.load(Ordering::Acquire);
-        memory::release_private_copies(root, core::mem::take(&mut *removed.system_pages.lock()));
+        memory::release_system_pages(root, core::mem::take(&mut *removed.system_pages.lock()));
         let threads = core::mem::take(&mut *removed.threads.lock());
         drop(threads);
     }

@@ -679,9 +679,10 @@ fn locate_manifest(image_base: u64) -> Result<Option<Manifest>, KernelError> {
 /// A imagem no VAD do processo corrente (o processo em montagem, anexado).
 /// O nome é o do FILE_OBJECT da imagem (o `\Device\...` do volume, como o
 /// MmGetFileNameForAddress devolve e o carregador grava para as DLLs), com o
-/// arquivo do volume quando há.
-fn push_image(base: u64, size: u64, name: &str, file: Option<Arc<VolumeFile>>) {
-    memory::insert_region(Space::current(), RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name: String::from(name), file }));
+/// arquivo do volume quando há. `system` é o EPROCESS cujas páginas de
+/// sistema formam a imagem (a ntdll), ou 0.
+fn push_image(base: u64, size: u64, name: &str, file: Option<Arc<VolumeFile>>, system: u64) {
+    memory::insert_region(Space::current(), RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name: String::from(name), file, system }));
 }
 
 /// O nome nativo (`\Device\...`) de uma imagem do volume: o do ponto de
@@ -706,7 +707,7 @@ fn map_main_image(process_pointer: u64, source: &Arc<dyn ImageSource>, options: 
     owner.adopt_image(image);
     // SAFETY: o EPROCESS em montagem, retido pelo chamador.
     unsafe { Eprocess::at(process_pointer) }.section_base_address.set(placed.1);
-    push_image(placed.1, placed.2, &image_region_name(file.as_ref(), name), file);
+    push_image(placed.1, placed.2, &image_region_name(file.as_ref(), name), file, 0);
     Ok((placed, information))
 }
 
@@ -858,7 +859,10 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             // (o nome que a região dela no System já leva).
             let ntdll_file = volume_files::lookup_volume_file("\\SystemRoot\\System32\\ntdll.dll").filter(|file| !file.directory());
             let ntdll_source = ntdll.notification_source.as_ref().map_or_else(|| ntdll.full_name.clone(), |source| String::from(source.name()));
-            push_image(ntdll.image_base, ntdll.size_of_image, &image_region_name(ntdll_file.as_ref(), &ntdll_source), ntdll_file);
+            // Com raiz própria, a ntdll do processo são as páginas de sistema
+            // dele (`loader::map_system_images`).
+            let system = if Space::current().root() == crate::ntos::mm::process_address_space::SYSTEM_ROOT { 0 } else { process_pointer };
+            push_image(ntdll.image_base, ntdll.size_of_image, &image_region_name(ntdll_file.as_ref(), &ntdll_source), ntdll_file, system);
             // A entrada vê o rsp "depois de um call" (8 mod 16) com endereço
             // de retorno 0, para falhar alto se o programa retornar.
             // A pilha pelo RtlCreateUserStack do PspSetupUserStack, com o

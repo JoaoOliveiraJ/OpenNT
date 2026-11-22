@@ -10,8 +10,11 @@
 //!   do exe de cada um, e a marca gravada na pilha de um não aparece na do
 //!   outro. Os frames dessas VAs são distintos, e a raiz do System não vê
 //!   nenhum deles.
-//! - A ntdll está na mesma VA nos dois, com o cabeçalho MZ, em frames
-//!   diferentes entre si e da cópia de sistema (cópias privadas).
+//! - A ntdll está na mesma VA nos dois, com o cabeçalho MZ: as páginas
+//!   somente leitura (o cabeçalho) no mesmo frame nos dois, o da fotografia,
+//!   diferente da cópia de sistema e sem escrita na PTE; as graváveis em
+//!   cópias privadas de cada um. Os dois têm as mesmas contas de páginas de
+//!   sistema privadas e divididas, mais divididas que privadas.
 //! - Depois os dois rodam em sequência e saem com os próprios códigos.
 //! - No fim, nada sobra: sem estado, raízes já sem página de usuário além da
 //!   visão da KUSER enquanto o EPROCESS está retido, devolvidas no último
@@ -155,10 +158,31 @@ pub fn run(assert: Assert) {
     let again_a = inspect(a, peb_a, ntdll, mark_at, None);
     assert(seen_a.is_some_and(|(image_base, _, mark)| image_base == FIRST.0 && mark == FIRST_MARK) && seen_b.is_some_and(|(image_base, _, mark)| image_base == SECOND.0 && mark == SECOND_MARK), "raiz: a mesma VA de PEB e de pilha tem conteudo diferente em cada processo (ImageBaseAddress e marca)");
     assert(again_a.is_some_and(|(_, _, mark)| mark == FIRST_MARK), "raiz: a marca gravada na pilha do segundo nao aparece na do primeiro");
-    let ntdll_frames = frames(ntdll);
-    assert(ntdll != 0 && seen_a.is_some_and(|(_, mz, _)| mz == 0x5A4D) && seen_b.is_some_and(|(_, mz, _)| mz == 0x5A4D) && private(ntdll_frames) && ntdll_frames.2 != 0, "raiz: a ntdll na mesma VA nos dois, em copias privadas distintas da de sistema");
+    // O cabeçalho da ntdll (somente leitura) é o mesmo frame nos dois, da
+    // fotografia, fora da raiz do System; uma página gravável da ntdll (a de
+    // bring-up do bundle não tem nenhuma) é uma cópia privada em cada um.
+    let header_frames = frames(ntdll);
+    let shared = |(in_a, in_b, in_system): (u64, u64, u64)| in_a != 0 && in_a == in_b && in_system != 0 && in_system != in_a;
+    let header_read_only = paging::read_leaf_in(root_a, ntdll).is_some_and(|entry| entry & 3 == 1) && paging::read_leaf_in(root_b, ntdll).is_some_and(|entry| entry & 3 == 1);
+    let writable = loader::first_private_ntdll_page();
+    assert(ntdll != 0 && seen_a.is_some_and(|(_, mz, _)| mz == 0x5A4D) && seen_b.is_some_and(|(_, mz, _)| mz == 0x5A4D) && shared(header_frames) && header_read_only && (writable == 0 || private(frames(writable))), "raiz: a ntdll na mesma VA nos dois, com as paginas somente leitura divididas e as gravaveis em copias privadas");
     let copies = |process: u64| process_state::get(process).map_or(0, |state| state.system_page_count());
-    assert(copies(a) != 0 && copies(a) == copies(b), "raiz: cada processo tem as proprias copias de sistema");
+    let divided = |process: u64| process_state::get(process).map_or(0, |state| state.shared_system_page_count());
+    assert(copies(a) == copies(b) && divided(a) > copies(a) && divided(a) == divided(b), "raiz: cada processo tem as proprias copias das paginas de sistema gravaveis e divide as outras");
+    // O NtProtectVirtualMemory que torna gravável o cabeçalho dividido em A
+    // dá a A a cópia privada antes (o PAGE_WRITECOPY resolvido): A grava na
+    // cópia, B continua no frame da fotografia, sem a escrita.
+    let cells = guest::alloc_bytes(0x18);
+    guest::write64(cells, ntdll);
+    guest::write64(cells + 8, 0x1000);
+    let copies_before = copies(a);
+    let reprotected = cells != 0 && memory::protect_in(memory::Space::of(a), cells, cells + 8, 0x04, cells + 0x10, false).is_ok_and(|status| status == 0);
+    let previous = guest::read32(cells + 0x10);
+    guest::free_bytes(cells);
+    let marked = process_context::with_process(a, || guest::try_write::<u16>(ntdll + 0x40, 0x4D41).is_ok()).unwrap_or(false);
+    let after = frames(ntdll);
+    let b_intact = process_context::with_process(b, || guest::try_read::<u16>(ntdll + 0x40).ok()).ok().flatten() != Some(0x4D41);
+    assert(reprotected && previous == 0x02 && marked && after.0 != header_frames.0 && after.1 == header_frames.1 && b_intact && copies(a) == copies_before + 1 && copies(b) == copies_before, "raiz: a pagina dividida da ntdll que fica gravavel em A ganha a copia privada de A, e B nao ve a escrita");
 
     // Em sequência, cada um com o próprio código de saída.
     let first_exit = user_process::run_created(first);

@@ -8,15 +8,20 @@
 //! processo); a ntdll é do sistema (`NTDLL_MODULE`) e vale em todo processo;
 //! o schema parseado fica em `API_SET`.
 //!
-//! Cópias de sistema: a ntdll, o apiset e o NLS são mapeados uma vez, na
+//! Páginas de sistema: a ntdll, o apiset e o NLS são mapeados uma vez, na
 //! raiz do System (anexado a ele, venha o pedido de onde vier), nas VAs que
 //! todo processo reserva para eles; logo depois as páginas são fotografadas
-//! (`TEMPLATES`). Cada processo com raiz própria recebe cópias privadas
-//! dessas páginas nas mesmas VAs ([`map_system_images`], o PspMapSystemDll
-//! do NT), devolvidas no término dele: nada de frame de usuário dividido
-//! entre processos, e a ntdll de cada um começa com os dados intactos. Os
-//! exports e o mapa SSN → nome continuam globais (a base é a mesma em
-//! todos).
+//! (`TEMPLATES`), cada uma com a proteção que os processos recebem: a das
+//! seções do PE na ntdll, PAGE_READONLY no apiset e no NLS. Cada processo
+//! com raiz própria recebe essas páginas nas mesmas VAs
+//! ([`map_system_images`], o PspMapSystemDll do NT e as vistas somente
+//! leitura das seções NLS): as de código e somente leitura sobre os frames
+//! da fotografia, divididos entre todos, e as graváveis em cópias privadas,
+//! então a ntdll de cada um começa com os dados intactos. Uma página
+//! dividida que o NtProtectVirtualMemory torna gravável ganha antes a cópia
+//! privada (o PAGE_WRITECOPY da vista de imagem), pela região da ntdll no
+//! VAD do processo ([`ImageRegion::system`]). Os exports e o mapa SSN →
+//! nome continuam globais (a base é a mesma em todos).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -25,7 +30,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use super::state::{self, write_unicode_string, write_user_bytes, write_user_wide, RegionKind, UserRegion};
-use super::memory::{self, Space, TemplatePage};
+use super::memory::{self, Space, SystemTemplate};
 use super::process_state;
 use crate::ntos::mm::process_address_space::SYSTEM_ROOT;
 use crate::ntos::ps::{process, process_context};
@@ -119,6 +124,21 @@ pub struct ImageRegion {
     pub size: u64,
     pub name: String,
     pub file: Option<Arc<VolumeFile>>,
+    /// O EPROCESS cujas páginas de sistema (`ProcessState::system_page`)
+    /// formam a imagem: a ntdll de um processo com raiz própria, com a
+    /// proteção de cada página e a cópia na escrita das divididas. 0 nas
+    /// outras imagens.
+    pub system: u64,
+}
+
+impl ImageRegion {
+    /// A página de sistema da página `index` da imagem.
+    fn system_page(&self, index: u64) -> Option<memory::SystemPage> {
+        if self.system == 0 {
+            return None;
+        }
+        process_state::get(self.system)?.system_page(self.base + index * 0x1000)
+    }
 }
 
 impl UserRegion for ImageRegion {
@@ -134,12 +154,27 @@ impl UserRegion for ImageRegion {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn page_protect(&self, index: u64) -> Option<u32> {
+        self.system_page(index).map(|page| page.protect)
+    }
+    fn frame(&self, index: u64) -> Option<u64> {
+        self.system_page(index).map(|page| page.frame)
+    }
+    fn record_protect(&self, index: u64, protect: u32, _physical: u64) -> bool {
+        self.system != 0 && process_state::get(self.system).is_some_and(|state| state.record_system_protect(self.base + index * 0x1000, protect))
+    }
+    fn write_copy(&self, index: u64) -> Option<Result<u64, u32>> {
+        if self.system == 0 {
+            return None;
+        }
+        process_state::get(self.system)?.system_write_copy(self.base + index * 0x1000)
+    }
 }
 
 /// A imagem entra no VAD do espaço: o processo que a carregou, ou o System
 /// para as imagens de sistema mapeadas uma vez (ntdll, apiset).
 fn push_image(space: Space, base: u64, size: u64, name: String, file: Option<Arc<VolumeFile>>) {
-    memory::insert_region(space, RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name, file }));
+    memory::insert_region(space, RegionKind::ProcessImages, Arc::new(ImageRegion { base, size, name, file, system: 0 }));
 }
 
 /// O volume de onde vêm a ntdll, o schema e o NLS.
@@ -150,10 +185,13 @@ static API_SET: SpinLock<Option<Arc<Schema>>> = SpinLock::new(None);
 static NTDLL_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
 /// A imagem do apiset schema (base, tamanho), mapeada uma vez.
 static API_SET_IMAGE: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
-/// As páginas das cópias de sistema (ntdll, apiset e cada tabela NLS)
-/// fotografadas logo depois do mapeamento na raiz do System, por nome: a
-/// origem das cópias privadas de cada processo com raiz própria.
-static TEMPLATES: SpinLock<BTreeMap<&'static str, Arc<Vec<TemplatePage>>>> = SpinLock::new(BTreeMap::new());
+/// As páginas de sistema (ntdll, apiset e cada tabela NLS) fotografadas
+/// logo depois do mapeamento na raiz do System, por nome: as páginas que os
+/// processos com raiz própria dividem e a origem das cópias privadas deles.
+static TEMPLATES: SpinLock<BTreeMap<&'static str, Arc<SystemTemplate>>> = SpinLock::new(BTreeMap::new());
+
+/// PAGE_READONLY: a proteção das páginas do apiset e do NLS nos processos.
+const PAGE_READONLY: u32 = 0x02;
 
 /// A VA cai numa imagem de sistema vista por todo processo na mesma VA (a
 /// ntdll e o apiset schema: a cópia de sistema ou a privada do processo).
@@ -180,35 +218,54 @@ fn system_frames(image: &PeImage) {
     }
 }
 
-/// Fotografa `[base, base + size)` da raiz do System como a cópia `name`;
-/// uma fotografia anterior do mesmo nome (a ntdll mapeada de novo) volta ao
-/// PFN.
-fn record_template(name: &'static str, base: u64, size: u64) -> Result<(), KernelError> {
-    let pages = memory::snapshot_system_range(base, size)?;
-    let previous = TEMPLATES.lock().insert(name, Arc::new(pages));
-    if let Some(pages) = previous.and_then(|previous| Arc::try_unwrap(previous).ok()) {
-        memory::release_template(pages);
-    }
+/// Fotografa `[base, base + size)` da raiz do System como as páginas de
+/// sistema `name`, com a proteção `protection(índice da página)` de cada
+/// uma nos processos; uma fotografia anterior do mesmo nome (a ntdll mapeada
+/// de novo) volta ao PFN quando o último processo que a mapeia termina.
+fn record_template(name: &'static str, base: u64, size: u64, protection: impl Fn(u64) -> u32) -> Result<(), KernelError> {
+    let template = memory::snapshot_system_range(base, size, protection)?;
+    let previous = TEMPLATES.lock().insert(name, Arc::new(template));
+    drop(previous);
     Ok(())
 }
 
+/// Uma imagem de sistema que os processos dividem (a ntdll; outra DLL de
+/// sistema, como a ntdll de 32 bits, segue o mesmo caminho), já carregada
+/// na raiz do System: os frames dela entram na conta das páginas de sistema
+/// e a fotografia `name` leva a proteção das seções do PE de cada página,
+/// como a vista da seção de imagem do PspMapSystemDll. Cada processo com
+/// raiz própria a recebe pelo [`map_system_images`], e a região dela no VAD
+/// do processo leva `ImageRegion::system` = o EPROCESS.
+pub fn register_system_image(name: &'static str, image: &PeImage) -> Result<(), KernelError> {
+    system_frames(image);
+    let protections = pe_loader::user_section_protections(image);
+    record_template(name, image.image_base, image.size_of_image, |page| protections.get(page as usize).copied().unwrap_or(PAGE_READONLY))
+}
+
 /// O PspMapSystemDll e as vistas de sistema do processo em montagem (o
-/// corrente, anexado): com raiz própria, ele recebe cópias privadas da
-/// ntdll, do apiset e do NLS nas VAs de sistema, com as permissões das
-/// originais, e as devolve no término. Na raiz do System nada muda: ele já
-/// vê as cópias de sistema.
+/// corrente, anexado): com raiz própria, ele recebe as páginas da ntdll, do
+/// apiset e do NLS nas VAs de sistema (`memory::map_system_pages`: as de
+/// código e somente leitura divididas, as graváveis em cópias privadas) e
+/// as desfaz no término. Na raiz do System nada muda: ele já vê as cópias de
+/// sistema.
 pub fn map_system_images() -> Result<(), KernelError> {
     let root = Space::current().root();
     if root == SYSTEM_ROOT {
         return Ok(());
     }
-    let Some(owner) = process_state::current() else { return Err(KernelError::new("copias de sistema sem estado do processo")) };
-    let templates: Vec<Arc<Vec<TemplatePage>>> = TEMPLATES.lock().values().cloned().collect();
-    let mut mapped = Vec::new();
-    let result = templates.iter().try_for_each(|pages| memory::map_private_copies(root, pages, &mut mapped));
+    let Some(owner) = process_state::current() else { return Err(KernelError::new("paginas de sistema sem estado do processo")) };
+    let templates: Vec<Arc<SystemTemplate>> = TEMPLATES.lock().values().cloned().collect();
+    let mut mapped = BTreeMap::new();
+    let result = templates.iter().try_for_each(|template| memory::map_system_pages(root, template, &mut mapped));
     // O que foi mapeado é do processo, mesmo numa falha no meio.
     owner.adopt_system_pages(mapped);
     result
+}
+
+/// A primeira página gravável (a primeira cópia privada) da ntdll nos
+/// processos, ou 0 (autotestes).
+pub fn first_private_ntdll_page() -> u64 {
+    TEMPLATES.lock().get("ntdll").and_then(|template| template.pages.iter().find(|page| matches!(page.protect & 0xFF, 0x04 | 0x08 | 0x40 | 0x80)).map(|page| page.va)).unwrap_or(0)
 }
 
 pub fn ntfs_volume() -> Option<Arc<Ntfs>> {
@@ -310,8 +367,7 @@ pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
 fn map_system_ntdll(source: Arc<dyn ImageSource>, notification: Arc<dyn FileSource>, origin: &str) -> Result<(), KernelError> {
     let source_name = String::from(notification.name());
     let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, notify_image: false, ..LoadOptions::default() })?;
-    system_frames(&image);
-    record_template("ntdll", image.image_base, image.size_of_image)?;
+    register_system_image("ntdll", &image)?;
     let exports = image.exports.exports.clone();
     state::with(|state| {
         state.ntdll_exports = Some(exports.clone());
@@ -367,7 +423,7 @@ fn map_system_api_set_schema() -> Result<(), KernelError> {
     let image = pe_loader::load_user(bytes, &LoadOptions { skip_imports: true, no_execute: true, notify_image: false, ..LoadOptions::default() })?;
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
     system_frames(&image);
-    record_template("apiset", image.image_base, image.size_of_image)?;
+    record_template("apiset", image.image_base, image.size_of_image, |_| PAGE_READONLY)?;
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
     *API_SET_IMAGE.lock() = (image.image_base, image.size_of_image);
@@ -398,7 +454,7 @@ fn map_system_nls_data() -> Result<state::NlsVas, KernelError> {
         let size = (bytes.len() as u64).div_ceil(0x1000) * 0x1000;
         let va = memory::map_shared_user_region(size)?;
         write_user_bytes(va, &bytes)?;
-        record_template(name, va, size)?;
+        record_template(name, va, size, |_| PAGE_READONLY)?;
         state::with(|state| {
             if let Some(vas) = state.nls_vas.as_mut() {
                 match key {

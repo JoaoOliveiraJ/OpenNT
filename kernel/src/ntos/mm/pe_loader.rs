@@ -390,6 +390,20 @@ fn user_page_protection(page: u64, size_of_headers: u64, sections: &[SectionInfo
     }
 }
 
+/// A proteção Win32 de cada página de uma imagem de usuário já carregada
+/// pelas seções do PE ([`user_page_protection`], o SizeOfHeaders lido do
+/// cabeçalho no primeiro frame): a que a vista de imagem do 19041 dá a cada
+/// página, para quem mapeia as páginas da imagem em outros processos (a
+/// ntdll de sistema, `ps/user/loader`).
+pub fn user_section_protections(image: &PeImage) -> Vec<u32> {
+    let Some(&header) = image.pages.first() else { return Vec::new() };
+    let e_lfanew = physical::read32(header + 0x3C) as u64;
+    // IMAGE_NT_HEADERS64: Signature (4), FileHeader (20), e o SizeOfHeaders
+    // a 60 bytes do IMAGE_OPTIONAL_HEADER64.
+    let size_of_headers = if e_lfanew + 24 + 64 <= 0x1000 { physical::read32(header + e_lfanew + 24 + 60) as u64 } else { 0x1000 };
+    (0..image.size_of_image.div_ceil(0x1000)).map(|index| user_page_protection(index * 0x1000, size_of_headers, &image.sections, false, false)).collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SectionInfo {
     pub name: String,

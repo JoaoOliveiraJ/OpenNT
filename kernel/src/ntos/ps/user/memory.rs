@@ -45,12 +45,14 @@
 //! todo processo vê na mesma VA (a KUSER_SHARED_DATA, a ntdll, o apiset e o
 //! NLS). Dois processos com raiz própria podem usar a mesma VA.
 //!
-//! Cópias de sistema: a ntdll, o apiset e o NLS são mapeados uma vez na raiz
-//! do System; logo depois o loader fotografa as páginas
-//! (`snapshot_system_range`), e cada processo com raiz própria recebe cópias
-//! privadas delas nas mesmas VAs (`map_private_copies`), devolvidas no
-//! término dele. Nenhum frame de usuário com escrita é dividido entre
-//! processos.
+//! Páginas de sistema: a ntdll, o apiset e o NLS são mapeados uma vez na
+//! raiz do System; logo depois o loader fotografa as páginas
+//! (`snapshot_system_range`), e cada processo com raiz própria as recebe nas
+//! mesmas VAs (`map_system_pages`): as de código e somente leitura sobre os
+//! frames da fotografia, divididos, e as graváveis em cópias privadas,
+//! desfeitas no término dele. Nenhum frame de usuário com escrita é
+//! dividido entre processos: uma página dividida que fica gravável ganha
+//! antes a cópia (`system_write_copy`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -991,7 +993,7 @@ pub fn map_user_region(size: u64) -> Result<u64, KernelError> {
 
 /// Igual, numa faixa de sistema (a cópia de sistema do NLS) mapeada na raiz
 /// do System, na mesma VA que todo processo reserva; cada processo com raiz
-/// própria recebe uma cópia privada dela (`map_private_copies`).
+/// própria recebe as páginas da fotografia dela (`map_system_pages`).
 pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
     let rounded = size.div_ceil(PAGE) * PAGE;
     if rounded == 0 {
@@ -1021,73 +1023,165 @@ pub fn map_shared_user_region(size: u64) -> Result<u64, KernelError> {
 
 /// Uma página de uma faixa de sistema fotografada logo depois do mapeamento
 /// na raiz do System: a VA, o frame com a cópia (do Mm, fora de toda tabela
-/// de páginas) e as permissões da PTE de origem.
+/// de páginas), a proteção Win32 que os processos recebem e os bits de
+/// cache da PTE de origem.
 pub struct TemplatePage {
     pub va: u64,
     pub frame: u64,
-    pub flags: u64,
-    pub nx: bool,
+    pub protect: u32,
+    pub cache: u64,
 }
 
-/// Bits da PTE de origem que a cópia repete.
-const TEMPLATE_FLAGS: u64 = paging::PAGE_PRESENT | paging::PAGE_RW | paging::PAGE_USER | paging::PAGE_PWT | paging::PAGE_PCD;
+/// A fotografia de uma faixa de sistema (a ntdll, o apiset, uma tabela
+/// NLS): as páginas protótipo que os processos dividem, como as da seção de
+/// imagem da ntdll que o PspMapSystemDll do 19041 mapeia em cada processo e
+/// as vistas somente leitura das seções NLS. Os frames voltam ao PFN quando
+/// a última referência cai: a fotografia substituída (a ntdll mapeada de
+/// novo) e o último processo que ainda mapeia uma página dela.
+pub struct SystemTemplate {
+    pub pages: Vec<TemplatePage>,
+}
+
+impl Drop for SystemTemplate {
+    fn drop(&mut self) {
+        for page in &self.pages {
+            pfn::free_page(page.frame);
+        }
+    }
+}
+
+/// Bits de cache da PTE de origem que as páginas dos processos repetem.
+const TEMPLATE_CACHE: u64 = paging::PAGE_PWT | paging::PAGE_PCD;
 
 /// Fotografa em frames próprios as páginas presentes de `[base, base +
-/// size)` na raiz do System: a origem das cópias por processo, que não muda
-/// com o que rodar depois na raiz do System. Uma falha devolve os frames já
-/// tirados.
-pub fn snapshot_system_range(base: u64, size: u64) -> Result<Vec<TemplatePage>, KernelError> {
-    let mut pages = Vec::new();
-    let mut va = base & !(PAGE - 1);
+/// size)` na raiz do System, com a proteção `protection(índice da página)`
+/// que os processos recebem: a origem das páginas de sistema de cada
+/// processo, que não muda com o que rodar depois na raiz do System. Uma
+/// falha devolve os frames já tirados.
+pub fn snapshot_system_range(base: u64, size: u64, protection: impl Fn(u64) -> u32) -> Result<SystemTemplate, KernelError> {
+    let mut template = SystemTemplate { pages: Vec::new() };
+    let first = base & !(PAGE - 1);
+    let mut va = first;
     while va < base + size {
         if let Some(page) = paging::query_page_in(SYSTEM_ROOT, va, false).filter(|page| page.page_size == PAGE) {
             let frame = pfn::alloc_page_for(pfn::FrameUse::SystemDll);
             if frame == 0 {
-                release_template(pages);
                 return Err(KernelError::new("PFN esgotado na fotografia de uma faixa de sistema"));
             }
             physical::write_bytes(frame, &physical::read_bytes(page.physical_address & !(PAGE - 1), PAGE as usize));
-            pages.push(TemplatePage { va, frame, flags: page.flags & TEMPLATE_FLAGS, nx: page.nx });
+            template.pages.push(TemplatePage { va, frame, protect: protection((va - first) / PAGE), cache: page.flags & TEMPLATE_CACHE });
         }
         va += PAGE;
     }
-    Ok(pages)
+    Ok(template)
 }
 
-/// Devolve ao PFN os frames de uma fotografia.
-pub fn release_template(pages: Vec<TemplatePage>) {
-    for page in pages {
-        pfn::free_page(page.frame);
+/// Uma página de sistema na raiz de um processo: o frame que a PTE usa, a
+/// proteção corrente e, enquanto a página é a compartilhada, a fotografia
+/// que a contém (que fica viva enquanto algum processo a mapeia). Sem
+/// fotografia, o frame é a cópia privada do processo.
+#[derive(Clone)]
+pub struct SystemPage {
+    pub frame: u64,
+    pub protect: u32,
+    pub template: Option<Arc<SystemTemplate>>,
+}
+
+impl SystemPage {
+    /// A página é a cópia privada do processo.
+    pub fn private(&self) -> bool {
+        self.template.is_none()
     }
 }
 
-/// Cópias privadas das páginas fotografadas na raiz `root`, nas mesmas VAs
-/// e com as mesmas permissões (o PspMapSystemDll e as vistas de sistema de
-/// um processo novo, sem frame dividido). Cada página mapeada entra em
-/// `mapped` (VA, frame) na hora: o dono a devolve no término, mesmo depois
-/// de uma falha no meio.
-pub fn map_private_copies(root: u64, pages: &[TemplatePage], mapped: &mut Vec<(u64, u64)>) -> Result<(), KernelError> {
-    for page in pages {
-        let frame = pfn::alloc_page_for(pfn::FrameUse::SystemDllCopy);
-        if frame == 0 {
-            return Err(KernelError::with_status("PFN esgotado na copia de sistema do processo", 0xC000_0017));
+/// A proteção é de cópia na escrita: PAGE_READWRITE, PAGE_WRITECOPY e as
+/// variantes EXECUTE (o MM_WRITECOPY que a vista de imagem dá às seções
+/// graváveis).
+fn copy_on_write(protect: u32) -> bool {
+    matches!(protect & 0xFF, 0x04 | 0x08 | 0x40 | 0x80)
+}
+
+/// Os bits da PTE de usuário de uma página de sistema e se ela fica sem
+/// execução: P menos em PAGE_NOACCESS, R/W só numa cópia privada gravável.
+fn system_pte(protect: u32, cache: u64, private: bool) -> (u64, bool) {
+    let present = protect & 0xFF != 0x01;
+    let writable = private && copy_on_write(protect);
+    (paging::PAGE_USER | cache | if present { paging::PAGE_PRESENT } else { 0 } | if writable { paging::PAGE_RW } else { 0 }, protect & 0xF0 == 0)
+}
+
+/// As páginas de sistema da fotografia na raiz `root`, nas mesmas VAs (o
+/// PspMapSystemDll e as vistas NLS de um processo novo): as de código e
+/// somente leitura sobre os frames da fotografia, divididos entre os
+/// processos e sem escrita; as graváveis sobre cópias privadas feitas na
+/// hora, como a vista de imagem faz com as seções graváveis
+/// (`image_segment::map_view`). Cada página mapeada entra em `mapped` (pela
+/// VA) na hora: o dono a desfaz no término, mesmo depois de uma falha no
+/// meio.
+pub fn map_system_pages(root: u64, template: &Arc<SystemTemplate>, mapped: &mut BTreeMap<u64, SystemPage>) -> Result<(), KernelError> {
+    for page in &template.pages {
+        let private = copy_on_write(page.protect);
+        let frame = if private {
+            let copy = pfn::alloc_page_for(pfn::FrameUse::SystemDllCopy);
+            if copy == 0 {
+                return Err(KernelError::with_status("PFN esgotado na copia de sistema do processo", 0xC000_0017));
+            }
+            physical::write_bytes(copy, &physical::read_bytes(page.frame, PAGE as usize));
+            copy
+        } else {
+            page.frame
+        };
+        let (flags, nx) = system_pte(page.protect, page.cache, private);
+        if !paging::map_page_in(root, page.va, frame, flags, MapOptions { nx, ..MapOptions::default() }) {
+            if private {
+                pfn::free_page(frame);
+            }
+            return Err(KernelError::new(alloc::format!("mapPage falhou na pagina de sistema em {:#x}", page.va)));
         }
-        physical::write_bytes(frame, &physical::read_bytes(page.frame, PAGE as usize));
-        if !paging::map_page_in(root, page.va, frame, page.flags, MapOptions { nx: page.nx, ..MapOptions::default() }) {
-            pfn::free_page(frame);
-            return Err(KernelError::new(alloc::format!("mapPage falhou na copia de sistema em {:#x}", page.va)));
-        }
-        mapped.push((page.va, frame));
+        mapped.insert(page.va, SystemPage { frame, protect: page.protect, template: (!private).then(|| template.clone()) });
     }
     Ok(())
 }
 
-/// Desfaz na raiz `root` as cópias privadas de [`map_private_copies`] e
-/// devolve os frames.
-pub fn release_private_copies(root: u64, pages: Vec<(u64, u64)>) {
-    for (va, frame) in pages {
+/// A cópia privada da página de sistema `va` de `pages` (as de um processo)
+/// que vai ficar gravável (o PAGE_WRITECOPY resolvido no
+/// NtProtectVirtualMemory): `None` sem página ou com ela já privada; o
+/// frame da fotografia continua com os outros processos. O frame da cópia
+/// vem com a trava solta.
+pub fn system_write_copy(pages: &SpinLock<BTreeMap<u64, SystemPage>>, va: u64) -> Option<Result<u64, u32>> {
+    let va = va & !(PAGE - 1);
+    let source = pages.lock().get(&va).filter(|page| !page.private()).map(|page| page.frame)?;
+    let copy = pfn::alloc_page_for(pfn::FrameUse::SystemDllCopy);
+    if copy == 0 {
+        return Some(Err(0xC000_009A));
+    }
+    physical::write_bytes(copy, &physical::read_bytes(source, PAGE as usize));
+    let template = {
+        let mut pages = pages.lock();
+        match pages.get_mut(&va).filter(|page| !page.private() && page.frame == source) {
+            Some(page) => {
+                page.frame = copy;
+                page.template.take()
+            }
+            None => {
+                drop(pages);
+                pfn::free_page(copy);
+                return None;
+            }
+        }
+    };
+    // A fotografia pode cair aqui, fora da trava.
+    drop(template);
+    Some(Ok(copy))
+}
+
+/// Desfaz na raiz `root` as páginas de sistema de [`map_system_pages`]:
+/// devolve as cópias privadas ao PFN e solta as fotografias.
+pub fn release_system_pages(root: u64, pages: BTreeMap<u64, SystemPage>) {
+    for (va, page) in pages {
         paging::unmap_page_in(root, va, MapOptions::default());
-        pfn::free_page(frame);
+        if page.private() {
+            pfn::free_page(page.frame);
+        }
     }
 }
 

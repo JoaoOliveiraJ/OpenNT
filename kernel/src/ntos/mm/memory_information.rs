@@ -206,11 +206,12 @@ pub fn print_frame_owners() {
 
 /// `[mm] processo`: uma linha por processo com raiz própria, com o working
 /// set (`process_usage`, em páginas, e a parte privada), o commit privado
-/// (EPROCESS.CommitCharge) e as cópias de sistema; depois a soma.
+/// (EPROCESS.CommitCharge) e as páginas de sistema (ntdll, apiset, NLS) em
+/// cópias privadas e divididas; depois a soma.
 pub fn print_processes() {
     use crate::ntos::inc::field::NtStruct;
     use crate::ntos::inc::types::Eprocess;
-    let (mut working_set, mut private, mut commit, mut copies, mut count) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut working_set, mut private, mut commit, mut copies, mut shared, mut count) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for state in crate::ntos::ps::user::process_state::all() {
         let root = state.directory_table_base.load(Ordering::Acquire);
         if root == 0 || root == super::process_address_space::SYSTEM_ROOT {
@@ -221,15 +222,16 @@ pub fn print_processes() {
         // na lista (o término tira o estado antes do último dereference).
         let process = unsafe { Eprocess::at(state.process) };
         let name: alloc::string::String = process.image_file_name.iter().map(|byte| byte.get()).take_while(|&byte| byte != 0).map(char::from).collect();
-        let (pages, private_pages, charge, system) = (usage.current / 0x1000, usage.private / 0x1000, process.commit_charge.get(), state.system_page_count() as u64);
-        crate::debug_print!("[mm] processo {} {}: working set {} paginas (privado {}), commit {}, copias de sistema {}", state.process_id, name, pages, private_pages, charge, system);
+        let (pages, private_pages, charge, system, divided) = (usage.current / 0x1000, usage.private / 0x1000, process.commit_charge.get(), state.system_page_count() as u64, state.shared_system_page_count() as u64);
+        crate::debug_print!("[mm] processo {} {}: working set {} paginas (privado {}), commit {}, copias de sistema {} (divididas {})", state.process_id, name, pages, private_pages, charge, system, divided);
         working_set += pages;
         private += private_pages;
         commit += charge;
         copies += system;
+        shared += divided;
         count += 1;
     }
-    crate::debug_print!("[mm] processos: {} com raiz propria, working set {} paginas (privado {}), commit {}, copias de sistema {}", count, working_set, private, commit, copies);
+    crate::debug_print!("[mm] processos: {} com raiz propria, working set {} paginas (privado {}), commit {}, copias de sistema {} (divididas {})", count, working_set, private, commit, copies, shared);
 }
 
 fn print_memory_line(event: &str, process_id: u64) {
