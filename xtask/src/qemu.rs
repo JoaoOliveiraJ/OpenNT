@@ -1417,8 +1417,48 @@ fn write_capture(image: &crate::png::Image, target: &Path, result: &Result<(), S
     Ok(())
 }
 
-/// Nome do `sendkey` do HMP para um caractere.
-fn key_name(character: char) -> Option<String> {
+/// O layout de teclado do convidado é o ABNT2: o volume leva o layout que o
+/// perfil do sistema desta máquina pré-carrega (`host_language`), e o do
+/// Brasil é o KBDBR.DLL.
+fn guest_abnt2() -> bool {
+    static ABNT2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ABNT2.get_or_init(|| crate::host_language::keyboard_layout_files().first().is_some_and(|file| file.eq_ignore_ascii_case("KBDBR.DLL")))
+}
+
+/// Os caracteres cuja tecla no ABNT2 não é a do layout dos EUA (o `sendkey`
+/// manda a posição da tecla): `Some(None)` para os que só saem por tecla
+/// morta (o acento grave, o til e o circunflexo), que o texto não usa.
+fn abnt2_key_name(character: char) -> Option<Option<String>> {
+    let plain = |name: &str| Some(Some(name.to_string()));
+    let shifted = |name: &str| Some(Some(format!("shift-{name}")));
+    match character {
+        // A tecla ao lado do Z (o `less` do QEMU) e a de `;` à direita do ponto.
+        '\\' => plain("less"),
+        '|' => shifted("less"),
+        ';' => plain("slash"),
+        ':' => shifted("slash"),
+        // A barra e a interrogação pelo AltGr com Q e W.
+        '/' => plain("alt_r-q"),
+        '?' => plain("alt_r-w"),
+        '[' => plain("bracket_right"),
+        '{' => shifted("bracket_right"),
+        ']' => plain("backslash"),
+        '}' => shifted("backslash"),
+        '\'' => plain("grave_accent"),
+        '"' => shifted("grave_accent"),
+        '`' | '~' | '^' => Some(None),
+        _ => None,
+    }
+}
+
+/// Nome do `sendkey` do HMP para um caractere: na posição do layout dos
+/// EUA, ou na do ABNT2 com `abnt2`.
+fn key_name(character: char, abnt2: bool) -> Option<String> {
+    if abnt2 {
+        if let Some(name) = abnt2_key_name(character) {
+            return name;
+        }
+    }
     let plain = |name: &str| Some(name.to_string());
     let shifted = |name: &str| Some(format!("shift-{name}"));
     match character {
@@ -1514,6 +1554,11 @@ pub fn check_keys(text: &str) -> Result<(), String> {
 /// `{ctrl_r-scroll_lock-scroll_lock}` ou `{spc}`). `{clique}` ([`CLICK`]) é o
 /// clique do botão esquerdo do mouse onde o ponteiro estiver.
 fn key_names(text: &str) -> Result<Vec<String>, String> {
+    key_names_in(text, false)
+}
+
+/// [`key_names`] no layout dos EUA ou no ABNT2.
+fn key_names_in(text: &str, abnt2: bool) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let mut characters = text.chars();
     while let Some(character) = characters.next() {
@@ -1529,7 +1574,7 @@ fn key_names(text: &str) -> Result<Vec<String>, String> {
             }
             combo
         } else {
-            key_name(character).ok_or_else(|| format!("tecla sem mapa no sendkey: {character:?}"))?
+            key_name(character, abnt2).ok_or_else(|| format!("tecla sem mapa no sendkey: {character:?}"))?
         });
     }
     Ok(names)
@@ -1540,11 +1585,18 @@ fn key_names(text: &str) -> Result<Vec<String>, String> {
 /// esse nome.
 const CLICK: &str = "clique";
 
-/// Digita `text` ([`key_names`]): cada tecla presa 30 ms, 70 ms entre elas;
-/// o [`CLICK`] aperta e solta o botão esquerdo do mouse.
+/// Digita `text` no Windows do convidado ([`key_names`], no layout dele:
+/// [`guest_abnt2`]): cada tecla presa 30 ms, 70 ms entre elas; o [`CLICK`]
+/// aperta e solta o botão esquerdo do mouse.
 fn type_keys(monitor: &mut TcpStream, text: &str) -> Result<(), String> {
+    type_keys_in(monitor, text, guest_abnt2())
+}
+
+/// [`type_keys`] no layout dos EUA ou no ABNT2 (o shell do kernel lê as
+/// teclas no dos EUA).
+fn type_keys_in(monitor: &mut TcpStream, text: &str, abnt2: bool) -> Result<(), String> {
     let mut send = |command: String| monitor.write_all(command.as_bytes()).map_err(|error| format!("monitor HMP: {error}"));
-    for name in key_names(text)? {
+    for name in key_names_in(text, abnt2)? {
         if name == CLICK {
             send("mouse_button 1\n".into())?;
             thread::sleep(Duration::from_millis(50));
@@ -2641,7 +2693,7 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
         send_after(&test.marker)?;
         if let Some(keys) = &test.keys {
             cursor = wait_for("[shell] pronto", 0)?;
-            with_monitor(&mut |monitor| type_keys(monitor, keys).map(|()| String::new()))?;
+            with_monitor(&mut |monitor| type_keys_in(monitor, keys, false).map(|()| String::new()))?;
         }
         for expected in &test.expect {
             cursor = wait_for(expected, cursor)?;
@@ -2836,6 +2888,19 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
 mod tests {
     use super::*;
     use crate::png::Image;
+
+    /// O caminho do Executar no ABNT2: os dois pontos pela tecla de `;` à
+    /// direita do ponto, a barra invertida pela tecla ao lado do Z; no
+    /// layout dos EUA, as teclas de sempre.
+    #[test]
+    fn run_path_keys_follow_the_guest_layout() {
+        let abnt2 = key_names_in("C:\\Wi", true).unwrap();
+        assert_eq!(abnt2, ["shift-c", "shift-slash", "less", "shift-w", "i"]);
+        let us = key_names_in("C:\\Wi", false).unwrap();
+        assert_eq!(us, ["shift-c", "shift-semicolon", "backslash", "shift-w", "i"]);
+        assert!(key_names_in("~", true).is_err());
+        assert_eq!(key_names_in("/?", true).unwrap(), ["alt_r-q", "alt_r-w"]);
+    }
 
     /// As escritas do disco de dados na tabela do `info blockstats` do QEMU
     /// 11.1 (a resposta do monitor, com o eco do comando antes).
