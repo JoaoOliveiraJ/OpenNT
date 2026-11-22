@@ -1037,6 +1037,11 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // carrega (ERROR_DLL_INIT_FAILED no host do OSIM).
     "srpapi.dll",
     "fwbase.dll",
+    // O DeviceAccessPolicyManager (deviceaccess.dll, em processo): o
+    // CapabilityAuthorizationHandler::Initialize das extensões de
+    // implantação o cria por CoCreateInstance em cada registro de pacote;
+    // sem a classe, REGDB_E_CLASSNOTREG e o OSIM falha o registro.
+    "deviceaccess.dll",
     // A classe WinRT Windows.Networking.Connectivity.NetworkInformation, que
     // o AppReadiness ativa ao subir (sem ela, REGDB_E_CLASSNOTREG e o
     // serviço para), com a carga atrasada do uso de dados.
@@ -1064,6 +1069,16 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     "NPSM.dll",
     "fcon.dll",
     "ExecModelClient.dll",
+    // O proxy/stub das interfaces do modelo de execução (ExecModelProxy),
+    // que empacota o IBackgroundAccessManagerService: o HampSystemBamStart
+    // do psmserviceexthost.dll o pede pelo BackgroundAccessManager do
+    // ExecModelClient na primeira sessão que o HAM vê (o
+    // HamServicingOpenPackageHandle do PLM do sihost, o modernexecserver.dll,
+    // quando o AppXSvc pede o AllowServicing). Sem a interface registrada a
+    // criação volta REGDB_E_IIDNOTREG, o HAM responde 0xC0040155 (o HRESULT
+    // com os bits de erro do NTSTATUS) e o registro dos pacotes da caixa
+    // falha.
+    "execmodelproxy.dll",
     "Windows.System.Launcher.dll",
     "OneCoreCommonProxyStub.dll",
     // Os imports estáticos dos componentes.
