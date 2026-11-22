@@ -89,11 +89,17 @@ const LOGON_UI_LOCAL_KEYS: &[&str] = &["SessionData", "Creative", "LogonSoundPla
 /// AppResolver pedem) e o UserManager (Windows.System.User,
 /// Windows.System.UserPicker...), serviços com a identidade SYSTEM; e o
 /// WindowManagement, o sihost.exe (`ExePath`) com as classes de janela do
-/// shell imersivo. O RPCSS acha o servidor pelo `Server` da classe e inicia
-/// o serviço do `ServiceName` (os de `user_services`) ou o programa do
+/// shell imersivo; e o camsvc (um serviço de `inbox_packages`), com a
+/// CapabilityProvisioning que as extensões de implantação do AppXSvc pedem,
+/// e o CrossContainerCamSvc, o mesmo serviço com a classe
+/// Windows.Internal.CapabilityAccess.CapabilityAccess: o camsvc registra as
+/// fábricas de todas as classes dele ao subir e, com uma sem registro, o
+/// RoRegisterActivationFactories volta REGDB_E_CLASSNOTREG e o serviço para.
+/// O RPCSS acha o servidor pelo `Server` da classe e inicia o serviço do
+/// `ServiceName` (os de `user_services` e `inbox_packages`) ou o programa do
 /// `ExePath` (o sihost.exe de `windows_binaries`).
 #[cfg(windows)]
-const WINRT_SERVERS: &[&str] = &["DispBrokerDesktopSvc", "StateRepository", "UserManager", "WindowManagement"];
+const WINRT_SERVERS: &[&str] = &["DispBrokerDesktopSvc", "StateRepository", "UserManager", "WindowManagement", "camsvc", "CrossContainerCamSvc"];
 
 /// As classes COM fora de processo dos processos do shell, sem
 /// `InprocServer32`: o processo que as hospeda registra a fábrica

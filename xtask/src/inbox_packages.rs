@@ -120,10 +120,15 @@ const APP_READINESS_CLASS: &str = "{C980E4C2-C178-4572-935D-A8A429884806}";
 const APP_READINESS_APPID: &str = "{88283d7c-46f4-47d5-8fc2-db0b5cf0cb54}";
 
 /// Os serviços do registro: o AppReadiness e o AppXSvc (com Parameters,
-/// Security e TriggerInfo). O StateRepository vai com os de
-/// `user_services`.
+/// Security e TriggerInfo) e o gerenciador de acesso às capacidades
+/// (camsvc, o CapabilityAccessManager.dll no `svchost.exe -k appmodel -p`,
+/// início sob demanda): o servidor da classe WinRT
+/// Windows.Internal.CapabilityAccess.Management.CapabilityProvisioning, que
+/// o CapabilityAuthorizationHandler::Initialize das extensões de
+/// implantação ativa em cada registro de pacote (o servidor camsvc de
+/// `logon_screen`). O StateRepository vai com os de `user_services`.
 #[cfg_attr(not(windows), allow(dead_code))]
-const SERVICES: &[&str] = &["AppReadiness", "AppXSvc"];
+const SERVICES: &[&str] = &["AppReadiness", "AppXSvc", "camsvc"];
 
 /// O provedor de confiança WINTRUST_ACTION_GENERIC_VERIFY_V2 (as funções do
 /// WINTRUST.DLL em `Cryptography\Providers\Trust\<etapa>\{guid}`).

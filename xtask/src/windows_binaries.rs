@@ -1042,6 +1042,9 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // implantação o cria por CoCreateInstance em cada registro de pacote;
     // sem a classe, REGDB_E_CLASSNOTREG e o OSIM falha o registro.
     "deviceaccess.dll",
+    // O serviço camsvc (`inbox_packages`), servidor da CapabilityProvisioning
+    // que o mesmo Initialize ativa logo depois.
+    "CapabilityAccessManager.dll",
     // A classe WinRT Windows.Networking.Connectivity.NetworkInformation, que
     // o AppReadiness ativa ao subir (sem ela, REGDB_E_CLASSNOTREG e o
     // serviço para), com a carga atrasada do uso de dados.
