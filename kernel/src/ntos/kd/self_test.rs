@@ -21,6 +21,14 @@
 //! tem o ponto de recuperação (`kd::recovery`):
 //! - `falta`: uma leitura fora da forma canônica (#GP sem tratador);
 //! - `bugcheck`: KeBugCheckEx(MANUALLY_INITIATED_CRASH).
+//!
+//! Um roda num AP, para as paradas fora do BSP (o teste `kd-smp2`):
+//! - `ap [n]`: depois de a máquina seguir, uma worker do kernel (o work item
+//!   reservado no boot com o depurador, como o do `monitor kill`) põe um
+//!   trabalho na caixa do primeiro AP com o anel 3 armado
+//!   (`smp::start_job`); o AP executa, no laço ocioso dele, um `int 3` fixo
+//!   (a parada é do AP: o BSP fica congelado) e chama `ap_target` `n`
+//!   vezes, onde o roteiro arma breakpoints de software e de hardware.
 
 use core::arch::global_asm;
 use core::fmt::Write;
@@ -29,7 +37,8 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use super::packet::Payload;
 use super::{exception_filter, stop, user_debug};
 use crate::hal::cpu;
-use crate::ntos::ke::clock;
+use crate::ntos::io::work_items;
+use crate::ntos::ke::{clock, smp};
 
 global_asm!(
     r#"
@@ -49,6 +58,12 @@ opennt_kd_test_step_fault:
     int3
     mov rax, qword ptr [rax]
     ret
+# `int 3` fixo do trabalho do AP (`ap`): a parada do AP, com o RIP depois
+# dele.
+.global opennt_kd_test_processor_break
+opennt_kd_test_processor_break:
+    int3
+    ret
 .popsection
 "#
 );
@@ -56,6 +71,7 @@ opennt_kd_test_step_fault:
 extern "sysv64" {
     fn opennt_kd_test_halt();
     fn opennt_kd_test_step_fault() -> u64;
+    fn opennt_kd_test_processor_break();
 }
 
 const TEST_NONE: u8 = 0;
@@ -75,7 +91,65 @@ const NONCANONICAL: u64 = 0x8000_0000_0000_0000;
 /// MANUALLY_INITIATED_CRASH, o código do despejo pedido.
 const MANUALLY_INITIATED_CRASH: u32 = 0xE2;
 
-const USAGE: &str = "uso: kdtest nmi [ms] | cli <ms> | excecao <codigo> <1|2> | hlt | passo-falta | falta | bugcheck\n";
+const USAGE: &str = "uso: kdtest nmi [ms] | cli <ms> | excecao <codigo> <1|2> | hlt | passo-falta | falta | bugcheck | ap [n]\n";
+
+/// O work item do trabalho do AP (0 antes do [`initialize`]).
+static AP_WORK_ITEM: AtomicU64 = AtomicU64::new(0);
+/// As chamadas de `ap_target` pedidas pelo `ap` (0 = nenhum pedido).
+static AP_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+/// Com o depurador ligado (`--kd`), reserva o work item do `ap` e o põe na
+/// fila, à espera de um pedido (como o do `monitor kill`). Chamada uma vez
+/// no boot, depois do pool.
+pub fn initialize() {
+    if !stop::active() || AP_WORK_ITEM.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let item = crate::ntos::mm::guest_memory::alloc_bytes(work_items::work_item_size());
+    if item == 0 {
+        crate::debug_print!("[kd] work item do kdtest ap nao reservado: o autoteste fica desligado");
+        return;
+    }
+    AP_WORK_ITEM.store(item, Ordering::Release);
+    work_items::queue_kernel_work_item(item, post_processor_job, 0, Some(processor_job_requested));
+}
+
+fn processor_job_requested() -> bool {
+    AP_REQUEST.load(Ordering::Acquire) != 0
+}
+
+/// A rotina do work item, a PASSIVE_LEVEL numa worker do BSP: o trabalho vai
+/// à caixa do primeiro AP com o anel 3 armado, sem esperar a conclusão (a
+/// máquina para no meio dele), e o item volta à fila.
+fn post_processor_job(_device: u64, _context: u64) {
+    let count = AP_REQUEST.load(Ordering::Acquire);
+    let slot = (0..smp::ap_slot_count()).find_map(|index| smp::ap_slot(index).filter(|&slot| smp::is_scheduling(slot)));
+    match slot {
+        Some(slot) => match smp::start_job(slot, processor_job as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64, [count, 0, 0, 0]) {
+            Ok(true) => crate::debug_print!("[kd] kdtest ap: trabalho na caixa do AP slot {} ({} chamadas)", slot, count),
+            Ok(false) => crate::debug_print!("[kd] kdtest ap: a caixa do AP slot {} esta ocupada", slot),
+            Err(error) => crate::debug_print!("[kd] kdtest ap: {}", error),
+        },
+        None => crate::debug_print!("[kd] kdtest ap: nenhum AP com o anel 3 armado (--user-smp)"),
+    }
+    AP_REQUEST.store(0, Ordering::Release);
+    work_items::queue_kernel_work_item(AP_WORK_ITEM.load(Ordering::Acquire), post_processor_job, 0, Some(processor_job_requested));
+}
+
+/// O trabalho no AP (o laço ocioso dele, no anel 0): o `int 3` fixo e as
+/// chamadas de [`ap_target`].
+extern "win64" fn processor_job(count: u64, _: u64, _: u64, _: u64) -> u64 {
+    // SAFETY: `int3; ret`, reconhecido pela entrada do vetor 3 do AP (a IDT
+    // inteira, copiada do BSP no armar do anel 3).
+    unsafe { opennt_kd_test_processor_break() };
+    (0..count).fold(0, |total, index| total + ap_target(index))
+}
+
+/// O ponto dos breakpoints do roteiro no trabalho do AP.
+#[inline(never)]
+pub fn ap_target(index: u64) -> u64 {
+    core::hint::black_box(index + 1)
+}
 
 fn arm(kind: u8, argument: u64, chance: u8, what: &str, out: &mut Payload) {
     TEST_ARGUMENT.store(argument, Ordering::Relaxed);
@@ -111,6 +185,15 @@ pub fn command(line: &str, out: &mut Payload) {
             let _ = writeln!(out, "a leitura voltou {:#x}: o ponto de recuperacao nao agiu", value);
         }
         "bugcheck" => crate::ntos::ke::bugcheck::bug_check_ex(MANUALLY_INITIATED_CRASH, 0x4B44_5445_5354, 0, 0, 0),
+        "ap" => {
+            if AP_WORK_ITEM.load(Ordering::Acquire) == 0 {
+                out.push_str("o work item do kdtest ap nao foi reservado\n");
+                return;
+            }
+            let count = first.and_then(|word| word.parse::<u64>().ok()).unwrap_or(1).clamp(1, 16);
+            AP_REQUEST.store(count, Ordering::Release);
+            let _ = writeln!(out, "autoteste armado: trabalho num AP com int 3 e {} chamadas de ap_target (roda numa worker depois de continuar)", count);
+        }
         _ => out.push_str(USAGE),
     }
 }

@@ -166,8 +166,10 @@ pub fn kmain() -> ! {
     }
 
     // Com o depurador do kernel ligado, o work item do `monitor kill`
-    // (`kd/terminate.rs`), antes do primeiro processo de usuário.
+    // (`kd/terminate.rs`), antes do primeiro processo de usuário, e o do
+    // autoteste que para num AP (`monitor kdtest ap`, `kd/self_test.rs`).
     crate::ntos::kd::terminate::initialize();
+    crate::ntos::kd::self_test::initialize();
 
     // Com o depurador do kernel (`--kd`), o contrato que os drivers veem.
     if !boot_config::kernel_debugger().is_empty() {
