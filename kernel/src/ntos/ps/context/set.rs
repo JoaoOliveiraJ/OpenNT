@@ -65,9 +65,17 @@ pub fn begin(thread: u64, input: u64, probe_mode: u8, context_mode: u8, flags: u
     }
     let caller = process::thread_record(process::get_current_thread());
     if context_mode != 0 && flags & 2 == 0 && caller.is_some_and(|caller| caller.process == record.process) && captured.flags & 0x10_0001 == 0x10_0001 {
-        // CONTEXT.SegCs da entrada capturada (a cópia própria ou o buffer de
-        // KernelMode, sem exigência de alinhamento).
-        guest::write::<u16>(captured.source + core::mem::offset_of!(Context, seg_cs) as u64, 0x33);
+        // O KiVerifyContextRecord (0x340180): CONTEXT.SegCs da entrada
+        // capturada (a cópia própria ou o buffer de KernelMode, sem exigência
+        // de alinhamento) vira o KGDT64_R3_CODE, menos num processo WoW64 x86
+        // (a thread pode voltar ao código de 32 bits) e no CS de 32 bits de
+        // um processo Pico.
+        let segment = captured.source + core::mem::offset_of!(Context, seg_cs) as u64;
+        // SAFETY: o EPROCESS dono da ETHREAD registrada.
+        let pico = unsafe { crate::ntos::inc::types::Eprocess::at(record.process) }.pico_context.get() != 0;
+        if !crate::ntos::ps::wow64::is_x86_process(record.process) && !(pico && guest::read::<u16>(segment) == 0x23) {
+            guest::write::<u16>(segment, 0x33);
+        }
     }
     // CONTEXT_XSTATE de KernelMode: o PspSetContext restaura o pedaço do
     // CONTEXT_EX do próprio buffer só num contexto de UserMode (o de

@@ -55,6 +55,8 @@ const EXIT_INTERVAL: u32 = 2;
 const DEBUG_SERVICE_VECTOR: u32 = 0x2D;
 /// O `__fastfail` (`int 0x29`), que a HAL salva como STATUS_STACK_BUFFER_OVERRUN.
 const FAST_FAIL_VECTOR: u32 = 0x29;
+/// O KGDT64_R3_CODE: o código de 64 bits do usuário.
+const USER_CODE: u16 = 0x33;
 
 const _: () = assert!(CONTEXT_EX_OFFSET + ContextEx::SIZE <= RECORD_OFFSET && RECORD_OFFSET + RECORD_SIZE <= MACHINE_OFFSET && MachineFrame::SIZE <= MACHINE_SIZE);
 const _: () = assert!(RECORD_OFFSET + RECORD_SLOT == MACHINE_OFFSET && CONTEXT_EX_OFFSET + 0x20 == RECORD_OFFSET);
@@ -320,6 +322,15 @@ pub fn hardware(thread: &UserThread, status: u32) -> u32 {
                 Some(code) => put(offset_of!(ExceptionRecord, exception_code), &code.to_le_bytes()),
                 None => {}
             }
+        }
+        // A falta que o Mm não resolve no código de 64 bits com o GS base do
+        // usuário diferente da TEB (o KiPageFault 0x40d6a7): um `mov gs` do
+        // usuário (o RunSimulatedCode do wow64cpu carrega o KGDT64_R3_DATA
+        // antes de voltar ao código de 32 bits) trocou o GS base pela base do
+        // descritor. O GS base volta à TEB e a instrução repete: a entrada
+        // seguinte no anel 3 põe a TEB no KernelGSbase.
+        if live.seg_cs.get() == USER_CODE && block.user_gs_base.get() != thread.with(|thread| thread.teb_va) {
+            return 0;
         }
         let information = offset_of!(ExceptionRecord, exception_information);
         put(offset_of!(ExceptionRecord, number_parameters), &2u32.to_le_bytes());

@@ -290,6 +290,14 @@ pub fn get(thread: u64, buffer: u64) -> Result<u32, KernelError> {
     result
 }
 
+/// PspGetContextThreadInternal(thread, context, KernelMode, UserMode, 1) num
+/// CONTEXT do kernel, que já traz o ContextFlags pedido: o CONTEXT nativo de
+/// que partem o PspWow64GetContextThread e o PspWow64SetContextThread
+/// (`ps/wow64/context`).
+pub fn get_kernel(thread: u64, storage: u64) -> Result<u32, KernelError> {
+    context_apc::execute(thread, Box::new(move || read_saved(thread, storage)))
+}
+
 /// NtGetContextThread(thread, context).
 pub fn nt_get_context_thread(handle: u64, context: u64, _a3: u64, _a4: u64, _rsp: u64) -> Result<u32, KernelError> {
     let thread = match threads::resolve(handle, THREAD_GET_CONTEXT) {

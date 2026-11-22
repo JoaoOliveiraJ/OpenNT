@@ -3663,6 +3663,23 @@ fn nt_query_information_thread(handle: u64, class: u64, out: u64, length: u64, r
     if (length != 0 && !probe_user_write(out, length)) || (returned != 0 && !probe_user_write(returned, 4)) {
         return Ok(0xC000_0005);
     }
+    // ThreadWow64Context (0x5fc032): o handle com THREAD_GET_CONTEXT, o
+    // tamanho conferido depois dele pelo PspWow64GetContextThread
+    // (`ps/wow64/context`) e ReturnLength 0x2CC.
+    if class == THREAD_WOW64_CONTEXT {
+        let thread = match resolve(handle, THREAD_GET_CONTEXT) {
+            Ok(thread) => thread,
+            Err(status) => return Ok(status),
+        };
+        let status = crate::ntos::ps::wow64::context::get(thread.pointer(), out, length)?;
+        if status & 0x8000_0000 != 0 || returned == 0 {
+            return Ok(status);
+        }
+        return state::guarded(|| {
+            guest::try_write::<u32>(returned, crate::ntos::ps::wow64::context::LENGTH as u32)?;
+            Ok(status)
+        });
+    }
     // O tamanho exato da classe (STATUS_INFO_LENGTH_MISMATCH) antes do
     // handle, e o acesso de cada classe (o switch de 0x5fc1ac): Basic,
     // Times, PriorityBoost, IsTerminated e ActualBasePriority com
@@ -3848,6 +3865,11 @@ fn nt_alert_thread_by_thread_id(id: u64, _a2: u64, _a3: u64, _a4: u64, _rsp: u64
     Ok(0)
 }
 
+/// THREADINFOCLASS.ThreadWow64Context e os direitos THREAD_GET_CONTEXT e
+/// THREAD_SET_CONTEXT dela.
+const THREAD_WOW64_CONTEXT: u32 = 29;
+const THREAD_GET_CONTEXT: u32 = 0x8;
+const THREAD_SET_CONTEXT: u32 = 0x10;
 /// THREADINFOCLASS.ThreadPriority e ThreadBasePriority.
 const THREAD_PRIORITY: u64 = 2;
 const THREAD_BASE_PRIORITY: u64 = 3;
@@ -4029,6 +4051,23 @@ fn nt_set_information_thread(handle: u64, class: u64, input: u64, length: u64, r
     }
     if class == THREAD_ACTUAL_BASE_PRIORITY {
         return set_actual_base_priority(handle, input, length);
+    }
+    // ThreadWow64Context (0x64b078): a entrada sondada com alinhamento 4 (a
+    // tabela de 0x64b5c4), o handle com THREAD_SET_CONTEXT e o
+    // PspWow64SetContextThread sob a rundown da thread (`ps/wow64/context`).
+    if class == THREAD_WOW64_CONTEXT as u64 {
+        let length = length as u32 as u64;
+        if length != 0 && input & 3 != 0 {
+            return Ok(0x8000_0002);
+        }
+        if length != 0 && !probe_user_read(input, length) {
+            return Ok(0xC000_0005);
+        }
+        let thread = match resolve(handle, THREAD_SET_CONTEXT) {
+            Ok(thread) => thread,
+            Err(status) => return Ok(status),
+        };
+        return crate::ntos::ps::wow64::context::set_protected(thread.pointer(), input, length);
     }
     // Cada classe confere o tamanho e captura o valor antes do handle (a
     // tabela de 0x64b5f4); uma classe desconhecida nem referencia o handle.

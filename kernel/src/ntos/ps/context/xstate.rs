@@ -149,14 +149,20 @@ pub fn apply_to_thread(extended: &Extended, thread: u64) {
 /// CONTEXT logo antes, sem passar dos 0x4D0 bytes (o teste do
 /// RtlpCopyExtendedContext). Devolve (cabeçalho do XSTATE, tamanho).
 pub fn user_chunk(context: u64) -> Result<Result<(u64, u32), u32>, KernelError> {
-    let context_ex = context + CONTEXT_LENGTH as u64;
+    user_chunk_after(context, CONTEXT_LENGTH)
+}
+
+/// [`user_chunk`] de um CONTEXT legado de `legacy` bytes (o do x64 ou o
+/// WOW64_CONTEXT de 0x2CC bytes, que o CONTEXT_EX segue do mesmo jeito).
+pub fn user_chunk_after(context: u64, legacy: u32) -> Result<Result<(u64, u32), u32>, KernelError> {
+    let context_ex = context + legacy as u64;
     if !state::probe_user_read(context_ex, ContextEx::SIZE) {
         return Ok(Err(STATUS_ACCESS_VIOLATION));
     }
     let chunks = state::user_struct::<ContextEx>(context_ex)?;
     let legacy_offset = chunks.legacy.offset.probe_get()?;
     let legacy_length = chunks.legacy.length.probe_get()?;
-    if legacy_offset != -(CONTEXT_LENGTH as i32) || legacy_length > CONTEXT_LENGTH {
+    if legacy_offset != -(legacy as i32) || legacy_length > legacy {
         return Ok(Err(STATUS_INVALID_PARAMETER));
     }
     let offset = chunks.x_state.offset.probe_get()?;
@@ -201,7 +207,13 @@ impl Drop for Mirror {
 /// kernel). Os bytes além do pedaço do kernel não seriam copiados: a leitura
 /// para nele.
 pub fn capture_user(context: u64, flags: u32) -> Result<Result<Extended, u32>, KernelError> {
-    let (header, length) = match user_chunk(context)? {
+    capture_user_after(context, CONTEXT_LENGTH, flags)
+}
+
+/// [`capture_user`] do pedaço que segue um CONTEXT legado de `legacy` bytes,
+/// num CONTEXT estendido nativo do kernel com `flags`.
+pub fn capture_user_after(context: u64, legacy: u32, flags: u32) -> Result<Result<Extended, u32>, KernelError> {
+    let (header, length) = match user_chunk_after(context, legacy)? {
         Ok(chunk) => chunk,
         Err(status) => return Ok(Err(status)),
     };
@@ -226,7 +238,12 @@ pub fn capture_user(context: u64, flags: u32) -> Result<Result<Extended, u32>, K
 /// (o RtlpWriteExtendedContext do NtGetContextThread): o cabeçalho e os
 /// recursos copiados; o resto do pedaço do usuário fica como estava.
 pub fn write_user(thread: u64, context: u64) -> Result<u32, KernelError> {
-    let (header, length) = match user_chunk(context)? {
+    write_user_after(thread, context, CONTEXT_LENGTH)
+}
+
+/// [`write_user`] no pedaço que segue um CONTEXT legado de `legacy` bytes.
+pub fn write_user_after(thread: u64, context: u64, legacy: u32) -> Result<u32, KernelError> {
+    let (header, length) = match user_chunk_after(context, legacy)? {
         Ok(chunk) => chunk,
         Err(status) => return Ok(status),
     };

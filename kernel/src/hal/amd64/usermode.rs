@@ -91,12 +91,17 @@ pub struct UserExecutionBlock {
     /// anel 3 cru): o fim do intervalo salva nela o estado estendido e a
     /// entrada o recarrega dela (`hal::amd64::extended_state`).
     pub xstate_area: Field<u64>,
+    /// O GS base do usuário na saída do intervalo (o KernelGSbase depois do
+    /// SWAPGS da entrada; o KTRAP_FRAME.GsBase que o KiPageFault do 19041
+    /// guarda numa falta do código de 64 bits): um `mov gs` do usuário o
+    /// troca pela base do descritor.
+    pub user_gs_base: Field<u64>,
 }
 
 // SAFETY: #[repr(C)] só de células.
 unsafe impl NtStruct for UserExecutionBlock {}
 
-const _: () = assert!(size_of::<UserExecutionBlock>() == 0x150);
+const _: () = assert!(size_of::<UserExecutionBlock>() == 0x158);
 
 /// Deslocamento de um campo do bloco a partir da KPCR (o operando `gs:` dos stubs).
 pub const fn gs_offset(field: usize) -> u64 {
@@ -877,8 +882,11 @@ fn load_user_segments(teb: u64) {
 
 /// O lado de saída (o SwapContext 0x405fdd): numa thread de processo WoW64,
 /// o IA32_FS_BASE vivo (que o código de 32 bits carregou pelo seletor ou pelo
-/// WRFSBASE) volta ao ETHREAD.UserFsBase.
+/// WRFSBASE) volta ao ETHREAD.UserFsBase. O GS base do usuário, que a
+/// entrada trocou para o KernelGSbase, fica no bloco da CPU
+/// ([`UserExecutionBlock::user_gs_base`]).
 fn save_user_segments() {
+    block().user_gs_base.set(cpu::read_msr(MSR_KERNEL_GS_BASE));
     let Some((thread, true)) = dispatched_thread() else { return };
     thread.user_fs_base.set(cpu::read_msr(MSR_FS_BASE));
 }

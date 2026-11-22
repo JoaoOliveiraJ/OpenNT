@@ -16,7 +16,11 @@
 //!   (PspWow64SetupCpuArea), a pilha de 32 bits (RtlpWow64CreateUserStack)
 //!   e o contexto x86 inicial (PspWow64InitThread e
 //!   PspWow64InitThreadGuestx86), que o wow64cpu carrega na primeira
-//!   entrada no código de 32 bits.
+//!   entrada no código de 32 bits;
+//! - o contexto x86 de outra thread (`context`): a classe ThreadWow64Context
+//!   do NtQueryInformationThread e do NtSetInformationThread
+//!   (PspWow64GetContextThread e PspWow64SetContextThread), que junta a área
+//!   de CPU com o CONTEXT nativo da thread.
 //!
 //! A PEB e a TEB de 32 bits (MiInitializeWowPeb e o MmCreateTeb) ficam em
 //! `mm/peb_teb.rs`, o limite de VA do processo (MiComputeProcessUserVa) em
@@ -25,6 +29,7 @@
 //! em `hal/amd64/usermode.rs`. O código de 32 bits nunca chama o kernel: a
 //! camada WoW64 volta ao modo de 64 bits e faz as syscalls normais do x64.
 
+pub mod context;
 pub mod process;
 pub mod system_dll;
 pub mod thread;
