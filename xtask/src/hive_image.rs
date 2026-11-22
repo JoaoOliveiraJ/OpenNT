@@ -760,6 +760,7 @@ mod tests {
             assert_eq!(seeded(&software, "Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data", name), Some((cm::seed::REG_BINARY, &complete[..])), "Notifications\\Data\\{name}");
         }
         assert_eq!(seeded(&software, "Microsoft\\Windows\\CurrentVersion\\OOBE\\Stats", "OOBEUserSignedIn").map(|(kind, data)| (kind, data.to_vec())), Some(dword(1)));
+        assert_eq!(seeded(&software, "Microsoft\\Windows\\CurrentVersion\\OOBE", "ProtectYourPC").map(|(kind, data)| (kind, data.to_vec())), Some(dword(3)));
         let image_state: Vec<u8> = "IMAGE_STATE_COMPLETE".encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
         assert_eq!(seeded(&software, "Microsoft\\Windows\\CurrentVersion\\Setup\\State", "ImageState"), Some((cm::seed::REG_SZ, image_state.as_slice())));
         // Os outros boots não levam o estado de setup.

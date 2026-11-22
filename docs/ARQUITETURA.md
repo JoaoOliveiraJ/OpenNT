@@ -6826,7 +6826,16 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   o kernel carrega ao criar a instância do nome. Com eles o OOBEComplete do
   kernel32 dá completo, e o CPolicyMonitor do LSM não espera o fim do OOBE.
   Nenhum nome é publicado pelo kernel: o 19041 só assina o
-  WNF_DEP_OOBE_COMPLETE no PnP quando `OOBEInProgress` é 1.
+  WNF_DEP_OOBE_COMPLETE no PnP quando `OOBEInProgress` é 1. A SOFTWARE leva
+  ainda `OOBE\ProtectYourPC` 3, a resposta à pergunta de privacidade que o
+  Setup grava numa instalação autônoma (o `ProtectYourPC` do unattend; 3 não
+  compartilha dados), da máquina e sem dado de usuário ou desta máquina. A
+  conta de teste vem do `CmdLine` do setup, não do OOBE, então nenhuma
+  resposta fica gravada: sem o valor, o ArePrivacySettingsManagedByPolicy do
+  explorer dá falso, o s_PerUserSetupStartMethod lança no primeiro logon o
+  cenário `ms-cxh://NTHPRIVACY` do CloudExperienceHost, que não está na
+  imagem, e a janela de fundo dele (UserOOBEWindowClass, numa banda acima da
+  barra de tarefas) deixa a tela preta uns 20 s.
 - **Conta de teste** (`xtask/src/test_account.rs`, `--conta-de-teste`, só com
   `--initial-process=smss`): o volume leva em `SYSTEM\Setup` o `SetupType` 2 e
   um `CmdLine`, o gancho de primeiro boot que o winlogon de uma instalação

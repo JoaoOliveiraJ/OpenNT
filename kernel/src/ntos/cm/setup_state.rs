@@ -20,6 +20,15 @@
 //!   testa o `setup.exe` diferente de zero).
 //! - `Setup\State` da SOFTWARE: a imagem completa (`IMAGE_STATE_COMPLETE`),
 //!   que o spp.dll e o motor de reset leem.
+//! - `OOBE` da SOFTWARE: o `ProtectYourPC` 3, a resposta à pergunta de
+//!   privacidade que o Setup grava numa instalação autônoma (o
+//!   `ProtectYourPC` do unattend; 3 é a que não compartilha dados). A conta
+//!   desta instalação vem do gancho de setup (`CmdLine`), não do OOBE; sem a
+//!   resposta, o ArePrivacySettingsManagedByPolicy do explorer.exe dá falso
+//!   (ele aceita 1 a 3), o s_PerUserSetupStartMethod lança no primeiro logon
+//!   o cenário `ms-cxh://NTHPRIVACY` do CloudExperienceHost e a janela de
+//!   fundo dele (UserOOBEWindowClass) cobre a tela até o evento
+//!   DestroyCloudExperienceHostAppBackgroundEvent.
 //! - `OOBE\Stats` da SOFTWARE: o `OOBEUserSignedIn` 1. O
 //!   IsFirstLogonAfterOOBE do logoncontroller.dll (LogonUI) dá verdadeiro
 //!   com o valor ausente ou zero, e o _IsOOBEAutoLogon do CLogonController
@@ -70,6 +79,8 @@ pub fn system_keys() -> Vec<SeedKey> {
 pub fn software_keys() -> Vec<SeedKey> {
     let mut state = SeedKey::new("Microsoft\\Windows\\CurrentVersion\\Setup\\State");
     state.text("ImageState", REG_SZ, "IMAGE_STATE_COMPLETE");
+    let mut oobe = SeedKey::new("Microsoft\\Windows\\CurrentVersion\\OOBE");
+    oobe.dword("ProtectYourPC", 3);
     let mut stats = SeedKey::new("Microsoft\\Windows\\CurrentVersion\\OOBE\\Stats");
     stats.dword("OOBEUserSignedIn", 1);
     let mut data = SeedKey::new("Microsoft\\Windows NT\\CurrentVersion\\Notifications\\Data");
@@ -78,5 +89,5 @@ pub fn software_keys() -> Vec<SeedKey> {
         let value: Vec<u8> = [1u32, 1u32].iter().flat_map(|word| word.to_le_bytes()).collect();
         data.value(&alloc::format!("{name:016X}"), REG_BINARY, value);
     }
-    alloc::vec![state, stats, data]
+    alloc::vec![state, oobe, stats, data]
 }
