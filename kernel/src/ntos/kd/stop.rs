@@ -164,6 +164,9 @@ struct Processor {
     segments: AtomicU64,
     fs_base: AtomicU64,
     gs_base: AtomicU64,
+    /// A impressão do conjunto de comparadores do depurador carregado nos
+    /// registradores de depuração do processador (`hardware_signature`).
+    loaded_hardware: AtomicU64,
 }
 
 impl Processor {
@@ -180,6 +183,7 @@ impl Processor {
             segments: AtomicU64::new(0),
             fs_base: AtomicU64::new(0),
             gs_base: AtomicU64::new(0),
+            loaded_hardware: AtomicU64::new(0),
         }
     }
 }
@@ -641,18 +645,48 @@ fn own_ipi_frozen() -> u32 {
     pcr::current().prcb.ipi_frozen.atomic().load(Ordering::Acquire)
 }
 
+/// A impressão do conjunto de comparadores do depurador (0 sem nenhum).
+fn hardware_signature() -> u64 {
+    if !breakpoints::any_hardware() {
+        return 0;
+    }
+    (0..4).fold(breakpoints::dr7(), |signature, index| signature.rotate_left(17) ^ breakpoints::hardware_slot(index).map_or(0, |(_, address, length)| address ^ length << 60))
+}
+
+/// Os comparadores do depurador nos registradores de depuração do
+/// processador corrente (e na KPRCB dele), com a impressão do conjunto.
+fn load_debug_registers(number: usize) {
+    breakpoints::load_into_processor();
+    PROCESSORS[number].loaded_hardware.store(hardware_signature(), Ordering::Release);
+}
+
+fn read_dr7() -> u64 {
+    let value: u64;
+    // SAFETY: DR7 do processador corrente, em anel 0.
+    unsafe { core::arch::asm!("mov {}, dr7", out(reg) value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+fn write_dr7(value: u64) {
+    // SAFETY: DR7 do processador corrente, em anel 0.
+    unsafe { core::arch::asm!("mov dr7, {}", in(reg) value, options(nomem, nostack, preserves_flags)) };
+}
+
 /// O KiFreezeTargetExecution: o processador corrente publica o quadro,
 /// passa a TARGET_FROZEN e fica preso até o degelo (TARGET_THAW, gravado
 /// pelo dono, ou o fim de um congelamento que não o viu chegar). No degelo
-/// o TLB sai (as PTEs mudaram na parada: breakpoint de memória) e os
-/// registradores de depuração voltam com os comparadores do depurador (o
-/// KiRestoreProcessorControlState carrega o KernelDr0-7 da
-/// KPRCB.ProcessorState de cada processador): um breakpoint de hardware
-/// armado numa parada vale em todos os processadores com a IDT inteira. Do
+/// o TLB sai (as PTEs mudaram na parada: breakpoint de memória) e, se o host
+/// mudou os comparadores na parada, os registradores de depuração voltam
+/// com os do depurador (o KiRestoreProcessorControlState carrega o
+/// KernelDr0-7 da KPRCB.ProcessorState de cada processador): um breakpoint
+/// de hardware armado numa parada vale em todos os processadores com a IDT
+/// inteira. Sem mudança, o DR7 de antes volta (a NMI pode chegar com o banco
+/// do usuário já carregado, logo antes do `swapgs` da volta ao anel 3). Do
 /// anel 3, os trampolins já trocaram o banco de depuração pelo do kernel e
 /// o devolvem depois, com o do kernel guardado.
 fn park(number: usize, frame: u64, fx: u64, error_code: bool) {
     // Uma vigia de dados não dispara dentro da prisão.
+    let saved_dr7 = read_dr7();
     breakpoints::disarm_processor();
     capture(number, frame, fx, error_code);
     // A NMI que chegou no código do usuário: os seletores e o GS dele (no
@@ -666,10 +700,12 @@ fn park(number: usize, frame: u64, fx: u64, error_code: bool) {
         core::hint::spin_loop();
     }
     super::page_breakpoints::after_thaw();
-    // Um AP sem a IDT inteira não tem o portão do #DB: os comparadores
-    // ficam desligados nele (um disparo ali seria falta tripla).
-    if has_debug_vectors() {
-        breakpoints::load_into_processor();
+    // Um AP sem a IDT inteira não tem o portão do #DB: os comparadores do
+    // depurador não vão a ele (um disparo ali seria falta tripla).
+    if has_debug_vectors() && PROCESSORS[number].loaded_hardware.load(Ordering::Acquire) != hardware_signature() {
+        load_debug_registers(number);
+    } else {
+        write_dr7(saved_dr7);
     }
     set_own_ipi_frozen(FROZEN_RUNNING);
     PROCESSORS[number].frozen.store(false, Ordering::Release);
@@ -905,7 +941,7 @@ fn prepare_step(number: usize, view: &View, over: u64, then_continue: bool) {
     STEP_PROCESSOR.store(number as u32 + 1, Ordering::Release);
     let resume = if breakpoints::hardware_execute_at(view.rip()) { RESUME_FLAG } else { 0 };
     view.set_rflags((flags | TRAP_FLAG | resume) & !INTERRUPT_FLAG);
-    breakpoints::load_into_processor();
+    load_debug_registers(number);
 }
 
 /// Fim do passo: TF desligado, IF de volta e o breakpoint suspenso
@@ -939,7 +975,7 @@ fn continue_execution(number: usize, view: &View) {
     if breakpoints::hardware_execute_at(view.rip()) {
         view.set_rflags(view.rflags() | RESUME_FLAG);
     }
-    breakpoints::load_into_processor();
+    load_debug_registers(number);
     thaw_others(number);
     transport::unlock();
     set_own_ipi_frozen(FROZEN_RUNNING);
