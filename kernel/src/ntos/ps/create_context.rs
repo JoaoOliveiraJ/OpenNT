@@ -617,6 +617,8 @@ struct Created {
     teb: u64,
     peb: u64,
     parameters: u64,
+    peb32: u64,
+    parameters32: u64,
     image_information: Vec<u8>,
     manifest: Option<Manifest>,
     parameter_flags: u32,
@@ -702,11 +704,12 @@ fn write_outputs(request: &UserCreateRequest, attributes: &Attributes, input: &C
         success.file_handle.probe_set(image_handles.0)?;
         success.section_handle.probe_set(image_handles.1)?;
         success.user_process_parameters_native.probe_set(created.parameters)?;
-        success.user_process_parameters_wow64.probe_set(0)?;
+        // Num processo WoW64, o bloco e a PEB de 32 bits (0 no nativo).
+        success.user_process_parameters_wow64.probe_set(created.parameters32 as u32)?;
         // O Flags do bloco entregue (NORMALIZED, com os Buffers absolutos).
         success.current_parameter_flags.probe_set(created.parameter_flags)?;
         success.peb_address_native.probe_set(created.peb)?;
-        success.peb_address_wow64.probe_set(0)?;
+        success.peb_address_wow64.probe_set(created.peb32 as u32)?;
     }
     info.state.probe_set(PsCreateInfo::SUCCESS)
 }
@@ -924,6 +927,8 @@ fn capture_and_create(request: &UserCreateRequest) -> Result<u32, u32> {
         teb: created.teb,
         peb: created.peb,
         parameters: created.parameters,
+        peb32: created.peb32,
+        parameters32: created.parameters32,
         image_information: created.image_information.to_vec(),
         manifest: created.manifest,
         parameter_flags: created.parameter_flags,

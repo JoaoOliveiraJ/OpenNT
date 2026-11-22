@@ -88,3 +88,4 @@ pub mod extra_storage;
 pub mod extra_tbs;
 pub mod extra_test_p7;
 pub mod extra_usermode;
+pub mod extra_wow64;

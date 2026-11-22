@@ -5972,6 +5972,468 @@ const _: () = {
     assert!(core::mem::offset_of!(GdiTebBatch32, buffer) == 0x8);
 };
 
+/// `_PEB32` (0x480 bytes).
+///
+/// Membros sobrepostos (uniões anônimas do C) ficam nas vistas
+/// `Peb32View1`, alcançada por `Deref`.
+#[repr(C)]
+pub struct Peb32 {
+    pub inherited_address_space: Field<u8>,
+    pub read_image_file_exec_options: Field<u8>,
+    pub being_debugged: Field<u8>,
+    pub bit_field: Field<u8>,
+    pub mutant: Field<u32>,
+    pub image_base_address: Field<u32>,
+    pub ldr: Field<u32>,
+    pub process_parameters: Field<u32>,
+    pub sub_system_data: Field<u32>,
+    pub process_heap: Field<u32>,
+    pub fast_peb_lock: Field<u32>,
+    pub atl_thunk_s_list_ptr: Field<u32>,
+    pub ifeo_key: Field<u32>,
+    pub cross_process_flags: Field<u32>,
+    pub kernel_callback_table: Field<u32>,
+    pub system_reserved: Field<u32>,
+    pub atl_thunk_s_list_ptr32: Field<u32>,
+    pub api_set_map: Field<u32>,
+    pub tls_expansion_counter: Field<u32>,
+    pub tls_bitmap: Field<u32>,
+    pub tls_bitmap_bits: [Field<u32>; 2],
+    pub read_only_shared_memory_base: Field<u32>,
+    pub shared_data: Field<u32>,
+    pub read_only_static_server_data: Field<u32>,
+    pub ansi_code_page_data: Field<u32>,
+    pub oem_code_page_data: Field<u32>,
+    pub unicode_case_table_data: Field<u32>,
+    pub number_of_processors: Field<u32>,
+    pub nt_global_flag: Field<u32>,
+    _pad_6c: Reserved<0x4>,
+    pub critical_section_timeout: LargeInteger,
+    pub heap_segment_reserve: Field<u32>,
+    pub heap_segment_commit: Field<u32>,
+    pub heap_de_commit_total_free_threshold: Field<u32>,
+    pub heap_de_commit_free_block_threshold: Field<u32>,
+    pub number_of_heaps: Field<u32>,
+    pub maximum_number_of_heaps: Field<u32>,
+    pub process_heaps: Field<u32>,
+    pub gdi_shared_handle_table: Field<u32>,
+    pub process_starter_helper: Field<u32>,
+    pub gdi_dc_attribute_list: Field<u32>,
+    pub loader_lock: Field<u32>,
+    pub os_major_version: Field<u32>,
+    pub os_minor_version: Field<u32>,
+    pub os_build_number: Field<u16>,
+    pub oscsd_version: Field<u16>,
+    pub os_platform_id: Field<u32>,
+    pub image_subsystem: Field<u32>,
+    pub image_subsystem_major_version: Field<u32>,
+    pub image_subsystem_minor_version: Field<u32>,
+    pub active_process_affinity_mask: Field<u32>,
+    pub gdi_handle_buffer: [Field<u32>; 34],
+    pub post_process_init_routine: Field<u32>,
+    pub tls_expansion_bitmap: Field<u32>,
+    pub tls_expansion_bitmap_bits: [Field<u32>; 32],
+    pub session_id: Field<u32>,
+    pub app_compat_flags: UlargeInteger,
+    pub app_compat_flags_user: UlargeInteger,
+    pub p_shim_data: Field<u32>,
+    pub app_compat_info: Field<u32>,
+    pub csd_version: String32,
+    pub activation_context_data: Field<u32>,
+    pub process_assembly_storage_map: Field<u32>,
+    pub system_default_activation_context_data: Field<u32>,
+    pub system_assembly_storage_map: Field<u32>,
+    pub minimum_stack_commit: Field<u32>,
+    pub spare_pointers: [Field<u32>; 4],
+    pub spare_ulongs: [Field<u32>; 5],
+    pub wer_registration_data: Field<u32>,
+    pub wer_ship_assert_ptr: Field<u32>,
+    pub p_unused: Field<u32>,
+    pub p_image_header_hash: Field<u32>,
+    pub tracing_flags: Field<u32>,
+    _pad_244: Reserved<0x4>,
+    pub csr_server_read_only_shared_memory_base: Field<u64>,
+    pub tpp_workerp_list_lock: Field<u32>,
+    pub tpp_workerp_list: ListEntry32,
+    pub wait_on_address_hash_table: [Field<u32>; 128],
+    pub telemetry_coverage_header: Field<u32>,
+    pub cloud_file_flags: Field<u32>,
+    pub cloud_file_diag_flags: Field<u32>,
+    pub placeholder_compatibility_mode: Field<i8>,
+    pub placeholder_compatibility_mode_reserved: [Field<i8>; 7],
+    pub leap_second_data: Field<u32>,
+    pub leap_second_flags: Field<u32>,
+    pub nt_global_flag2: Field<u32>,
+    _pad_47c: Reserved<0x4>,
+}
+
+/// Vista 1 de `_PEB32` (membros sobrepostos à vista anterior).
+#[repr(C)]
+pub struct Peb32View1 {
+    _align: [u64; 0],
+    _pad_0: Reserved<0x2c>,
+    pub user_shared_info_ptr: Field<u32>,
+    _pad_30: Reserved<0x450>,
+}
+
+impl core::ops::Deref for Peb32 {
+    type Target = Peb32View1;
+    #[inline(always)]
+    fn deref(&self) -> &Peb32View1 {
+        // SAFETY: vistas do mesmo objeto, mesmo tamanho e alinhamento, só de células.
+        unsafe { &*(self as *const Self).cast::<Peb32View1>() }
+    }
+}
+
+unsafe impl NtStruct for Peb32 {}
+
+impl Peb32 {
+    /// `ImageUsesLargePages`: bits 0..=0 de `bit_field`.
+    pub const IMAGE_USES_LARGE_PAGES_SHIFT: u32 = 0;
+    pub const IMAGE_USES_LARGE_PAGES_MASK: u8 = 0x1;
+    #[inline(always)]
+    pub fn image_uses_large_pages(&self) -> u8 {
+        self.bit_field.bits(0, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_image_uses_large_pages(&self, value: u8) {
+        self.bit_field.set_bits(0, 1, value as u64)
+    }
+    /// `IsProtectedProcess`: bits 1..=1 de `bit_field`.
+    pub const IS_PROTECTED_PROCESS_SHIFT: u32 = 1;
+    pub const IS_PROTECTED_PROCESS_MASK: u8 = 0x2;
+    #[inline(always)]
+    pub fn is_protected_process(&self) -> u8 {
+        self.bit_field.bits(1, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_protected_process(&self, value: u8) {
+        self.bit_field.set_bits(1, 1, value as u64)
+    }
+    /// `IsImageDynamicallyRelocated`: bits 2..=2 de `bit_field`.
+    pub const IS_IMAGE_DYNAMICALLY_RELOCATED_SHIFT: u32 = 2;
+    pub const IS_IMAGE_DYNAMICALLY_RELOCATED_MASK: u8 = 0x4;
+    #[inline(always)]
+    pub fn is_image_dynamically_relocated(&self) -> u8 {
+        self.bit_field.bits(2, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_image_dynamically_relocated(&self, value: u8) {
+        self.bit_field.set_bits(2, 1, value as u64)
+    }
+    /// `SkipPatchingUser32Forwarders`: bits 3..=3 de `bit_field`.
+    pub const SKIP_PATCHING_USER32_FORWARDERS_SHIFT: u32 = 3;
+    pub const SKIP_PATCHING_USER32_FORWARDERS_MASK: u8 = 0x8;
+    #[inline(always)]
+    pub fn skip_patching_user32_forwarders(&self) -> u8 {
+        self.bit_field.bits(3, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_skip_patching_user32_forwarders(&self, value: u8) {
+        self.bit_field.set_bits(3, 1, value as u64)
+    }
+    /// `IsPackagedProcess`: bits 4..=4 de `bit_field`.
+    pub const IS_PACKAGED_PROCESS_SHIFT: u32 = 4;
+    pub const IS_PACKAGED_PROCESS_MASK: u8 = 0x10;
+    #[inline(always)]
+    pub fn is_packaged_process(&self) -> u8 {
+        self.bit_field.bits(4, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_packaged_process(&self, value: u8) {
+        self.bit_field.set_bits(4, 1, value as u64)
+    }
+    /// `IsAppContainer`: bits 5..=5 de `bit_field`.
+    pub const IS_APP_CONTAINER_SHIFT: u32 = 5;
+    pub const IS_APP_CONTAINER_MASK: u8 = 0x20;
+    #[inline(always)]
+    pub fn is_app_container(&self) -> u8 {
+        self.bit_field.bits(5, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_app_container(&self, value: u8) {
+        self.bit_field.set_bits(5, 1, value as u64)
+    }
+    /// `IsProtectedProcessLight`: bits 6..=6 de `bit_field`.
+    pub const IS_PROTECTED_PROCESS_LIGHT_SHIFT: u32 = 6;
+    pub const IS_PROTECTED_PROCESS_LIGHT_MASK: u8 = 0x40;
+    #[inline(always)]
+    pub fn is_protected_process_light(&self) -> u8 {
+        self.bit_field.bits(6, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_protected_process_light(&self, value: u8) {
+        self.bit_field.set_bits(6, 1, value as u64)
+    }
+    /// `IsLongPathAwareProcess`: bits 7..=7 de `bit_field`.
+    pub const IS_LONG_PATH_AWARE_PROCESS_SHIFT: u32 = 7;
+    pub const IS_LONG_PATH_AWARE_PROCESS_MASK: u8 = 0x80;
+    #[inline(always)]
+    pub fn is_long_path_aware_process(&self) -> u8 {
+        self.bit_field.bits(7, 1) as u8
+    }
+    #[inline(always)]
+    pub fn set_is_long_path_aware_process(&self, value: u8) {
+        self.bit_field.set_bits(7, 1, value as u64)
+    }
+    /// `ProcessInJob`: bits 0..=0 de `cross_process_flags`.
+    pub const PROCESS_IN_JOB_SHIFT: u32 = 0;
+    pub const PROCESS_IN_JOB_MASK: u32 = 0x1;
+    #[inline(always)]
+    pub fn process_in_job(&self) -> u32 {
+        self.cross_process_flags.bits(0, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_in_job(&self, value: u32) {
+        self.cross_process_flags.set_bits(0, 1, value as u64)
+    }
+    /// `ProcessInitializing`: bits 1..=1 de `cross_process_flags`.
+    pub const PROCESS_INITIALIZING_SHIFT: u32 = 1;
+    pub const PROCESS_INITIALIZING_MASK: u32 = 0x2;
+    #[inline(always)]
+    pub fn process_initializing(&self) -> u32 {
+        self.cross_process_flags.bits(1, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_initializing(&self, value: u32) {
+        self.cross_process_flags.set_bits(1, 1, value as u64)
+    }
+    /// `ProcessUsingVEH`: bits 2..=2 de `cross_process_flags`.
+    pub const PROCESS_USING_VEH_SHIFT: u32 = 2;
+    pub const PROCESS_USING_VEH_MASK: u32 = 0x4;
+    #[inline(always)]
+    pub fn process_using_veh(&self) -> u32 {
+        self.cross_process_flags.bits(2, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_using_veh(&self, value: u32) {
+        self.cross_process_flags.set_bits(2, 1, value as u64)
+    }
+    /// `ProcessUsingVCH`: bits 3..=3 de `cross_process_flags`.
+    pub const PROCESS_USING_VCH_SHIFT: u32 = 3;
+    pub const PROCESS_USING_VCH_MASK: u32 = 0x8;
+    #[inline(always)]
+    pub fn process_using_vch(&self) -> u32 {
+        self.cross_process_flags.bits(3, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_using_vch(&self, value: u32) {
+        self.cross_process_flags.set_bits(3, 1, value as u64)
+    }
+    /// `ProcessUsingFTH`: bits 4..=4 de `cross_process_flags`.
+    pub const PROCESS_USING_FTH_SHIFT: u32 = 4;
+    pub const PROCESS_USING_FTH_MASK: u32 = 0x10;
+    #[inline(always)]
+    pub fn process_using_fth(&self) -> u32 {
+        self.cross_process_flags.bits(4, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_using_fth(&self, value: u32) {
+        self.cross_process_flags.set_bits(4, 1, value as u64)
+    }
+    /// `ProcessPreviouslyThrottled`: bits 5..=5 de `cross_process_flags`.
+    pub const PROCESS_PREVIOUSLY_THROTTLED_SHIFT: u32 = 5;
+    pub const PROCESS_PREVIOUSLY_THROTTLED_MASK: u32 = 0x20;
+    #[inline(always)]
+    pub fn process_previously_throttled(&self) -> u32 {
+        self.cross_process_flags.bits(5, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_previously_throttled(&self, value: u32) {
+        self.cross_process_flags.set_bits(5, 1, value as u64)
+    }
+    /// `ProcessCurrentlyThrottled`: bits 6..=6 de `cross_process_flags`.
+    pub const PROCESS_CURRENTLY_THROTTLED_SHIFT: u32 = 6;
+    pub const PROCESS_CURRENTLY_THROTTLED_MASK: u32 = 0x40;
+    #[inline(always)]
+    pub fn process_currently_throttled(&self) -> u32 {
+        self.cross_process_flags.bits(6, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_currently_throttled(&self, value: u32) {
+        self.cross_process_flags.set_bits(6, 1, value as u64)
+    }
+    /// `ProcessImagesHotPatched`: bits 7..=7 de `cross_process_flags`.
+    pub const PROCESS_IMAGES_HOT_PATCHED_SHIFT: u32 = 7;
+    pub const PROCESS_IMAGES_HOT_PATCHED_MASK: u32 = 0x80;
+    #[inline(always)]
+    pub fn process_images_hot_patched(&self) -> u32 {
+        self.cross_process_flags.bits(7, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_process_images_hot_patched(&self, value: u32) {
+        self.cross_process_flags.set_bits(7, 1, value as u64)
+    }
+    /// `ReservedBits0`: bits 8..=31 de `cross_process_flags`.
+    pub const RESERVED_BITS0_SHIFT: u32 = 8;
+    pub const RESERVED_BITS0_MASK: u32 = 0xffffff00;
+    #[inline(always)]
+    pub fn reserved_bits0(&self) -> u32 {
+        self.cross_process_flags.bits(8, 24) as u32
+    }
+    #[inline(always)]
+    pub fn set_reserved_bits0(&self, value: u32) {
+        self.cross_process_flags.set_bits(8, 24, value as u64)
+    }
+    /// `HeapTracingEnabled`: bits 0..=0 de `tracing_flags`.
+    pub const HEAP_TRACING_ENABLED_SHIFT: u32 = 0;
+    pub const HEAP_TRACING_ENABLED_MASK: u32 = 0x1;
+    #[inline(always)]
+    pub fn heap_tracing_enabled(&self) -> u32 {
+        self.tracing_flags.bits(0, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_heap_tracing_enabled(&self, value: u32) {
+        self.tracing_flags.set_bits(0, 1, value as u64)
+    }
+    /// `CritSecTracingEnabled`: bits 1..=1 de `tracing_flags`.
+    pub const CRIT_SEC_TRACING_ENABLED_SHIFT: u32 = 1;
+    pub const CRIT_SEC_TRACING_ENABLED_MASK: u32 = 0x2;
+    #[inline(always)]
+    pub fn crit_sec_tracing_enabled(&self) -> u32 {
+        self.tracing_flags.bits(1, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_crit_sec_tracing_enabled(&self, value: u32) {
+        self.tracing_flags.set_bits(1, 1, value as u64)
+    }
+    /// `LibLoaderTracingEnabled`: bits 2..=2 de `tracing_flags`.
+    pub const LIB_LOADER_TRACING_ENABLED_SHIFT: u32 = 2;
+    pub const LIB_LOADER_TRACING_ENABLED_MASK: u32 = 0x4;
+    #[inline(always)]
+    pub fn lib_loader_tracing_enabled(&self) -> u32 {
+        self.tracing_flags.bits(2, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_lib_loader_tracing_enabled(&self, value: u32) {
+        self.tracing_flags.set_bits(2, 1, value as u64)
+    }
+    /// `SpareTracingBits`: bits 3..=31 de `tracing_flags`.
+    pub const SPARE_TRACING_BITS_SHIFT: u32 = 3;
+    pub const SPARE_TRACING_BITS_MASK: u32 = 0xfffffff8;
+    #[inline(always)]
+    pub fn spare_tracing_bits(&self) -> u32 {
+        self.tracing_flags.bits(3, 29) as u32
+    }
+    #[inline(always)]
+    pub fn set_spare_tracing_bits(&self, value: u32) {
+        self.tracing_flags.set_bits(3, 29, value as u64)
+    }
+    /// `SixtySecondEnabled`: bits 0..=0 de `leap_second_flags`.
+    pub const SIXTY_SECOND_ENABLED_SHIFT: u32 = 0;
+    pub const SIXTY_SECOND_ENABLED_MASK: u32 = 0x1;
+    #[inline(always)]
+    pub fn sixty_second_enabled(&self) -> u32 {
+        self.leap_second_flags.bits(0, 1) as u32
+    }
+    #[inline(always)]
+    pub fn set_sixty_second_enabled(&self, value: u32) {
+        self.leap_second_flags.set_bits(0, 1, value as u64)
+    }
+    /// `Reserved`: bits 1..=31 de `leap_second_flags`.
+    pub const RESERVED_SHIFT: u32 = 1;
+    pub const RESERVED_MASK: u32 = 0xfffffffe;
+    #[inline(always)]
+    pub fn reserved(&self) -> u32 {
+        self.leap_second_flags.bits(1, 31) as u32
+    }
+    #[inline(always)]
+    pub fn set_reserved(&self, value: u32) {
+        self.leap_second_flags.set_bits(1, 31, value as u64)
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Peb32>() == 0x480);
+    assert!(core::mem::offset_of!(Peb32, inherited_address_space) == 0x0);
+    assert!(core::mem::offset_of!(Peb32, read_image_file_exec_options) == 0x1);
+    assert!(core::mem::offset_of!(Peb32, being_debugged) == 0x2);
+    assert!(core::mem::offset_of!(Peb32, bit_field) == 0x3);
+    assert!(core::mem::offset_of!(Peb32, mutant) == 0x4);
+    assert!(core::mem::offset_of!(Peb32, image_base_address) == 0x8);
+    assert!(core::mem::offset_of!(Peb32, ldr) == 0xc);
+    assert!(core::mem::offset_of!(Peb32, process_parameters) == 0x10);
+    assert!(core::mem::offset_of!(Peb32, sub_system_data) == 0x14);
+    assert!(core::mem::offset_of!(Peb32, process_heap) == 0x18);
+    assert!(core::mem::offset_of!(Peb32, fast_peb_lock) == 0x1c);
+    assert!(core::mem::offset_of!(Peb32, atl_thunk_s_list_ptr) == 0x20);
+    assert!(core::mem::offset_of!(Peb32, ifeo_key) == 0x24);
+    assert!(core::mem::offset_of!(Peb32, cross_process_flags) == 0x28);
+    assert!(core::mem::offset_of!(Peb32, kernel_callback_table) == 0x2c);
+    assert!(core::mem::offset_of!(Peb32, system_reserved) == 0x30);
+    assert!(core::mem::offset_of!(Peb32, atl_thunk_s_list_ptr32) == 0x34);
+    assert!(core::mem::offset_of!(Peb32, api_set_map) == 0x38);
+    assert!(core::mem::offset_of!(Peb32, tls_expansion_counter) == 0x3c);
+    assert!(core::mem::offset_of!(Peb32, tls_bitmap) == 0x40);
+    assert!(core::mem::offset_of!(Peb32, tls_bitmap_bits) == 0x44);
+    assert!(core::mem::offset_of!(Peb32, read_only_shared_memory_base) == 0x4c);
+    assert!(core::mem::offset_of!(Peb32, shared_data) == 0x50);
+    assert!(core::mem::offset_of!(Peb32, read_only_static_server_data) == 0x54);
+    assert!(core::mem::offset_of!(Peb32, ansi_code_page_data) == 0x58);
+    assert!(core::mem::offset_of!(Peb32, oem_code_page_data) == 0x5c);
+    assert!(core::mem::offset_of!(Peb32, unicode_case_table_data) == 0x60);
+    assert!(core::mem::offset_of!(Peb32, number_of_processors) == 0x64);
+    assert!(core::mem::offset_of!(Peb32, nt_global_flag) == 0x68);
+    assert!(core::mem::offset_of!(Peb32, critical_section_timeout) == 0x70);
+    assert!(core::mem::offset_of!(Peb32, heap_segment_reserve) == 0x78);
+    assert!(core::mem::offset_of!(Peb32, heap_segment_commit) == 0x7c);
+    assert!(core::mem::offset_of!(Peb32, heap_de_commit_total_free_threshold) == 0x80);
+    assert!(core::mem::offset_of!(Peb32, heap_de_commit_free_block_threshold) == 0x84);
+    assert!(core::mem::offset_of!(Peb32, number_of_heaps) == 0x88);
+    assert!(core::mem::offset_of!(Peb32, maximum_number_of_heaps) == 0x8c);
+    assert!(core::mem::offset_of!(Peb32, process_heaps) == 0x90);
+    assert!(core::mem::offset_of!(Peb32, gdi_shared_handle_table) == 0x94);
+    assert!(core::mem::offset_of!(Peb32, process_starter_helper) == 0x98);
+    assert!(core::mem::offset_of!(Peb32, gdi_dc_attribute_list) == 0x9c);
+    assert!(core::mem::offset_of!(Peb32, loader_lock) == 0xa0);
+    assert!(core::mem::offset_of!(Peb32, os_major_version) == 0xa4);
+    assert!(core::mem::offset_of!(Peb32, os_minor_version) == 0xa8);
+    assert!(core::mem::offset_of!(Peb32, os_build_number) == 0xac);
+    assert!(core::mem::offset_of!(Peb32, oscsd_version) == 0xae);
+    assert!(core::mem::offset_of!(Peb32, os_platform_id) == 0xb0);
+    assert!(core::mem::offset_of!(Peb32, image_subsystem) == 0xb4);
+    assert!(core::mem::offset_of!(Peb32, image_subsystem_major_version) == 0xb8);
+    assert!(core::mem::offset_of!(Peb32, image_subsystem_minor_version) == 0xbc);
+    assert!(core::mem::offset_of!(Peb32, active_process_affinity_mask) == 0xc0);
+    assert!(core::mem::offset_of!(Peb32, gdi_handle_buffer) == 0xc4);
+    assert!(core::mem::offset_of!(Peb32, post_process_init_routine) == 0x14c);
+    assert!(core::mem::offset_of!(Peb32, tls_expansion_bitmap) == 0x150);
+    assert!(core::mem::offset_of!(Peb32, tls_expansion_bitmap_bits) == 0x154);
+    assert!(core::mem::offset_of!(Peb32, session_id) == 0x1d4);
+    assert!(core::mem::offset_of!(Peb32, app_compat_flags) == 0x1d8);
+    assert!(core::mem::offset_of!(Peb32, app_compat_flags_user) == 0x1e0);
+    assert!(core::mem::offset_of!(Peb32, p_shim_data) == 0x1e8);
+    assert!(core::mem::offset_of!(Peb32, app_compat_info) == 0x1ec);
+    assert!(core::mem::offset_of!(Peb32, csd_version) == 0x1f0);
+    assert!(core::mem::offset_of!(Peb32, activation_context_data) == 0x1f8);
+    assert!(core::mem::offset_of!(Peb32, process_assembly_storage_map) == 0x1fc);
+    assert!(core::mem::offset_of!(Peb32, system_default_activation_context_data) == 0x200);
+    assert!(core::mem::offset_of!(Peb32, system_assembly_storage_map) == 0x204);
+    assert!(core::mem::offset_of!(Peb32, minimum_stack_commit) == 0x208);
+    assert!(core::mem::offset_of!(Peb32, spare_pointers) == 0x20c);
+    assert!(core::mem::offset_of!(Peb32, spare_ulongs) == 0x21c);
+    assert!(core::mem::offset_of!(Peb32, wer_registration_data) == 0x230);
+    assert!(core::mem::offset_of!(Peb32, wer_ship_assert_ptr) == 0x234);
+    assert!(core::mem::offset_of!(Peb32, p_unused) == 0x238);
+    assert!(core::mem::offset_of!(Peb32, p_image_header_hash) == 0x23c);
+    assert!(core::mem::offset_of!(Peb32, tracing_flags) == 0x240);
+    assert!(core::mem::offset_of!(Peb32, csr_server_read_only_shared_memory_base) == 0x248);
+    assert!(core::mem::offset_of!(Peb32, tpp_workerp_list_lock) == 0x250);
+    assert!(core::mem::offset_of!(Peb32, tpp_workerp_list) == 0x254);
+    assert!(core::mem::offset_of!(Peb32, wait_on_address_hash_table) == 0x25c);
+    assert!(core::mem::offset_of!(Peb32, telemetry_coverage_header) == 0x45c);
+    assert!(core::mem::offset_of!(Peb32, cloud_file_flags) == 0x460);
+    assert!(core::mem::offset_of!(Peb32, cloud_file_diag_flags) == 0x464);
+    assert!(core::mem::offset_of!(Peb32, placeholder_compatibility_mode) == 0x468);
+    assert!(core::mem::offset_of!(Peb32, placeholder_compatibility_mode_reserved) == 0x469);
+    assert!(core::mem::offset_of!(Peb32, leap_second_data) == 0x470);
+    assert!(core::mem::offset_of!(Peb32, leap_second_flags) == 0x474);
+    assert!(core::mem::offset_of!(Peb32, nt_global_flag2) == 0x478);
+    assert!(core::mem::size_of::<Peb32View1>() == 0x480);
+    assert!(core::mem::align_of::<Peb32View1>() == core::mem::align_of::<Peb32>());
+    assert!(core::mem::offset_of!(Peb32View1, user_shared_info_ptr) == 0x2c);
+};
+
 /// `_PROCESS_ENERGY_VALUES` (0x110 bytes).
 ///
 /// Membros sobrepostos (uniões anônimas do C) ficam nas vistas

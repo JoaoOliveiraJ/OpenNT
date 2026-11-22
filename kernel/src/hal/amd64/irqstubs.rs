@@ -206,8 +206,9 @@ irq_nmi_not_spare:
     cmp byte ptr [rip + opennt_sampler_nmi], 0
     jne irq_sample_nmi
 irq_common_not_nmi:
-    # Veio do anel 3 (CS do frame = 0x33)? Troca para a KPCR (drivers leem
-    # gs:[0x188]) e captura os registradores de depuracao do usuario.
+    # Veio do anel 3 (RPL 3 no CS do frame: 0x33, ou 0x23 no codigo de 32
+    # bits do WoW64)? Troca para a KPCR (drivers leem gs:[0x188]) e captura
+    # os registradores de depuracao do usuario.
     movzx edi, byte ptr [rsp + 72]
     mov r11d, 88
     cmp edi, 8
@@ -227,8 +228,8 @@ irq_common_not_nmi:
 irq_entry_error_code:
     mov r11d, 96                    # com codigo de erro, o CS fica 8 bytes depois
 irq_entry_cs:
-    cmp word ptr [rsp + r11], 0x33
-    jne irq_gs_ready
+    test byte ptr [rsp + r11], 3
+    jz irq_gs_ready
     swapgs
     call user_debug_leave
 irq_gs_ready:
@@ -270,8 +271,8 @@ irq_sample_done:
     jne irq_context_saved
     lock inc dword ptr gs:[{processor_ticks}]
 irq_timer_context:
-    cmp word ptr [rsp + 88], 0x33
-    jne irq_context_saved
+    test byte ptr [rsp + 88], 3
+    jz irq_context_saved
     mov rax, gs:[{context}]
     test rax, rax
     jz irq_context_saved
@@ -308,6 +309,12 @@ irq_timer_context:
     mov [rax + 0xF8], rdx
     mov edx, [rsp + 96]
     mov [rax + 0x44], edx
+    # SegCs e SegSs do quadro: o intervalo volta ao modo de onde saiu (o
+    # codigo de 32 bits do WoW64 com 0x23).
+    mov dx, [rsp + 88]
+    mov [rax + 0x38], dx
+    mov dx, [rsp + 112]
+    mov [rax + 0x42], dx
 irq_context_saved:
 
     # IRQ1 (teclado): le o scancode e empilha no ring buffer, exceto quando
@@ -399,16 +406,16 @@ irq_restore_interval:
     cmp edi, 0x41
     jne irq_restore_registers
 irq_timer_interval:
-    cmp word ptr [rsp + 88], 0x33
-    jne irq_restore_registers
+    test byte ptr [rsp + 88], 3
+    jz irq_restore_registers
     cmp qword ptr gs:[{context}], 0
     je irq_restore_registers
     mov dword ptr gs:[{exit_kind}], 2
     xor edi, edi
     jmp user_terminate_current
 irq_restore_registers:
-    cmp word ptr [rsp + 88], 0x33
-    jne irq_kernel_registers
+    test byte ptr [rsp + 88], 3
+    jz irq_kernel_registers
     call user_debug_enter
 irq_kernel_registers:
     pop r11
@@ -421,8 +428,8 @@ irq_kernel_registers:
     pop rcx
     pop rax
     add rsp, 8                      # descarta o vetor empilhado
-    cmp word ptr [rsp + 8], 0x33    # voltando para o anel 3?
-    jne irq_iret
+    test byte ptr [rsp + 8], 3      # voltando para o anel 3?
+    jz irq_iret
     swapgs
 irq_iret:
     iretq
@@ -452,8 +459,8 @@ irq_nmi:
     # `kd::stop`): o pedido de parada do host (o `nmi` do monitor do QEMU),
     # o pedido de um AP ou o congelamento. Nunca vai ao despacho de
     # excecoes: a NMI nao e uma excecao do processo nem do kernel.
-    cmp word ptr [rsp + 88], 0x33
-    jne irq_nmi_kernel
+    test byte ptr [rsp + 88], 3
+    jz irq_nmi_kernel
     # Do anel 3: a fronteira comum (SWAPGS e o banco de depuracao), a parada
     # com o quadro do usuario e a volta.
     swapgs
@@ -515,8 +522,8 @@ irq_exception:
     # continua (o longjmp e user_terminate_current). O estado arquitetural
     # vai para o CONTEXT do intervalo; a pilha do usuario nunca e lida aqui.
     mov r10d, edi
-    cmp word ptr [rsp + r11], 0x33
-    jne irq_kernel_exception
+    test byte ptr [rsp + r11], 3
+    jz irq_kernel_exception
     # O fast fail tambem salva o CONTEXT: o despacho (`ps/user/exceptions.rs`)
     # o leva direto a segunda chance, sem entrega ao processo, com os
     # registradores do `int 0x29` para o depurador.
@@ -556,6 +563,10 @@ irq_exception:
     mov [rax + 0xF8], rdx
     mov edx, [rsp + r11 + 8]
     mov [rax + 0x44], edx
+    mov dx, [rsp + r11]
+    mov [rax + 0x38], dx
+    mov dx, [rsp + r11 + 24]
+    mov [rax + 0x42], dx
     xor edx, edx
     cmp r11d, 96
     jne irq_user_error_saved

@@ -184,6 +184,12 @@ pub fn console_process() -> bool {
     flag(name::CONSOLE_PROCESS)
 }
 
+/// `WOW64` (`--wow64`): o volume leva o WoW64; com `CONSOLEPROCESS`, o
+/// processo de console é o cmd.exe x86 de SysWOW64.
+pub fn wow64() -> bool {
+    flag(name::WOW64)
+}
+
 /// O boot do processo inicial real (`--initial-process=smss`).
 pub fn smss_boot() -> bool {
     initial_process() == "smss"

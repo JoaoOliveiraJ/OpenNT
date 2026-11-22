@@ -50,3 +50,4 @@ pub mod apphelp_cache;
 pub mod termination_ports;
 pub mod critical;
 pub mod quantum;
+pub mod wow64;

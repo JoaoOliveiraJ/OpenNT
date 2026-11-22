@@ -377,7 +377,8 @@ pub mod pe_exports {
 pub mod pe_image_information {
     //! SECTION_IMAGE_INFORMATION.
     //!
-    //! Capturada na criação da imagem PE32+; a consulta posterior usa esta
+    //! Capturada na criação da imagem (PE32+, ou PE32 x86 do WoW64, com a
+    //! Machine 0x14C e os tamanhos de pilha de 32 bits); a consulta posterior usa esta
     //! cópia, e escrever nos cabeçalhos mapeados não altera os metadados que o
     //! gerenciador de processos reteve.
 
@@ -392,16 +393,25 @@ pub mod pe_image_information {
         let mut information = [0u8; INFORMATION_SIZE];
         let put16 = |information: &mut [u8; INFORMATION_SIZE], offset: usize, value: u32| information[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes());
         let put32 = |information: &mut [u8; INFORMATION_SIZE], offset: usize, value: u32| information[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-        let preferred = metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32;
+        // O cabeçalho PE32 (as imagens x86 do WoW64): ImageBase de 32 bits
+        // em +28, os tamanhos de pilha de 32 bits em +72/+76 e o
+        // LoaderFlags em +88 (no PE32+, +104).
+        let pe32 = metadata.read_u16(optional)? == 0x10B;
+        let preferred = if pe32 { metadata.read_u32(optional + 28)? as u64 } else { metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32 };
         // TransferAddress acompanha a seção realmente mapeada (com relocação).
         let transfer = mapped_base.wrapping_add(metadata.read_u32(optional + 16)? as u64);
         let dll_characteristics = metadata.read_u16(optional + 70)?;
         put32(&mut information, 0, transfer as u32);
         put32(&mut information, 4, (transfer >> 32) as u32);
-        // ZeroBits e o padding ficam zero nas imagens x64 aceitas.
-        for (destination, source) in [(16usize, 72u64), (24, 80)] {
-            put32(&mut information, destination, metadata.read_u32(optional + source)?);
-            put32(&mut information, destination + 4, metadata.read_u32(optional + source + 4)?);
+        // ZeroBits e o padding ficam zero nas imagens aceitas.
+        if pe32 {
+            put32(&mut information, 16, metadata.read_u32(optional + 72)?);
+            put32(&mut information, 24, metadata.read_u32(optional + 76)?);
+        } else {
+            for (destination, source) in [(16usize, 72u64), (24, 80)] {
+                put32(&mut information, destination, metadata.read_u32(optional + source)?);
+                put32(&mut information, destination + 4, metadata.read_u32(optional + source + 4)?);
+            }
         }
         put32(&mut information, 32, metadata.read_u16(optional + 68)?);
         // Versão do subsistema: minor antes de major; versão do SO: o inverso.
@@ -427,7 +437,7 @@ pub mod pe_image_information {
             information[50] = 1;
             information[51] |= 8;
         }
-        put32(&mut information, 52, metadata.read_u32(optional + 104)?);
+        put32(&mut information, 52, metadata.read_u32(optional + if pe32 { 88 } else { 104 })?);
         put32(&mut information, 56, source_size as u32);
         put32(&mut information, 60, metadata.read_u32(optional + 64)?);
         Ok(information)

@@ -434,7 +434,10 @@ pub fn exports(segment: &ImageSegment, image_base: u64) -> Result<Exports, Kerne
         Ok(bytes)
     };
     let header = u32::from_le_bytes(read_rva(0x3C, 4)?.try_into().unwrap_or([0; 4])) as u64;
-    let directory = read_rva(header + 24 + 112, 8)?;
+    // O diretório de dados do PE32 (imagem x86 do WoW64) começa 16 bytes
+    // antes do do PE32+.
+    let magic = u16::from_le_bytes(read_rva(header + 24, 2)?.try_into().unwrap_or([0; 2]));
+    let directory = read_rva(crate::ntos::mm::pe_loader::data_directories(header + 24, magic == super::image_header::MAGIC_PE32), 8)?;
     let (rva, size) = (u32::from_le_bytes([directory[0], directory[1], directory[2], directory[3]]) as u64, u32::from_le_bytes([directory[4], directory[5], directory[6], directory[7]]) as u64);
     pe_exports::read_exports(&read_rva, image_base, segment.size_of_image, rva, size)
 }

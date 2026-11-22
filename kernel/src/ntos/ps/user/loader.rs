@@ -193,6 +193,22 @@ static TEMPLATES: SpinLock<BTreeMap<&'static str, Arc<SystemTemplate>>> = SpinLo
 /// PAGE_READONLY: a proteção das páginas do apiset e do NLS nos processos.
 const PAGE_READONLY: u32 = 0x02;
 
+/// A ImageBase do cabeçalho da ntdll de sistema (a relocação dela é a
+/// diferença para a base mapeada).
+static NTDLL_PREFERRED_BASE: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// A ImageBase do cabeçalho da ntdll de sistema, depois de mapeada.
+pub fn ntdll_preferred_base() -> Option<u64> {
+    *NTDLL_PREFERRED_BASE.lock()
+}
+
+/// As páginas fotografadas de uma cópia de sistema (`"apiset"`,
+/// `"nls-ansi"`, `"nls-oem"`, `"nls-unicode"`), para quem precisa delas em
+/// outra VA (a PEB de 32 bits de um processo WoW64, `ps::wow64`).
+pub fn system_template(name: &str) -> Option<Arc<SystemTemplate>> {
+    TEMPLATES.lock().get(name).cloned()
+}
+
 /// A VA cai numa imagem de sistema vista por todo processo na mesma VA (a
 /// ntdll e o apiset schema: a cópia de sistema ou a privada do processo).
 pub fn system_image(va: u64) -> bool {
@@ -254,7 +270,10 @@ pub fn map_system_images() -> Result<(), KernelError> {
         return Ok(());
     }
     let Some(owner) = process_state::current() else { return Err(KernelError::new("paginas de sistema sem estado do processo")) };
-    let templates: Vec<Arc<SystemTemplate>> = TEMPLATES.lock().values().cloned().collect();
+    // A ntdll de 32 bits só num processo WoW64 x86 (o PsMapSystemDlls do
+    // 19041 mapeia a DLL de sistema do WoW64 só nele).
+    let wow64 = crate::ntos::ps::wow64::is_x86_process(process::get_current_process());
+    let templates: Vec<Arc<SystemTemplate>> = TEMPLATES.lock().iter().filter(|(name, _)| wow64 || **name != crate::ntos::ps::wow64::system_dll::TEMPLATE).map(|(_, template)| template.clone()).collect();
     let mut mapped = BTreeMap::new();
     let result = templates.iter().try_for_each(|template| memory::map_system_pages(root, template, &mut mapped));
     // O que foi mapeado é do processo, mesmo numa falha no meio.
@@ -368,6 +387,7 @@ fn map_system_ntdll(source: Arc<dyn ImageSource>, notification: Arc<dyn FileSour
     let source_name = String::from(notification.name());
     let image = pe_loader::load_from_source(source, &LoadOptions { user_space: true, notify_image: false, ..LoadOptions::default() })?;
     register_system_image("ntdll", &image)?;
+    *NTDLL_PREFERRED_BASE.lock() = Some(image.preferred_base);
     let exports = image.exports.exports.clone();
     state::with(|state| {
         state.ntdll_exports = Some(exports.clone());

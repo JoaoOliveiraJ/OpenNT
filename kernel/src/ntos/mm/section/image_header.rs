@@ -25,10 +25,15 @@
 //! seguro do IUM ou um driver carregado com essa exigência); o OpenNT não tem
 //! nenhum desses modos.
 //!
+//! As máquinas aceitas são a nativa (PE32+ AMD64) e a x86 do WoW64 (PE32
+//! i386, os binários de SysWOW64), cada uma com o seu cabeçalho opcional; os
+//! campos lidos aqui (alinhamentos, SizeOfImage e SizeOfHeaders) ficam nos
+//! mesmos deslocamentos nos dois formatos.
+//!
 //! Lacuna: as outras recusas do MiVerifyImageHeader (características,
-//! ImageBase, tamanho do cabeçalho opcional) não estão aqui, só imagens
-//! PE32+ AMD64 são aceitas, e um arquivo sem MZ dá
-//! STATUS_INVALID_IMAGE_FORMAT em vez de STATUS_INVALID_IMAGE_NOT_MZ.
+//! ImageBase, tamanho do cabeçalho opcional) não estão aqui, e um arquivo
+//! sem MZ dá STATUS_INVALID_IMAGE_FORMAT em vez de
+//! STATUS_INVALID_IMAGE_NOT_MZ.
 
 use alloc::vec::Vec;
 
@@ -71,6 +76,20 @@ fn dword(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
 }
 
+/// IMAGE_FILE_MACHINE_AMD64 com IMAGE_NT_OPTIONAL_HDR64_MAGIC e
+/// IMAGE_FILE_MACHINE_I386 com IMAGE_NT_OPTIONAL_HDR32_MAGIC.
+pub const MACHINE_AMD64: u16 = 0x8664;
+pub const MACHINE_I386: u16 = 0x14C;
+pub const MAGIC_PE32_PLUS: u16 = 0x20B;
+pub const MAGIC_PE32: u16 = 0x10B;
+
+/// As máquinas que a seção de imagem aceita: a nativa (PE32+ AMD64) e a do
+/// WoW64 (PE32 i386), cada uma com o cabeçalho opcional do seu formato, como
+/// o MiVerifyImageHeader do x64 aceita as imagens de 32 bits de SysWOW64.
+pub fn machine_supported(machine: u16, magic: u16) -> bool {
+    matches!((machine, magic), (MACHINE_AMD64, MAGIC_PE32_PLUS) | (MACHINE_I386, MAGIC_PE32))
+}
+
 /// Os alinhamentos que o MiVerifyImageHeader aceita.
 pub fn alignments_valid(section_alignment: u32, file_alignment: u32) -> bool {
     if file_alignment & 0x1FF != 0 && file_alignment != section_alignment {
@@ -105,7 +124,7 @@ pub fn parse(file_size: u64, read: Reader) -> Result<Result<ImageHeader, u32>, K
     }
     let Some(nt) = read(portable, NT_HEADERS_READ)? else { return invalid };
     let optional_size = word(&nt, 20) as u64;
-    if dword(&nt, 0) != 0x4550 || word(&nt, 4) != 0x8664 || optional_size < 64 || word(&nt, 24) != 0x20B {
+    if dword(&nt, 0) != 0x4550 || optional_size < 64 || !machine_supported(word(&nt, 4), word(&nt, 24)) {
         return invalid;
     }
     let section_count = word(&nt, 6) as u64;

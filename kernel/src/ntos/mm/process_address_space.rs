@@ -170,6 +170,54 @@ pub fn create(process: u64) -> Result<u64, KernelError> {
     Ok(root)
 }
 
+/// O HighestUserAddress padrão (MmUserProbeAddress) e os limites de um
+/// processo de 2 GB e de um WoW64 de 4 GB.
+const HIGHEST_USER_ADDRESS: u64 = map::USER_PROBE_ADDRESS;
+const HIGHEST_USER_ADDRESS_2GB: u64 = 0x7FFF_0000;
+const HIGHEST_USER_ADDRESS_WOW64_4GB: u64 = 0xFFFF_0000;
+/// IMAGE_FILE_LARGE_ADDRESS_AWARE.
+const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x20;
+
+/// O MiComputeProcessUserVa do MmInitializeProcessAddressSpace (19041
+/// 0x6fc210): o EPROCESS.HighestUserAddress de um processo com imagem. Sem
+/// EPROCESS.Flags.OverrideAddressSpace, uma imagem sem
+/// IMAGE_FILE_LARGE_ADDRESS_AWARE fica com 2 GB (0x7FFF0000), nativa ou
+/// WoW64; um processo WoW64 x86 com ela fica com 4 GB (0xFFFF0000) e liga
+/// EPROCESS.Flags.Wow64VaSpace4Gb; os demais, o MmUserProbeAddress. A
+/// escolha de VA do processo não passa do limite
+/// (`ps::user::memory::occupied`).
+pub fn compute_user_va(process: u64, characteristics: u16, wow64_x86: bool) {
+    use crate::ntos::inc::types::Eprocess;
+    // SAFETY: o EPROCESS em montagem, retido pelo chamador.
+    let eprocess = unsafe { Eprocess::at(process) };
+    let mut highest = HIGHEST_USER_ADDRESS;
+    if eprocess.override_address_space() == 0 {
+        if characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE == 0 {
+            highest = HIGHEST_USER_ADDRESS_2GB;
+        } else if wow64_x86 {
+            highest = HIGHEST_USER_ADDRESS_WOW64_4GB;
+            eprocess.flags.atomic().fetch_or(Eprocess::WOW64_VA_SPACE4_GB_MASK, Ordering::SeqCst);
+        }
+    }
+    eprocess.highest_user_address.set(highest);
+}
+
+/// O fim exclusivo da faixa que a escolha de VA do processo usa: o
+/// MM_HIGHEST_VAD_ADDRESS dele (HighestUserAddress menos 64 KB) + 1; sem
+/// HighestUserAddress gravado, o padrão.
+pub fn allocation_top(process: u64) -> u64 {
+    use crate::ntos::inc::types::Eprocess;
+    if process == 0 {
+        return map::HIGHEST_VAD_ADDRESS + 1;
+    }
+    // SAFETY: o EPROCESS vivo do espaço consultado.
+    let highest = unsafe { Eprocess::at(process) }.highest_user_address.get();
+    if highest == 0 || highest > HIGHEST_USER_ADDRESS {
+        return map::HIGHEST_VAD_ADDRESS + 1;
+    }
+    highest - map::ALLOCATION_GRANULARITY
+}
+
 /// Desfaz uma raiz de [`create`] que nunca foi publicada.
 fn discard(root: u64) {
     if let Err(error) = paging::release_user_half_in(root, &shared_user_data::shared_user_pages()).and_then(|_| delete_root(root)) {

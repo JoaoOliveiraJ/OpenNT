@@ -8,8 +8,10 @@
 //! os bits KernelMode (16), UserMode (17), Native (18) e Process (19, a
 //! máquina do processo dado). A primeira entrada é sempre a AMD64 nativa
 //! (kernel, usuário e nativa); as de WoW64 (i386, ARM) só entram quando o
-//! PsWow64IsMachineSupported as reconhece, e o OpenNT não tem WoW64: o
-//! vetor é AMD64 e o terminador. Um buffer menor recebe
+//! PsWow64IsMachineSupported as reconhece: aqui a i386 (só UserMode), quando
+//! a ntdll de 32 bits de SysWOW64 está no volume (`ps::wow64`). O bit
+//! Process vai na entrada da máquina do processo dado (EWOW64PROCESS.Machine,
+//! ou a nativa); sem processo, em nenhuma. Um buffer menor recebe
 //! STATUS_BUFFER_TOO_SMALL com o tamanho em ReturnLength (o smss pergunta
 //! primeiro com buffer nulo).
 
@@ -21,6 +23,7 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
+const IMAGE_FILE_MACHINE_I386: u32 = 0x14C;
 const KERNEL_MODE: u32 = 1 << 16;
 const USER_MODE: u32 = 1 << 17;
 const NATIVE: u32 = 1 << 18;
@@ -51,9 +54,17 @@ pub fn query(input: u64, input_length: u64, output: u64, length: u64, returned: 
             Err(status) => return Ok(status),
         }
     };
-    // Sem WoW64: a máquina de todo processo é a nativa.
-    let native = IMAGE_FILE_MACHINE_AMD64 | KERNEL_MODE | USER_MODE | NATIVE | if process.is_some() { PROCESS } else { 0 };
-    let entries = [native, 0];
+    // A máquina do processo dado (o EWOW64PROCESS.Machine, ou a nativa)
+    // recebe o bit Process; sem processo, nenhuma.
+    let machine = process.map(|process| crate::ntos::ps::process_accessors::wow64_machine(process) as u32);
+    let process_bit = |entry: u32| if machine == Some(entry) { PROCESS } else { 0 };
+    let native = IMAGE_FILE_MACHINE_AMD64 | KERNEL_MODE | USER_MODE | NATIVE | process_bit(IMAGE_FILE_MACHINE_AMD64);
+    let mut entries = alloc::vec![native];
+    // O WoW64 x86 só modo usuário, com a ntdll de 32 bits presente.
+    if crate::ntos::ps::wow64::process::machine_supported(IMAGE_FILE_MACHINE_I386 as u16) {
+        entries.push(IMAGE_FILE_MACHINE_I386 | USER_MODE | process_bit(IMAGE_FILE_MACHINE_I386));
+    }
+    entries.push(0);
     let required = (entries.len() * 4) as u64;
     if returned != 0 {
         guest::try_write::<u32>(returned, required as u32)?;

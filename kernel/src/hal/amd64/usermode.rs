@@ -35,7 +35,7 @@ use crate::hal::amd64::{context_switch, native_call};
 use crate::hal::cpu;
 use crate::ntos::ex::system_services;
 use crate::ntos::inc::field::{Field, NtStruct, Reserved};
-use crate::ntos::inc::types::{Kthread, KthreadView1};
+use crate::ntos::inc::types::{Eprocess, Ethread, Kthread, KthreadView1};
 use crate::ntos::ke::pcr::{self, layout};
 use crate::ntos::mm::memory_map::MAX_CPUS;
 use crate::rtl::SpinLock;
@@ -127,13 +127,37 @@ const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-/// Seletores: 0x10/0x18 do stage2, 0x28 dados e 0x30 código de usuário,
-/// 0x38 a TSS de 16 bytes.
+/// Seletores: 0x10/0x18 do stage2, 0x20 o código de 32 bits do usuário
+/// (KGDT64_R3_CMCODE, o modo de compatibilidade do WoW64), 0x28 dados e 0x30
+/// código de usuário, 0x38 a TSS de 16 bytes e 0x50 o descritor da TEB de 32
+/// bits (KGDT64_R3_CMTEB, o FS do código x86).
 const SEL_KERNEL_CODE: u64 = 0x10;
+const SEL_USER_COMPAT_CODE: u64 = 0x20;
 const SEL_USER_DATA: u64 = 0x28;
 const SEL_USER_CODE: u64 = 0x30;
 const SEL_TSS: u64 = 0x38;
+const SEL_USER_COMPAT_TEB: u64 = 0x50;
 const SEL_SYSRET_BASE: u64 = SEL_USER_DATA - 8;
+/// O seletor de código de 32 bits como o CONTEXT e o quadro do IRETQ o levam
+/// (KGDT64_R3_CMCODE | RPL 3).
+pub const USER_COMPAT_CS: u16 = (SEL_USER_COMPAT_CODE | 3) as u16;
+/// KGDT64_R3_DATA | RPL 3 e KGDT64_R3_CMTEB | RPL 3.
+pub const USER_DS: u16 = (SEL_USER_DATA | 3) as u16;
+pub const USER_COMPAT_FS: u16 = (SEL_USER_COMPAT_TEB | 3) as u16;
+/// Os descritores de usuário da GDT, os do NT x64 (o winload os monta e o
+/// KiSystemStartup do 19041 grava o limite 0x3C00 do CMTEB): o código de 32
+/// bits DPL 3 de 4 GB (D=1, G=1), os dados planos DPL 3 de 4 GB (B=1: a pilha
+/// de 32 bits do modo de compatibilidade), o código de 64 bits DPL 3 (L=1) e
+/// o CMTEB, dados DPL 3 de 0x3C00 bytes com B=1, cuja base é a TEB de 32 bits
+/// da thread corrente (o SwapContext a regrava a cada troca).
+const GDT_USER_COMPAT_CODE: u64 = 0x00CF_FB00_0000_FFFF;
+const GDT_USER_DATA: u64 = 0x00CF_F300_0000_FFFF;
+const GDT_USER_CODE: u64 = 0x0020_FB00_0000_0000;
+const GDT_USER_COMPAT_TEB: u64 = 0x0040_F300_0000_3C00;
+/// As entradas da GDT de cada CPU: da nula ao CMTEB.
+const GDT_ENTRIES: u16 = (SEL_USER_COMPAT_TEB / 8 + 1) as u16;
+/// IA32_FS_BASE.
+const MSR_FS_BASE: u32 = 0xC000_0100;
 /// RFLAGS limpos na entrada de syscall: TF|IF|DF|IOPL|NT|AC.
 const SFMASK_VALUE: u64 = 0x47700;
 /// Sem IOPB: toda porta de E/S falta para o anel 3.
@@ -388,7 +412,14 @@ user_exec_context:
     push qword ptr [rdi + 0x98]
     mov eax, [rdi + 0x44]
     push rax
-    push {user_cs}
+    # CONTEXT.SegCs: o código de 32 bits (KGDT64_R3_CMCODE) volta ao modo de
+    # compatibilidade; qualquer outro valor, ao código de 64 bits.
+    movzx eax, word ptr [rdi + 0x38]
+    cmp eax, {compat_cs}
+    je opennt_uec_cs_ready
+    mov eax, {user_cs}
+opennt_uec_cs_ready:
+    push rax
     push qword ptr [rdi + 0xF8]
     call user_debug_enter
     mov rax, [rdi + 0x78]
@@ -583,6 +614,7 @@ user_terminate_current:
     xstate_area = const gs_offset(offset_of!(UserExecutionBlock, xstate_area)),
     user_ds = const SEL_USER_DATA | 3,
     user_cs = const SEL_USER_CODE | 3,
+    compat_cs = const SEL_USER_COMPAT_CODE | 3,
 );
 
 extern "C" {
@@ -709,8 +741,13 @@ pub fn processor_user_mode_init(stack_top: u64, double_fault_stack: u64) -> Resu
     // toda a vida do sistema e de uso só dela.
     unsafe {
         core::ptr::copy_nonoverlapping(current.base as *const u8, gdt as *mut u8, limit + 1);
-        *gdt.add((SEL_USER_DATA / 8) as usize) = 0x0000_F200_0000_0000;
-        *gdt.add((SEL_USER_CODE / 8) as usize) = 0x0020_FA00_0000_0000;
+        // O 0x20 do stage2 (os dados de 32 bits do bootstrap) só serve antes
+        // do modo longo: aqui ele vira o código de 32 bits do usuário.
+        *gdt.add((SEL_USER_COMPAT_CODE / 8) as usize) = GDT_USER_COMPAT_CODE;
+        *gdt.add((SEL_USER_DATA / 8) as usize) = GDT_USER_DATA;
+        *gdt.add((SEL_USER_CODE / 8) as usize) = GDT_USER_CODE;
+        *gdt.add((SEL_TSS / 8) as usize + 2) = 0;
+        *gdt.add((SEL_USER_COMPAT_TEB / 8) as usize) = GDT_USER_COMPAT_TEB;
         core::ptr::write_bytes(tss, 0, TSS_LIMIT as usize);
         core::ptr::write_unaligned(tss.add(TSS_RSP0) as *mut u64, stack_top);
         core::ptr::write_unaligned(tss.add(TSS_IST1) as *mut u64, double_fault_stack);
@@ -718,9 +755,13 @@ pub fn processor_user_mode_init(stack_top: u64, double_fault_stack: u64) -> Resu
         let base = tss as u64;
         *gdt.add((SEL_TSS / 8) as usize) = (TSS_LIMIT - 1) | ((base & 0xFF_FFFF) << 16) | (0x89 << 40) | (((base >> 24) & 0xFF) << 56);
         *gdt.add((SEL_TSS / 8) as usize + 1) = base >> 32;
-        let register = Register { limit: 9 * 8 - 1, base: gdt as u64 };
+        let register = Register { limit: GDT_ENTRIES * 8 - 1, base: gdt as u64 };
         asm!("lgdt [{}]", in(reg) &register, options(readonly, nostack));
         asm!("mov ax, {selector}", "ltr ax", selector = const SEL_TSS, out("ax") _, options(nostack));
+        // Os seletores de dados do KiSystemStartup: DS e ES no KGDT64_R3_DATA
+        // e o FS no CMTEB, os valores que o anel 3 recebe (o IRETQ zeraria um
+        // seletor DPL 0, e o código de 32 bits precisa de DS e ES válidos).
+        asm!("mov ds, {data:x}", "mov es, {data:x}", "mov fs, {teb:x}", data = in(reg) USER_DS as u64, teb = in(reg) USER_COMPAT_FS as u64, options(nostack, preserves_flags));
     }
     // A entrada de syscall desta CPU carrega a mesma pilha da TSS.RSP0.
     let kpcr = pcr::current();
@@ -784,6 +825,62 @@ fn load_kernel_stack(top: u64) {
     // SAFETY: a TSS desta CPU; ela só lê o RSP0 numa entrada vinda do anel
     // 3, e aqui está no anel 0.
     unsafe { core::ptr::write_unaligned(tss.add(TSS_RSP0) as *mut u64, top) };
+}
+
+const _: () = assert!(GDT_ENTRIES as u64 * 8 <= layout::PROCESSOR_TSS - layout::PROCESSOR_GDT);
+
+/// A thread do intervalo (gs:[188h]) e o processo dela (KTHREAD.Process),
+/// com o EPROCESS.WoW64Process.
+fn dispatched_thread() -> Option<(&'static Ethread, bool)> {
+    let thread = pcr::current().prcb.current_thread.get();
+    if thread == 0 {
+        return None;
+    }
+    // SAFETY: a KTHREAD corrente (no começo do ETHREAD) está viva enquanto é
+    // despachada; o processo dono vive enquanto ela vive.
+    let thread = unsafe { Ethread::at(thread) };
+    let process = thread.tcb.process.get();
+    let wow64 = process != 0 && unsafe { Eprocess::at(process) }.wo_w64_process.get() != 0;
+    Some((thread, wow64))
+}
+
+/// O lado de entrada do SwapContext do 19041 para os segmentos do usuário
+/// (0x406367): a base do descritor KGDT64_R3_CMTEB desta CPU recebe a TEB de
+/// 32 bits (`teb` + 0x2000) numa thread de processo WoW64, ou o
+/// ETHREAD.UserFsBase nas outras; o FS recarrega o seletor 0x53 e o
+/// IA32_FS_BASE recebe o UserFsBase. O `mov fs, 0x53` do wow64cpu (o
+/// RunSimulatedCode, sem RDWRFSGSBASE) acha no descritor a TEB de 32 bits da
+/// thread que está na CPU. DS e ES voltam ao KGDT64_R3_DATA se mudaram.
+fn load_user_segments(teb: u64) {
+    let Some((thread, wow64)) = dispatched_thread() else { return };
+    let fs_base = thread.user_fs_base.get();
+    let base = if wow64 { (teb + crate::ntos::ps::wow64::TEB32_OFFSET) as u32 } else { fs_base as u32 };
+    let gdt = pcr::current().gdt_base.get() + SEL_USER_COMPAT_TEB;
+    // SAFETY: a GDT desta CPU, na reserva da KPCR dela; só esta CPU a usa e o
+    // descritor 0x50 é de dados de usuário (nenhum seletor do kernel o usa).
+    unsafe {
+        let descriptor = gdt as *mut u64;
+        let value = core::ptr::read_volatile(descriptor) & !0xFF00_00FF_FFFF_0000;
+        let value = value | ((base as u64 & 0xFF_FFFF) << 16) | (((base as u64 >> 24) & 0xFF) << 56);
+        core::ptr::write_volatile(descriptor, value);
+        asm!("mov fs, {teb:x}", teb = in(reg) USER_COMPAT_FS as u64, options(nostack, preserves_flags));
+    }
+    cpu::write_msr(MSR_FS_BASE, fs_base);
+    let selectors: u16;
+    // SAFETY: só lê os seletores.
+    unsafe { asm!("mov {all:x}, ds", "mov {other:x}, es", "and {all:x}, {other:x}", all = out(reg) selectors, other = out(reg) _, options(nomem, nostack, preserves_flags)) };
+    if selectors != USER_DS {
+        // SAFETY: DS e ES não entram no endereçamento do modo de 64 bits.
+        unsafe { asm!("mov ds, {data:x}", "mov es, {data:x}", data = in(reg) USER_DS as u64, options(nostack, preserves_flags)) };
+    }
+}
+
+/// O lado de saída (o SwapContext 0x405fdd): numa thread de processo WoW64,
+/// o IA32_FS_BASE vivo (que o código de 32 bits carregou pelo seletor ou pelo
+/// WRFSBASE) volta ao ETHREAD.UserFsBase.
+fn save_user_segments() {
+    let Some((thread, true)) = dispatched_thread() else { return };
+    thread.user_fs_base.set(cpu::read_msr(MSR_FS_BASE));
 }
 
 /// O anel 3 foi armado.
@@ -856,7 +953,9 @@ pub fn exec_user_context(context: u64, teb: u64) -> u32 {
     block.continue_flag.set(0);
     block.xstate_area.set(current_xstate_area());
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    load_user_segments(teb);
     let result = unsafe { user_exec_context(context, stack) };
+    save_user_segments();
     load_kernel_stack(fallback);
     block.context.set(0);
     block.xstate_area.set(0);
@@ -958,9 +1057,11 @@ pub fn resume_kernel_context(saved_rsp: u64, teb: u64) -> u32 {
     block.exit_kind.set(0);
     block.xstate_area.set(current_xstate_area());
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    load_user_segments(teb);
     // SAFETY: `saved_rsp` é o KernelStack que `block_in_service` gravou na
     // pilha viva da thread corrente, ainda não retomado.
     let result = unsafe { context_switch::resume(saved_rsp) };
+    save_user_segments();
     load_kernel_stack(fallback);
     block.context.set(0);
     block.xstate_area.set(0);
@@ -1004,6 +1105,7 @@ pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -
     block.exit_kind.set(0);
     block.continue_flag.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    load_user_segments(teb);
     // SAFETY: a pilha de kernel da thread corrente está viva e sem quadro (a
     // thread não tem serviço suspenso); a rotina sai pelo fim do intervalo,
     // que volta ao quadro de despachante que a retomada grava.
@@ -1011,6 +1113,7 @@ pub fn exec_kernel_routine(context: u64, teb: u64, routine: extern "C" fn(u64) -
         let frame = context_switch::build_service_frame(stack, routine, argument);
         context_switch::resume(frame)
     };
+    save_user_segments();
     load_kernel_stack(fallback);
     block.context.set(0);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
@@ -1248,7 +1351,12 @@ fn capture_syscall_registers(frame: *const u64, result: u64) {
     write64(context + 0xF0, f(14));
     write64(context + 0xF8, f(1));
     write32(context + 0x44, f(8) as u32);
+    // A syscall vem sempre do código de 64 bits (o WoW64 volta a ele antes
+    // da instrução syscall): CS e SS do usuário de 64 bits, mesmo depois de
+    // um intervalo que o relógio interrompeu no código de 32 bits.
     unsafe {
+        core::ptr::write_volatile((context + 0x38) as *mut u16, (SEL_USER_CODE | 3) as u16);
+        core::ptr::write_volatile((context + 0x42) as *mut u16, USER_DS);
         core::ptr::copy_nonoverlapping((frame as *const u8).sub(0x208), (context + 0x100) as *mut u8, 512);
     }
     write32(context + 0x34, read32(context + 0x118));

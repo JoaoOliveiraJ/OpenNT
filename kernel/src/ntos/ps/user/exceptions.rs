@@ -235,6 +235,12 @@ fn deliver_frame(thread: &UserThread, record: &[u8]) -> Result<u64, u32> {
     }
     live.rsp.set(stack);
     live.rip.set(dispatcher);
+    // O KiUserExceptionDispatcher é código de 64 bits, também para uma
+    // exceção do código de 32 bits de uma thread WoW64 (o KiDispatchException
+    // grava KGDT64_R3_CODE e KGDT64_R3_DATA no quadro; o CS de 32 bits fica
+    // no CONTEXT e no machine frame salvos, que o wow64.dll lê).
+    live.seg_cs.set(0x33);
+    live.seg_ss.set(0x2B);
     live.rcx.set(stack + RECORD_OFFSET);
     live.rdx.set(stack);
     // TF/DF/RF limpos na entrada do despachante; as flags originais ficam

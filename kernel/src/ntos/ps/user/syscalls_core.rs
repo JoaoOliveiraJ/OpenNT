@@ -475,9 +475,18 @@ fn query_system_information(class: u32, buffer: u64, length: u64, returned: u64)
                 basic.highest_physical_page_number.probe_set(physical_layout::highest_physical_page() as u32)?;
                 basic.allocation_granularity.probe_set(memory_map::ALLOCATION_GRANULARITY as u32)?;
                 basic.minimum_user_mode_address.probe_set(memory_map::LOWEST_USER_ADDRESS)?;
-                basic.maximum_user_mode_address.probe_set(memory_map::HIGHEST_USER_ADDRESS)?;
-                basic.active_processors_affinity_mask.probe_set(online_mask())?;
-                basic.number_of_processors.probe_set(smp::online_cpu_count() as i8)?;
+                // SystemEmulationBasicInformation (o
+                // ExpGetSystemEmulationBasicInformation 0x316278, que o
+                // wow64.dll consulta para o código de 32 bits): o último
+                // endereço é o HighestUserAddress do processo menos 1, e a
+                // máscara dos processadores do grupo cabe em 32 bits (as duas
+                // metades sobrepostas), com a contagem dela.
+                // SAFETY: o EPROCESS do processo corrente, vivo durante a syscall.
+                let highest = unsafe { crate::ntos::inc::types::Eprocess::at(crate::ntos::ps::process::get_current_process()) }.highest_user_address.get();
+                let (maximum, mask) = if class == 62 && highest != 0 { (highest - 1, (online_mask() >> 32) | (online_mask() & 0xFFFF_FFFF)) } else { (memory_map::HIGHEST_USER_ADDRESS, online_mask()) };
+                basic.maximum_user_mode_address.probe_set(maximum)?;
+                basic.active_processors_affinity_mask.probe_set(mask)?;
+                basic.number_of_processors.probe_set(mask.count_ones() as i8)?;
                 set_returned(SystemBasicInformation::SIZE as u32)?;
                 Ok(STATUS_SUCCESS)
             }
@@ -1108,8 +1117,9 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
         }
         // ProcessWow64Information (ULONG_PTR): o PEB de 32 bits do processo
         // WoW64, pelo handle com PROCESS_QUERY_LIMITED_INFORMATION; outro
-        // comprimento é STATUS_INFO_LENGTH_MISMATCH. O OpenNT só roda
-        // processos nativos de 64 bits: 0.
+        // comprimento é STATUS_INFO_LENGTH_MISMATCH. É o
+        // PsGetProcessWow64Process (o EWOW64PROCESS.Peb): 0 num processo
+        // nativo.
         26 => {
             if length != 8 {
                 return Ok(STATUS_INFO_LENGTH_MISMATCH);
@@ -1117,10 +1127,11 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             if !probe_user_write(buffer, 8) {
                 return Ok(0xC000_0005);
             }
-            if let Err(status) = queried_process(handle) {
-                return Ok(status);
-            }
-            guest::try_write::<u64>(buffer, 0)?;
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            guest::try_write::<u64>(buffer, crate::ntos::ps::process_accessors::wow64_process(target))?;
             set_returned(8)?;
             Ok(STATUS_SUCCESS)
         }

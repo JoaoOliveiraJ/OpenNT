@@ -1,4 +1,12 @@
-//! Loader de executáveis PE32+ (x86-64).
+//! Loader de executáveis PE32+ (x86-64) e, no modo usuário, PE32 (x86, as
+//! imagens de SysWOW64 dos processos WoW64).
+//!
+//! O cabeçalho opcional PE32 difere do PE32+ só nos campos de 64 bits: a
+//! ImageBase é de 32 bits em +28 (com o BaseOfData em +24), os tamanhos de
+//! pilha e de heap são de 32 bits e o diretório de dados começa em +96 em vez
+//! de +112; a relocação é a IMAGE_REL_BASED_HIGHLOW. Uma imagem PE32 nunca é
+//! de kernel, e o kernel não resolve os imports nem semeia o cookie GS dela:
+//! quem faz isso é a ntdll de 32 bits.
 //!
 //! Faz o parse do PE, copia cabeçalhos e seções para frames do PFN, mapeia a
 //! imagem na VA escolhida, aplica relocações, semeia o cookie GS e resolve a
@@ -144,6 +152,9 @@ pub struct ImageLayout {
     pub characteristics: u16,
     /// OptionalHeader.DllCharacteristics.
     pub dll_characteristics: u16,
+    /// FileHeader.Machine: IMAGE_FILE_MACHINE_AMD64 ou, numa imagem do
+    /// WoW64, IMAGE_FILE_MACHINE_I386.
+    pub machine: u16,
 }
 
 /// ImageBase preferida, SizeOfImage e as características do cabeçalho, sem
@@ -159,11 +170,27 @@ pub fn image_layout(source: &dyn ImageSource) -> Result<ImageLayout, KernelError
         return Err(KernelError::new("assinatura PE ausente"));
     }
     let optional = pe_header + 24;
-    if metadata.read_u16(optional)? != 0x20B {
-        return Err(KernelError::new("nao e PE32+"));
+    let machine = metadata.read_u16(pe_header + 4)? as u16;
+    let magic = metadata.read_u16(optional)? as u16;
+    if !image_header::machine_supported(machine, magic) {
+        return Err(KernelError::new("nao e PE32+ AMD64 nem PE32 i386"));
     }
-    let preferred_base = metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32;
-    Ok(ImageLayout { preferred_base, size_of_image: metadata.read_u32(optional + 56)? as u64, characteristics: metadata.read_u16(pe_header + 22)? as u16, dll_characteristics: metadata.read_u16(optional + 70)? as u16 })
+    let preferred_base = preferred_image_base(&metadata, optional, magic == image_header::MAGIC_PE32)?;
+    Ok(ImageLayout { preferred_base, size_of_image: metadata.read_u32(optional + 56)? as u64, characteristics: metadata.read_u16(pe_header + 22)? as u16, dll_characteristics: metadata.read_u16(optional + 70)? as u16, machine })
+}
+
+/// A ImageBase do cabeçalho opcional: de 32 bits em +28 no PE32, de 64 bits
+/// em +24 no PE32+.
+fn preferred_image_base(metadata: &MetadataReader, optional: u64, pe32: bool) -> Result<u64, KernelError> {
+    if pe32 {
+        return Ok(metadata.read_u32(optional + 28)? as u64);
+    }
+    Ok(metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32)
+}
+
+/// Onde começa o diretório de dados do cabeçalho opcional.
+pub fn data_directories(optional: u64, pe32: bool) -> u64 {
+    optional + if pe32 { 96 } else { 112 }
 }
 
 /// Dependência retida por um import nativo (outro módulo carregado).
@@ -711,24 +738,29 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
         return Err(KernelError::new("assinatura PE ausente"));
     }
     let coff = pe_header + 4;
-    if metadata.read_u16(coff)? != 0x8664 {
-        return Err(KernelError::new("so suportamos PE x86-64"));
-    }
     let section_count = metadata.read_u16(coff + 2)? as u64;
     let optional_size = metadata.read_u16(coff + 16)? as u64;
     let optional = coff + 20;
-    if metadata.read_u16(optional)? != 0x20B {
-        return Err(KernelError::new("nao e PE32+"));
+    let magic = metadata.read_u16(optional)? as u16;
+    if !image_header::machine_supported(metadata.read_u16(coff)? as u16, magic) {
+        return Err(KernelError::new("so suportamos PE32+ x86-64 (e PE32 x86 no modo usuario)"));
     }
+    // A imagem x86 é só do modo usuário de um processo WoW64; os imports e
+    // o cookie GS dela são da ntdll de 32 bits.
+    let pe32 = magic == image_header::MAGIC_PE32;
+    if pe32 && (!options.user_space || !options.skip_imports || !options.skip_security_cookie) {
+        return Err(KernelError::new("PE32: so imagens de usuario, sem imports nem cookie pelo kernel"));
+    }
+    let directories = data_directories(optional, pe32);
     let entry_rva = metadata.read_u32(optional + 16)? as u64;
-    let preferred_base = metadata.read_u32(optional + 24)? as u64 | (metadata.read_u32(optional + 28)? as u64) << 32;
+    let preferred_base = preferred_image_base(&metadata, optional, pe32)?;
     let size_of_image = metadata.read_u32(optional + 56)? as u64;
     let size_of_headers = metadata.read_u32(optional + 60)? as u64;
-    let export_rva = metadata.read_u32(optional + 112)? as u64;
-    let export_size = metadata.read_u32(optional + 116)? as u64;
-    let import_rva = metadata.read_u32(optional + 120)? as u64;
-    let reloc_rva = metadata.read_u32(optional + 152)? as u64;
-    let reloc_size = metadata.read_u32(optional + 156)? as u64;
+    let export_rva = metadata.read_u32(directories)? as u64;
+    let export_size = metadata.read_u32(directories + 4)? as u64;
+    let import_rva = metadata.read_u32(directories + 8)? as u64;
+    let reloc_rva = metadata.read_u32(directories + 40)? as u64;
+    let reloc_size = metadata.read_u32(directories + 44)? as u64;
     let section_table = optional + optional_size;
     let mut sections = Vec::new();
     for index in 0..section_count {
@@ -940,7 +972,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 return Err(KernelError::new(alloc::format!("mapeamento VA quebrado: entry traduz p/ {probe:#x} (esperado {expected:#x})")));
             }
         }
-        // Relocação (IMAGE_BASE_RELOCATION): DIR64, HIGHLOW e HIGH.
+        // Relocação (IMAGE_BASE_RELOCATION): DIR64, HIGHLOW (a das imagens
+        // x86), LOW e HIGH.
         let delta = relocation_delta as u64;
         if !options.skip_relocations && relocation_delta != 0 && reloc_rva != 0 {
             let mut count = 0u32;
@@ -958,8 +991,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                     let target = page_rva + (entry & 0xFFF) as u64;
                     let width = match entry_type {
                         10 => 8,
-                        2 => 4,
-                        1 => 2,
+                        3 => 4,
+                        1 | 2 => 2,
                         _ => 0,
                     };
                     if target + width > size_of_image {
@@ -970,8 +1003,12 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                             mapping.write64(target, mapping.read64(target).wrapping_add(delta));
                             count += 1;
                         }
-                        2 => {
+                        3 => {
                             mapping.write32(target, mapping.read32(target).wrapping_add(delta as u32));
+                            count += 1;
+                        }
+                        2 => {
+                            mapping.write16(target, mapping.read16(target).wrapping_add(delta as u16));
                             count += 1;
                         }
                         1 => {
@@ -1000,8 +1037,8 @@ fn load_prepared(source: Arc<dyn ImageSource>, options: &LoadOptions, code_integ
                 seed_low ^= 0x10F3;
             }
             let mut cookie = 0u64;
-            let load_config_rva = metadata.read_u32(optional + 192)? as u64;
-            let load_config_size = metadata.read_u32(optional + 196)? as u64;
+            let load_config_rva = metadata.read_u32(directories + 80)? as u64;
+            let load_config_size = metadata.read_u32(directories + 84)? as u64;
             if load_config_rva != 0 && load_config_size >= 0x60 && load_config_rva + 0x60 <= size_of_image {
                 cookie = mapping.read64(load_config_rva + 0x58);
                 if cookie < image_base || cookie + 8 > image_base + size_of_image {

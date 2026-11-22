@@ -77,7 +77,7 @@ use crate::ntos::ps::user::memory::{self, Space};
 use crate::ntos::ps::user::process_state;
 use crate::ntos::ps::user::state::{self, RegionKind};
 use crate::ntos::ps::user::threads::{self, UserThread};
-use crate::ntos::ps::{cid, process_context};
+use crate::ntos::ps::{cid, process_context, wow64};
 use crate::ntos::rtl::image::pe_image_information::INFORMATION_SIZE;
 use crate::ntos::rtl::resource::find as resource_find;
 use crate::rtl::KernelError;
@@ -241,6 +241,11 @@ pub struct CreatedProcess {
     pub teb: u64,
     /// O bloco de RTL_USER_PROCESS_PARAMETERS (PEB.ProcessParameters).
     pub parameters: u64,
+    /// Num processo WoW64 x86, a PEB de 32 bits e o bloco de parâmetros de
+    /// 32 bits (o PebAddressWow64 e o UserProcessParametersWow64 do
+    /// PsCreateSuccess); 0 num processo nativo.
+    pub peb32: u64,
+    pub parameters32: u64,
     /// O rsp inicial da primeira thread (topo da pilha - 8).
     pub stack_top: u64,
     pub image_base: u64,
@@ -719,11 +724,17 @@ fn create_main_thread(process_pointer: u64, thread_id: u64) -> Result<u64, Kerne
 /// As notificações de carga das imagens iniciais, no processo novo (o
 /// corrente, anexado) e com o PID dele: o executável, com o FILE_OBJECT da
 /// seção de imagem, e a ntdll.
-fn notify_initial_images(process_pointer: u64, process_id: u64, image: Image, source: &Arc<dyn FileSource>, ntdll: &Module) -> Result<(), KernelError> {
+fn notify_initial_images(process_pointer: u64, process_id: u64, image: Image, source: &Arc<dyn FileSource>, ntdll: &Module, ntdll32: Option<&wow64::system_dll::Wow64Ntdll>) -> Result<(), KernelError> {
     let file_object = process::image_section(process_pointer).and_then(section_objects::state).map_or(0, |state| state.image_file_object);
     image_notify::notify(image, &NotifyOptions { name: Some(String::from(source.name())), file_object, source: Some(source.clone()), process_id: Some(process_id), ..NotifyOptions::default() })?;
     let name = ntdll.notification_source.as_ref().map_or_else(|| ntdll.full_name.clone(), |source| String::from(source.name()));
-    image_notify::notify(Image { image_base: ntdll.image_base, size_of_image: ntdll.size_of_image }, &NotifyOptions { name: Some(name), source: ntdll.notification_source.clone(), process_id: Some(process_id), ..NotifyOptions::default() })
+    image_notify::notify(Image { image_base: ntdll.image_base, size_of_image: ntdll.size_of_image }, &NotifyOptions { name: Some(name), source: ntdll.notification_source.clone(), process_id: Some(process_id), ..NotifyOptions::default() })?;
+    // A ntdll de 32 bits de um processo WoW64 (a segunda DLL de sistema que o
+    // PsMapSystemDlls mapeia nele).
+    match ntdll32 {
+        Some(ntdll32) => wow64::system_dll::notify_loaded(ntdll32, process_id),
+        None => Ok(()),
+    }
 }
 
 /// O que a montagem anexada ao processo novo produz.
@@ -731,6 +742,8 @@ struct Built {
     thread_id: u64,
     peb: u64,
     parameters: u64,
+    peb32: u64,
+    parameters32: u64,
     teb: u64,
     stack_top: u64,
     context: u64,
@@ -779,6 +792,17 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         return Err(CreateFailure::ExeFormat(KernelError::with_status(format!("caracteristicas {prohibited:#x} proibidas pelo pedido"), STATUS_INVALID_IMAGE_FORMAT), layout.dll_characteristics));
     }
     let (preferred_base, size_of_image) = (layout.preferred_base, layout.size_of_image);
+    // Uma imagem x86 vira processo WoW64 só com a máquina suportada (o
+    // PsWow64IsMachineSupported do PspAllocateProcess; sem ela,
+    // PsCreateFailMachineMismatch).
+    let ntdll32 = if layout.machine == wow64::MACHINE_I386 {
+        if !wow64::process::machine_supported(layout.machine) {
+            return Err(CreateFailure::ExeFormat(KernelError::with_status("imagem x86 sem o WoW64 x86", STATUS_INVALID_IMAGE_FORMAT), layout.dll_characteristics));
+        }
+        wow64::system_dll::ntdll()
+    } else {
+        None
+    };
     let (ntdll, start, initialize) = system_dll().map_err(CreateFailure::Other)?;
     let parameters = &request.parameters;
     let executable = Executable { source: source.clone(), image_size: size_of_image, image_information: None, command_line: Some(parameters.command_line.clone()) };
@@ -805,6 +829,13 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         exit_process(process_pointer, status);
         CreateFailure::Terminated(status)
     };
+    // O EWOW64PROCESS de uma imagem x86 e o MiComputeProcessUserVa do
+    // MmInitializeProcessAddressSpace (o limite de VA do processo), antes de
+    // qualquer VA ser escolhida nele.
+    if ntdll32.is_some() {
+        wow64::process::allocate(process_pointer).map_err(fail)?;
+    }
+    crate::ntos::mm::process_address_space::compute_user_va(process_pointer, layout.characteristics, ntdll32.is_some());
     // ObInitProcess: a herança de handles do pai, antes de o processo novo
     // ter qualquer thread.
     if let Some(parent) = request.inherit_handles_from {
@@ -868,11 +899,27 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             // A pilha pelo RtlCreateUserStack do PspSetupUserStack, com o
             // MaximumStackSize e o CommittedStackSize da imagem
             // (SECTION_IMAGE_INFORMATION +0x10 e +0x18).
+            // Num processo WoW64 (o PspAllocateThread): a ntdll de 32 bits
+            // (o PsMapSystemDlls), a pilha nativa com os tamanhos fixos da
+            // camada WoW64 e a área de CPU no topo dela, e a pilha de 32 bits
+            // com os tamanhos do cabeçalho PE32.
+            if let Some(ntdll32) = &ntdll32 {
+                wow64::system_dll::map_into_current_process(ntdll32)?;
+            }
             let stack_size = |offset: usize| u64::from_le_bytes(image_information[offset..offset + 8].try_into().unwrap_or([0; 8]));
-            let stack = memory::create_user_stack(stack_size(0x18), stack_size(0x10), 0, false).map_err(|status| KernelError::with_status("pilha da primeira thread", status))?;
-            let (stack_base, stack_limit, deallocation_stack) = (stack.base, stack.limit, stack.allocation_base);
+            let (commit, reserve) = if ntdll32.is_some() { (wow64::thread::NATIVE_STACK_COMMIT, wow64::thread::NATIVE_STACK_RESERVE) } else { (stack_size(0x18), stack_size(0x10)) };
+            let stack = memory::create_user_stack(commit, reserve, 0, false).map_err(|status| KernelError::with_status("pilha da primeira thread", status))?;
+            let (mut stack_base, stack_limit, deallocation_stack) = (stack.base, stack.limit, stack.allocation_base);
+            let stack32 = match ntdll32 {
+                Some(_) => {
+                    stack_base = wow64::thread::setup_cpu_area(stack_base);
+                    Some(wow64::thread::create_user_stack(0, 0, 0, false).map_err(|status| KernelError::with_status("pilha de 32 bits da primeira thread", status))?)
+                }
+                None => None,
+            };
             let stack_top = stack_base - 8;
             let peb = peb_teb::create_peb(process_pointer, image_base)?;
+            let peb32 = if ntdll32.is_some() { peb_teb::create_wow64_peb(process_pointer, peb)? } else { 0 };
             loader::create_kernel_ldr()?;
             // O PspLocateInPEManifest do PspSetupUserProcessAddressSpace,
             // antes da cópia dos parâmetros: o manifesto achado liga
@@ -886,10 +933,22 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
             fixup_console_handle(block, creator, process_pointer, parameters.console_handle, &image_information);
             // SAFETY: a PEB recém-criada no processo corrente.
             unsafe { Peb::at(peb) }.process_parameters.set(block);
-            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) })?;
+            // O PspWow64SetupUserProcessAddressSpace: os parâmetros de 32 bits.
+            let parameters32 = if peb32 != 0 { wow64::process::thunk_process_parameters(peb32, block)? } else { 0 };
+            let wow64_teb = stack32.as_ref().map(|stack32| peb_teb::Wow64Teb { peb32, stack_base: stack32.base, stack_limit: stack32.limit, deallocation_stack: stack32.allocation_base });
+            let teb = peb_teb::create_teb(&TebDescription { process_id, thread_id, peb, stack_base, stack_limit, deallocation_stack, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer), wow64: wow64_teb })?;
+            // O contexto inicial do PspCreateUserContext: RtlUserThreadStart
+            // nativo com a entrada e a PEB (a de 32 bits num processo WoW64,
+            // que o PspWow64InitThread passa ao EBX do contexto x86).
+            let argument = if peb32 != 0 { peb32 } else { peb };
             let context = memory::map_user_region(threads::CONTEXT_SIZE)?;
-            threads::initialize_context(context, start, stack_top, entry_point, peb);
-            Ok(Built { thread_id, peb, parameters: block, teb, stack_top, context, entry_point, image_base, size_of_image, image_information, manifest, parameter_flags })
+            threads::initialize_context(context, start, stack_top, entry_point, argument);
+            if let (Some(ntdll32), Some(stack32)) = (&ntdll32, &stack32) {
+                let initial = wow64::thread::InitialThread { teb, cpu_area: stack_base, native_start: start, start_routine: entry_point, argument, stack_base32: stack32.base };
+                wow64::thread::init_thread(&initial, ntdll32, wow64::thread::stack_randomization(process_pointer))?;
+                wow64::system_dll::prepare_init_blocks(ntdll32)?;
+            }
+            Ok(Built { thread_id, peb, parameters: block, peb32, parameters32, teb, stack_top, context, entry_point, image_base, size_of_image, image_information, manifest, parameter_flags })
         })
         .and_then(|built| built)
         .inspect_err(|_| cid::release(thread_id, 0))
@@ -919,7 +978,7 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
     // processo novo.
     process::notify_thread_created(thread_pointer).map_err(fail)?;
     let image = Image { image_base: built.image_base, size_of_image: built.size_of_image };
-    process_context::with_process(process_pointer, || notify_initial_images(process_pointer, process_id, image, &source, &ntdll)).and_then(|notified| notified).map_err(fail)?;
+    process_context::with_process(process_pointer, || notify_initial_images(process_pointer, process_id, image, &source, &ntdll, ntdll32.as_deref())).and_then(|notified| notified).map_err(fail)?;
     // PspInsertProcess: o processo está inserido (EPROCESS.Flags.ProcessInserted).
     // SAFETY: EPROCESS recém-criado, retido até o término.
     unsafe { Eprocess::at(process_pointer) }.flags.atomic().fetch_or(Eprocess::PROCESS_INSERTED_MASK, core::sync::atomic::Ordering::SeqCst);
@@ -935,6 +994,8 @@ pub fn create_user_process(request: &CreateProcessRequest<'_>) -> Result<Created
         peb: built.peb,
         teb: built.teb,
         parameters: built.parameters,
+        peb32: built.peb32,
+        parameters32: built.parameters32,
         stack_top: built.stack_top,
         image_base: built.image_base,
         entry_point: built.entry_point,

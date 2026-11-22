@@ -82,6 +82,10 @@ pub const TPM: &str = "TPM";
 /// O teste do processo de console de ponta a ponta no boot comum: o
 /// cmd.exe real com um console sem janela (`test/console_process.rs`).
 pub const CONSOLE_PROCESS: &str = "CONSOLEPROCESS";
+/// O volume leva a camada WoW64 e os programas x86 de SysWOW64; com
+/// `CONSOLEPROCESS`, o cmd.exe do console é o de 32 bits
+/// (`test/console_process.rs`).
+pub const WOW64: &str = "WOW64";
 /// Toda linha `FALHOU` dos serviços de modo usuário vai para a serial; sem
 /// a opção, cada (pid, serviço, status, chamador) sai nas quatro primeiras
 /// vezes e depois uma a cada 256, com a contagem.

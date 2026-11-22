@@ -80,7 +80,7 @@ use crate::hal::amd64::context_switch::{EXIT_BLOCKED, EXIT_THREAD_EXITED};
 use crate::ntos::ke::user_callback::CalloutStacks;
 use crate::ntos::ke::{apc, clock, context_switch, dispatcher, irql, smp, thread_alert, thread_dispatch, thread_lock, thread_priority};
 use crate::ntos::ob::objects::completion as completion_objects;
-use crate::ntos::ps::{alert_thread, cid, dispatch_perf, process, query_thread, set_thread_information};
+use crate::ntos::ps::{alert_thread, cid, dispatch_perf, process, query_thread, set_thread_information, wow64};
 use crate::ntos::se::token::thread as thread_tokens;
 use crate::rtl::{sync, KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -2906,11 +2906,16 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         let exports = state.ntdll_exports.as_ref().map(|exports| (exports.get("RtlUserThreadStart").copied().unwrap_or(0), exports.get("LdrInitializeThunk").copied().unwrap_or(0)));
         (exports.unwrap_or((0, 0)), state.ntdll_image_base)
     });
+    // Num processo WoW64 x86 (o PspAllocateThread): a pilha nativa tem os
+    // tamanhos fixos da camada WoW64, e os pedidos vão para a de 32 bits.
+    let ntdll32 = if wow64::is_x86_process(process::get_current_process()) { wow64::system_dll::ntdll() } else { None };
     // Um tamanho zero sai da imagem (o SizeOfStackCommit e o
     // SizeOfStackReserve dos cabeçalhos do ImageBaseAddress da PEB, como no
     // RtlCreateUserStack): a PEB e os cabeçalhos estão em memória de
     // usuário, então cada passo é sondado.
-    let (commit, reserve) = if request.commit != 0 && request.reserve != 0 {
+    let (commit, reserve) = if ntdll32.is_some() {
+        (wow64::thread::NATIVE_STACK_COMMIT, wow64::thread::NATIVE_STACK_RESERVE)
+    } else if request.commit != 0 && request.reserve != 0 {
         (request.commit, request.reserve)
     } else {
         let image = (|| -> Result<(u64, u64), KernelError> {
@@ -2934,16 +2939,30 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             Err(error) => return Err(error.status),
         }
     };
-    if commit.max(reserve) > 0x7FFF_FFFF {
+    if commit.max(reserve).max(request.commit).max(request.reserve) > 0x7FFF_FFFF {
         return Err(0xC000_000D);
     }
     let mut regions: Vec<Region> = Vec::new();
     let mut context = 0u64;
     let mut thread_pointer = 0u64;
     let result = (|| -> Result<Arc<UserThread>, u32> {
-        let stack = memory::create_user_stack(commit, reserve, if request.zero_bits != 0 { (1u64 << (64 - request.zero_bits)) - 0x1000 } else { 0 }, true)?;
+        let highest = if request.zero_bits != 0 { (1u64 << (64 - request.zero_bits)) - 0x1000 } else { 0 };
+        let stack = memory::create_user_stack(commit, reserve, highest, true)?;
         regions.push(stack.region.clone());
-        let (teb, region) = allocate_private(0x2000, 0)?;
+        // WoW64: a área de CPU no topo da pilha nativa e a pilha de 32 bits
+        // (o PspWow64SetupCpuArea e o PspWow64SetupUserStack).
+        let mut stack_base = stack.base;
+        let stack32 = match ntdll32 {
+            Some(_) => {
+                stack_base = wow64::thread::setup_cpu_area(stack.base);
+                let stack32 = wow64::thread::create_user_stack(request.commit, request.reserve, highest, true)?;
+                regions.push(stack32.region.clone());
+                Some(stack32)
+            }
+            None => None,
+        };
+        let wow64_teb = stack32.as_ref().map(|stack32| peb_teb::Wow64Teb { peb32: wow64::peb32(process::get_current_process()), stack_base: stack32.base, stack_limit: stack32.limit, deallocation_stack: stack32.allocation_base });
+        let (teb, region) = allocate_private(if wow64_teb.is_some() { peb_teb::WOW64_TEB_REGION } else { 0x2000 }, 0)?;
         regions.push(region);
         // O CONTEXT de partida (RtlUserThreadStart) fica na pilha de usuário,
         // logo abaixo do RSP inicial, como o PspInitializeThunkContext do
@@ -2955,7 +2974,8 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
         // 0x28 abaixo. A escrita dá à página do topo da pilha o frame (zero
         // sob demanda), como a sonda de escrita do 19041 sobre a mesma faixa.
         let length = crate::ntos::rtl::extended_context::extended_context_length2(THUNK_CONTEXT_FLAGS, 0).map_err(|status| if status & 0x8000_0000 != 0 { status } else { 0xC000_000D })? as u64;
-        let startup = (stack.base - 8 - length) & !0xF;
+        // Numa thread WoW64, abaixo da área de CPU (o StackBase novo).
+        let startup = (stack_base - 8 - length) & !0xF;
         context = guest::alloc_bytes(CONTEXT_SIZE);
         if context == 0 {
             return Err(0xC000_0017);
@@ -2980,19 +3000,31 @@ pub fn create_user_thread(request: &CreateRequest) -> Result<Arc<UserThread>, u3
             thread.hidden = request.flags & 4 != 0;
         });
         // O MmCreateTeb sobre a TEB recém-comprometida.
-        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base: stack.base, stack_limit: stack.limit, deallocation_stack: stack.allocation_base, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer) });
+        peb_teb::initialize_teb(teb, &peb_teb::TebDescription { process_id, thread_id: id, peb, stack_base, stack_limit: stack.limit, deallocation_stack: stack.allocation_base, current_locale: crate::ntos::ps::locale::thread_locale_of(process_pointer), wow64: wow64_teb });
         // SAFETY: TEB recém-comprometida; a thread ainda não roda.
         let block = unsafe { Teb::at(teb) };
-        // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit.
-        block.same_teb_flags.set((if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 }));
-        initialize_context(startup, exports.0, stack.base - 8, request.start, 0);
+        // SameTebFlags: SkipThreadAttach, LoaderWorker e SkipLoaderInit (o
+        // PspAllocateThread os grava também na TEB de 32 bits).
+        let same_teb_flags = (if request.flags & 2 != 0 { 8 } else { 0 }) | (if request.flags & 0x10 != 0 { 0x2000 } else { 0 }) | (if request.flags & 0x20 != 0 { 0x4000 } else { 0 });
+        block.same_teb_flags.set(same_teb_flags);
+        if wow64_teb.is_some() {
+            // SAFETY: a TEB de 32 bits, na terceira página da mesma região.
+            unsafe { crate::ntos::inc::types::Teb32::at(teb + wow64::TEB32_OFFSET) }.same_teb_flags.set(same_teb_flags);
+        }
+        initialize_context(startup, exports.0, stack_base - 8, request.start, 0);
         // Os flags do PspInitializeThunkContext e o CONTEXT_EX depois do
         // CONTEXT (os pedaços All e Legacy, sem XSTATE).
         crate::ntos::rtl::extended_context::initialize_extended_context2(startup, THUNK_CONTEXT_FLAGS, 0).map_err(|status| if status & 0x8000_0000 != 0 { status } else { 0xC000_000D })?;
         // O argumento é um ULONG_PTR opaco: preserva os 64 bits.
+        let argument = request.argument_words[0] as u64 | (request.argument_words[1] as u64) << 32;
         // SAFETY: o CONTEXT de partida acabou de ser montado.
-        unsafe { Context::at(startup) }.rdx.set(request.argument_words[0] as u64 | (request.argument_words[1] as u64) << 32);
+        unsafe { Context::at(startup) }.rdx.set(argument);
         initialize_context(context, exports.1, startup - 0x28, startup, ntdll_base);
+        // O PspWow64InitThread: a área de CPU e o contexto x86 inicial.
+        if let (Some(ntdll32), Some(stack32)) = (&ntdll32, &stack32) {
+            let initial = wow64::thread::InitialThread { teb, cpu_area: stack_base, native_start: exports.0, start_routine: request.start, argument, stack_base32: stack32.base };
+            wow64::thread::init_thread(&initial, ntdll32, wow64::thread::stack_randomization(process_pointer)).map_err(|error| if error.status != 0 { error.status } else { 0xC000_0017 })?;
+        }
         process::add_thread(process_pointer);
         process::describe_thread(thread_pointer, None, false);
         process::set_thread_start(thread_pointer, request.start);

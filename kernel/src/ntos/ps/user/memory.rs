@@ -538,6 +538,13 @@ pub fn occupied(space: Space) -> Vec<section_address::Region> {
     }
     occupied.extend(sections::views().iter().filter(|view| view.root == root).map(|view| section_address::Region { base: view.base, size: view.size }));
     occupied.extend(section_views::all().iter().filter(|view| view.root() == root).map(|view| section_address::Region { base: view.base(), size: view.size() }));
+    // Acima do HighestUserAddress do processo (os 2 GB de uma imagem sem
+    // LARGE_ADDRESS_AWARE, os 4 GB de um WoW64 com ela) nada é escolhido,
+    // como no MiFindEmptyAddressRange e no MiSelectUserAddress.
+    let top = crate::ntos::mm::process_address_space::allocation_top(space.process());
+    if top < USER_ALLOCATION_TOP {
+        occupied.push(section_address::Region { base: top, size: USER_ALLOCATION_TOP - top });
+    }
     occupied.retain(|region| region.base < USER_ADDRESS_LIMIT);
     occupied
 }
@@ -934,6 +941,22 @@ const STACK_GUARD_SIZE: u64 = 3 * PAGE;
 ///   (`mm/guard_page`, o MiCheckForUserStackOverflow).
 /// - Qualquer falha libera a reserva (MEM_RELEASE) e devolve o status.
 pub fn create_user_stack(commit: u64, reserve: u64, highest: u64, pageable: bool) -> Result<UserStack, u32> {
+    build_user_stack(commit, reserve, highest, pageable, STACK_GUARD_SIZE)
+}
+
+/// As páginas de guarda da pilha de 32 bits de uma thread WoW64 (2 páginas).
+const WOW64_STACK_GUARD_SIZE: u64 = 2 * PAGE;
+
+/// A pilha de 32 bits de uma thread WoW64 no processo corrente, como o
+/// RtlpWow64CreateUserStack do ntoskrnl 19041 (rva 0x692b5c) a monta: os
+/// mesmos arredondamentos, o PEB.MinimumStackCommit e o commit no topo de
+/// [`create_user_stack`], com duas páginas de guarda; a reserva fica abaixo
+/// do HighestUserAddress do processo (a escolha de VA não passa dele).
+pub fn create_wow64_user_stack(commit: u64, reserve: u64, highest: u64, pageable: bool) -> Result<UserStack, u32> {
+    build_user_stack(commit, reserve, highest, pageable, WOW64_STACK_GUARD_SIZE)
+}
+
+fn build_user_stack(commit: u64, reserve: u64, highest: u64, pageable: bool, guard: u64) -> Result<UserStack, u32> {
     const MEGABYTE: u64 = 0x10_0000;
     let round = |value: u64, unit: u64| value.checked_add(unit - 1).map(|value| value & !(unit - 1)).ok_or(STATUS_INVALID_PARAMETER);
     let commit = if commit == 0 { 0x4000 } else { commit };
@@ -968,8 +991,8 @@ pub fn create_user_stack(commit: u64, reserve: u64, highest: u64, pageable: bool
         let base = allocation_base + reserve;
         let limit = base - commit;
         let mut status = call(limit, commit, MEM_COMMIT, 4);
-        if status == 0 && reserve - commit >= STACK_GUARD_SIZE {
-            status = call(limit - STACK_GUARD_SIZE, STACK_GUARD_SIZE, MEM_COMMIT, 4 | PAGE_GUARD);
+        if status == 0 && reserve - commit >= guard {
+            status = call(limit - guard, guard, MEM_COMMIT, 4 | PAGE_GUARD);
         }
         match region {
             Some(region) if status == 0 => Ok(UserStack { allocation_base, limit, base, region }),

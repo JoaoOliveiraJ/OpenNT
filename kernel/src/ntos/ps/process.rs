@@ -857,6 +857,8 @@ fn collect_process(process: u64) -> Result<(), KernelError> {
     // Nenhuma CPU fica registrada no EPROCESS que volta ao pool (a troca
     // tiraria o bit de ActiveProcessors de memória livre).
     context_switch::forget_process(process);
+    // O EWOW64PROCESS de um processo WoW64 volta ao pool com ele.
+    crate::ntos::ps::wow64::process::delete(process);
     guest::free_bytes(process);
     Ok(())
 }
