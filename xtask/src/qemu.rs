@@ -649,6 +649,12 @@ pub enum InputAction {
     /// aperta Enter e confere a saída ([`screen_check::command_output`], o
     /// `COMMAND_OUTPUT_OK`).
     Command(String),
+    /// Espera o disco de dados do convidado parar de gravar
+    /// ([`wait_disk_quiet`]), aperta Win+R, espera a caixa Executar, digita o
+    /// comando (o shutdown.exe) e o Enter. Não confere janela: o teste espera
+    /// o desligamento (o gerador do primeiro logon feito,
+    /// `crate::first_logon`).
+    Shutdown(String),
 }
 
 /// `--send=MARCADOR[+MS]:TECLAS`, `--dismiss=MARCADOR[+MS]:TECLAS` e
@@ -759,6 +765,12 @@ impl InputSend {
             return Err(format!("--command={text}: o comando e de letras, algarismos e espacos"));
         }
         Ok(InputSend { after, delay, action: InputAction::Command(command.to_string()) })
+    }
+
+    /// O desligamento pela caixa Executar ([`InputAction::Shutdown`]) logo
+    /// depois de `after`.
+    pub fn shutdown(after: &str, command: &str) -> InputSend {
+        InputSend { after: after.to_string(), delay: Duration::ZERO, action: InputAction::Shutdown(command.to_string()) }
     }
 
     /// `--mouse=MARCADOR[+MS]:DX,DY`.
@@ -1869,6 +1881,106 @@ fn run_command(monitor: &mut TcpStream, ppm: &Path, command: &str, sent: &mut Op
     Ok(format!("caixa Executar ({dialog}); {command}: {program}"))
 }
 
+/// O desligamento do gerador do primeiro logon feito: como o `--run` até o
+/// comando digitado parado na caixa Executar, e o Enter. O shutdown.exe não
+/// abre janela; o teste segue pelo desligamento.
+fn shutdown_command(monitor: &mut TcpStream, ppm: &Path, command: &str, sent: &mut Option<Instant>) -> Result<String, String> {
+    let before = still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    *sent = Some(Instant::now());
+    type_keys(monitor, "{meta_l-r}")?;
+    let dialog = new_window(monitor, ppm, &before, "com o Win+R (a caixa Executar)")?;
+    type_keys(monitor, command)?;
+    still_screen(monitor, ppm, WINDOW_WAIT, screen_check::drawn_screen)?;
+    type_keys(monitor, "{ret}")?;
+    Ok(format!("caixa Executar ({dialog})"))
+}
+
+/// O disco de dados no `info blockstats` do HMP: o `-drive if=ide,index=1`
+/// (o canal primário, unidade 1), que o QEMU chama `ide0-hd1`.
+const DATA_DRIVE: &str = "ide0-hd1";
+/// A espera do disco parado: no mínimo [`QUIET_MIN`] desde o começo, até
+/// [`QUIET_FOR`] seguidos sem escrita, lendo a cada [`QUIET_POLL`]; depois
+/// de [`QUIET_MAX`] ela segue mesmo com o disco gravando.
+const QUIET_MIN: Duration = Duration::from_secs(30);
+const QUIET_FOR: Duration = Duration::from_secs(20);
+const QUIET_POLL: Duration = Duration::from_secs(5);
+const QUIET_MAX: Duration = Duration::from_secs(300);
+
+/// Uma conexão do monitor HMP que lê as respostas (o [`connect_monitor`]
+/// as descarta), pronta para um comando: o banner e o primeiro prompt já
+/// lidos.
+fn hmp_session(port: u16, deadline: Instant) -> Result<TcpStream, String> {
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() > deadline => return Err(format!("monitor HMP: {error}")),
+            Err(_) => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(10))).map_err(|error| format!("monitor HMP: {error}"))?;
+    hmp_until_prompt(&mut stream)?;
+    Ok(stream)
+}
+
+/// Lê o monitor até o prompt `(qemu) ` e devolve o texto antes dele.
+fn hmp_until_prompt(stream: &mut TcpStream) -> Result<String, String> {
+    let mut text = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = stream.read(&mut buffer).map_err(|error| format!("monitor HMP: {error}"))?;
+        if count == 0 {
+            return Err("monitor HMP: conexao fechada".into());
+        }
+        text.extend_from_slice(&buffer[..count]);
+        if text.ends_with(b"(qemu) ") {
+            text.truncate(text.len() - b"(qemu) ".len());
+            return Ok(String::from_utf8_lossy(&text).into_owned());
+        }
+    }
+}
+
+/// As escritas que o disco de dados recebeu desde a subida do QEMU (o
+/// `wr_operations` do `info blockstats`).
+fn data_disk_writes(stream: &mut TcpStream) -> Result<u64, String> {
+    stream.write_all(b"info blockstats\n").map_err(|error| format!("monitor HMP: {error}"))?;
+    let text = hmp_until_prompt(stream)?;
+    blockstats_writes(&text, DATA_DRIVE).ok_or_else(|| format!("o info blockstats nao tem o {DATA_DRIVE}: {:?}", text.trim()))
+}
+
+/// As operações de escrita do disco `drive` na saída do `info blockstats`
+/// do QEMU 11: uma tabela por disco, depois da linha `nome: idle_time_ns=`,
+/// com a linha `Write:` (bytes, operações, tempo, fundidas).
+fn blockstats_writes(text: &str, drive: &str) -> Option<u64> {
+    let mut lines = text.lines().skip_while(|line| !line.starts_with(&format!("{drive}:")));
+    lines.next()?;
+    let write = lines.take_while(|line| !line.trim().is_empty()).find(|line| line.starts_with("Write:"))?;
+    write.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Espera o disco de dados do convidado parar de gravar: [`QUIET_FOR`]
+/// seguidos sem escrita, depois de pelo menos [`QUIET_MIN`], por até
+/// [`QUIET_MAX`]. Devolve quantas escritas houve e quanto durou.
+fn wait_disk_quiet(port: u16, deadline: Instant) -> Result<String, String> {
+    let mut monitor = hmp_session(port, deadline)?;
+    let started = Instant::now();
+    let first = data_disk_writes(&mut monitor)?;
+    let (mut last, mut changed) = (first, started);
+    loop {
+        thread::sleep(QUIET_POLL);
+        let writes = data_disk_writes(&mut monitor)?;
+        if writes != last {
+            (last, changed) = (writes, Instant::now());
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        if started.elapsed() >= QUIET_MIN && changed.elapsed() >= QUIET_FOR {
+            return Ok(format!("{} escritas em {elapsed:.0} s, nenhuma nos ultimos {} s", last - first, QUIET_FOR.as_secs()));
+        }
+        if started.elapsed() >= QUIET_MAX {
+            return Ok(format!("{} escritas em {elapsed:.0} s, ainda gravando (a espera acabou)", last - first));
+        }
+    }
+}
+
 /// O `--open`: espera a tela desenhada parada, digita as teclas (a hora vai
 /// para `sent`) e espera a janela nova ([`new_window`]).
 fn open_with_keys(monitor: &mut TcpStream, ppm: &Path, keys: &str, sent: &mut Option<Instant>) -> Result<String, String> {
@@ -2462,6 +2574,21 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         }
                     }
                 }
+                InputAction::Shutdown(command) => {
+                    let quiet = wait_disk_quiet(port, deadline)?;
+                    note(format!("[xtask] disco do convidado parado (aos {:.1} s): {quiet}", launched.elapsed().as_secs_f64()));
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let mut sent = None;
+                    let outcome = with_monitor(&mut |monitor| shutdown_command(monitor, &ppm, command, &mut sent));
+                    let at = sent.map_or(at, |sent| sent.duration_since(launched).as_secs_f64());
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] Win+R e {command} pelo monitor (aos {at:.1} s): {description}")),
+                        Err(missing) => {
+                            note(format!("[xtask] Win+R e {command} pelo monitor (aos {at:.1} s), sem a caixa Executar: {missing}"));
+                            return Err(format!("o desligamento pela caixa Executar nao foi digitado: {missing}"));
+                        }
+                    }
+                }
                 InputAction::Type(text) => {
                     let ppm = log.with_file_name("tela-monitor.ppm");
                     let mut sent = None;
@@ -2706,6 +2833,24 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
 mod tests {
     use super::*;
     use crate::png::Image;
+
+    /// As escritas do disco de dados na tabela do `info blockstats` do QEMU
+    /// 11.1 (a resposta do monitor, com o eco do comando antes).
+    #[test]
+    fn blockstats_writes_of_the_data_disk() {
+        let text = "info blockstats\x1b[K\r\n\
+            ide0-hd0: idle_time_ns=374276685300\r\n                          bytes       operations            total_time_ns     merged\r\n\
+            Read:                  20460032              221                420443200          0\r\n\
+            Write:                        0                0                        0          0\r\n\
+            Flush:                                         0                        0\r\n\r\n\
+            ide0-hd1: idle_time_ns=36504323300\r\n                          bytes       operations            total_time_ns     merged\r\n\
+            Read:                1030619648            35338              16576149700          0\r\n\
+            Write:                 62763520            19908               5592494400          0\r\n\
+            Flush:                                      6443              36810944400\r\n\r\n";
+        assert_eq!(blockstats_writes(text, "ide0-hd1"), Some(19908));
+        assert_eq!(blockstats_writes(text, "ide0-hd0"), Some(0));
+        assert_eq!(blockstats_writes(text, "ide1-cd0"), None);
+    }
 
     /// O QEMU recebe a pasta temporária da execução nas três variáveis, e a
     /// pasta sai inteira no fim, com o que o processo deixou nela (o arquivo

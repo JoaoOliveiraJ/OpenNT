@@ -7,6 +7,7 @@
 //!                        [--build-only|--no-build [--image-dir=DIR]] [--kd=com2 --script=ARQ] [--capture=ARQ.png]
 //!                        [--expect-stop] [--watch-screen] [--capture-every=SEGUNDOS]
 //!                        [--expect-poweroff] [--power-cycles=N] [--allow-reboot] [--manual-crash]
+//!                        [--primeiro-logon-feito | --gerar-primeiro-logon]
 //!                        [--send=MARCADOR[+MS]:TECLAS]... [--dismiss=MARCADOR[+MS]:TECLAS]...
 //!                        [--mouse=MARCADOR[+MS]:DX,DY]...
 //! cargo xtask test-all   [--jobs=N] [--only=ID,...] [--skip=ID,...] [--repeat=N] [--keep] [--cpu-friendly]
@@ -67,6 +68,7 @@ mod build;
 mod crash;
 mod debug;
 mod event_log;
+mod first_logon;
 mod fonts;
 mod heap_census;
 mod hive_image;
@@ -196,6 +198,12 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --capture-every=SEGUNDOS (durante o teste, a tela do QEMU em tela-NNNN.png na
                    --build-dir: a NNNN e a dos NNNN*SEGUNDOS s desde a subida do QEMU, gravada
                    so quando mudou; no fim do teste, passando ou nao, tela-final.png)
+                   --primeiro-logon-feito (com --conta-de-teste e --display=basic: o volume de
+                   dados e o do primeiro logon que o convidado ja fez, do cache em
+                   OPENNT_PRIMEIRO_LOGON ou build/primeiro-logon pelo hash das imagens e da
+                   maquina; se faltar, antes do teste um boot do convidado chega a area de
+                   trabalho, espera o disco parar e desliga pelo shutdown.exe da caixa Executar)
+                   --gerar-primeiro-logon (so gera esse volume, ou o acha no cache, e termina)
                    --expect-poweroff (no fim o QEMU sai sozinho pelo desligamento ACPI)
                    --power-cycles=N (religa ate N vezes o QEMU que o convidado desligou)
                    --allow-reboot (o reinicio do convidado reinicia a maquina)
@@ -278,6 +286,11 @@ struct Arguments {
     time_travel: Option<time_travel::Mode>,
     /// `debug --replay --gdb-port=N`: a porta do gdbstub do QEMU.
     gdb_port: Option<u16>,
+    /// `--primeiro-logon-feito`: o volume de dados é o do primeiro logon
+    /// feito pelo convidado (`first_logon`), gerado antes se faltar.
+    first_logon_done: bool,
+    /// `--gerar-primeiro-logon`: só gera (ou acha no cache) esse volume.
+    make_first_logon: bool,
 }
 
 fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
@@ -356,6 +369,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         allow_reboot: false,
         time_travel: None,
         gdb_port: None,
+        first_logon_done: false,
+        make_first_logon: false,
     };
     for argument in iterator {
         let (name, value) = match argument.split_once('=') {
@@ -454,6 +469,8 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--type" => parsed.inputs.push(qemu::InputSend::type_text(&required()?)?),
             "--command" => parsed.inputs.push(qemu::InputSend::command(&required()?)?),
             "--hold" => parsed.hold_ms = required()?.parse().map_err(|_| "--hold invalido")?,
+            "--primeiro-logon-feito" => parsed.first_logon_done = true,
+            "--gerar-primeiro-logon" => parsed.make_first_logon = true,
             "--build-only" => parsed.build_only = true,
             "--no-build" => parsed.no_build = true,
             "--image-dir" => parsed.image_dir = Some(PathBuf::from(required()?)),
@@ -561,6 +578,15 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
     if parsed.no_client && (parsed.connect.is_some() || parsed.script.is_some()) {
         return Err("--no-client so abre o QEMU (sem --connect nem --script)".into());
     }
+    if parsed.first_logon_done || parsed.make_first_logon {
+        if parsed.command != "test-boot" {
+            return Err("--primeiro-logon-feito e --gerar-primeiro-logon sao opcoes do test-boot".into());
+        }
+        if parsed.first_logon_done && parsed.make_first_logon {
+            return Err("--primeiro-logon-feito e --gerar-primeiro-logon se excluem (o segundo so gera o volume)".into());
+        }
+        first_logon::check(&parsed.build, &parsed.machine)?;
+    }
     Ok(parsed)
 }
 
@@ -629,13 +655,24 @@ fn execute(arguments: Arguments) -> Result<(), String> {
             let log = build_dir.join("serial.log");
             let mut machine = arguments.machine.clone();
             machine.accelerator = qemu::machine_accelerator(&machine)?;
+            // O volume do primeiro logon feito: o do cache, ou um novo, gerado
+            // por um boot do convidado com a máquina deste teste.
+            let first_logon = if arguments.first_logon_done || arguments.make_first_logon {
+                Some(first_logon::ensure(&images, &build_dir, &options, &machine)?)
+            } else {
+                None
+            };
+            if arguments.make_first_logon {
+                return Ok(());
+            }
             if !options.kd.is_empty() && machine.kd_port.is_none() {
                 machine.kd_port = Some(qemu::free_port()?);
             }
             let session = script_session(&arguments, &options, &machine, &images, &log)?;
-            // O volume de dados fica como o build o deixou: cada teste começa
-            // dele, e execuções paralelas dividem o mesmo arquivo.
-            let ntfs = images.join("ntfs.img");
+            // O volume de dados fica como o build (ou o gerador do primeiro
+            // logon) o deixou: cada teste começa dele, e execuções paralelas
+            // dividem o mesmo arquivo.
+            let ntfs = first_logon.unwrap_or_else(|| images.join("ntfs.img"));
             let nvme = qemu::nvme_disk(&images.join("os.img"), &options.storage);
             let disks = qemu::Disks { boot: image, data: ntfs.exists().then_some(ntfs), data_snapshot: true, nvme, nvme_snapshot: true };
             qemu::test_boot(
