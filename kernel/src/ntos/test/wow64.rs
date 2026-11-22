@@ -18,6 +18,8 @@
 //! - o KeGet/SetExecuteOptions de um processo WoW64 e de um nativo;
 //! - o `\KnownDlls32` do kernel só no boot sem o smss (na cadeia do smss os
 //!   diretórios e as seções de KnownDlls são do smss.exe);
+//! - a seção de imagem com SEC_IMAGE | 0x100000 (a KnownDll _wow64cpu do
+//!   smss): a flag BaseBelow4gb do pacote e as vistas abaixo de 4 GB;
 //! - a junção do contexto x86 (`ps::wow64::context`): o
 //!   RtlpWow64SanitizeContextFlags, o RtlpWow64GetContextOnAmd64 e o
 //!   RtlpWow64SetContextOnAmd64 com a thread parada no código de 32 bits e
@@ -42,6 +44,7 @@ pub fn run(assert: Assert) {
     cpu_area(assert);
     execute_options(assert);
     known_dlls(assert);
+    base_below_4gb(assert);
     context_merge(assert);
     x87_frames(assert);
     alpc_layout(assert);
@@ -102,6 +105,20 @@ fn known_dlls(assert: Assert) {
     let provisioned = kernel_known_dll("\\KNOWNDLLS32", "kernel32.dll", false);
     assert(directories == [("\\KnownDlls", "C:\\Windows\\System32"), ("\\KnownDlls32", "C:\\Windows\\SysWOW64")] && native_only.len() == 1, "wow64: sem o smss o kernel cria o \\KnownDlls32 so com o volume do WoW64");
     assert(provisioned.as_ref().is_some_and(|(directory, source)| *directory == "\\KnownDlls32" && source == "\\SystemRoot\\SysWOW64\\kernel32.dll"), "wow64: sem o smss o \\KnownDlls32 sai de SysWOW64");
+}
+
+/// O SEC_IMAGE | 0x100000 do smss para as DLLs de CPU do WoW64: o pacote
+/// leva a flag BaseBelow4gb (o MiInitializeCreateSectionPacket), que a
+/// criação aceita, e a vista da imagem fica abaixo de 4 GB.
+fn base_below_4gb(assert: Assert) {
+    use crate::ntos::mm::section::create::BASE_BELOW_4GB;
+    use crate::ntos::mm::section::image_view::view_upper;
+    use crate::ntos::mm::section::parameters::{decode, Decoded};
+    let decoded = decode(0x0110_0000, 0x10, 0, 4, 0, false);
+    let flagged = matches!(decoded, Decoded::Request(request) if request.flags & BASE_BELOW_4GB != 0 && request.attributes & 0x0100_0000 != 0);
+    let plain = matches!(decode(0x0100_0000, 0x10, 0, 4, 0, false), Decoded::Request(request) if request.flags & BASE_BELOW_4GB == 0);
+    assert(flagged && plain, "wow64: SEC_IMAGE com 0x100000 vira a flag BaseBelow4gb do pacote de criacao");
+    assert(view_upper(0x7FFF_FFFE_FFFF, true) == 0xFFFF_FFFF && view_upper(0x7FFF_FFFE_FFFF, false) == 0x7FFF_FFFE_FFFF && view_upper(0x7FFE_FFFF, true) == 0x7FFE_FFFF, "wow64: a vista de uma imagem BaseBelow4gb fica abaixo de 4 GB");
 }
 
 /// A junção do RtlpWow64GetContextOnAmd64 e do RtlpWow64SetContextOnAmd64 em

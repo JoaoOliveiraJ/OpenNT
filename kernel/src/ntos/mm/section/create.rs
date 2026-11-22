@@ -30,6 +30,14 @@ use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{Acl, ObjectAttributes, SecurityDescriptor, SecurityDescriptorRelative, Sid, UnicodeString};
 
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// A flag 0x200 do pacote de criação (`parameters::decode`), do SEC_IMAGE
+/// com 0x100000: o MiInitializeCreateSectionPacket do 19041 a liga e o
+/// MiCreateImageFileMap a leva ao ImageFlags.BaseBelow4gb da
+/// SECTION_IMAGE_INFORMATION da imagem, que escolhe uma base abaixo de 4 GB.
+/// O smss.exe cria assim as KnownDlls de nome com `_` (as DLLs de CPU do
+/// WoW64, como o _wow64cpu, cujo código roda também no modo de
+/// compatibilidade).
+pub const BASE_BELOW_4GB: u32 = 0x200;
 
 /// Lê um campo de uma estrutura do chamador (OBJECT_ATTRIBUTES, nome,
 /// descritor): em UserMode a leitura é sondada — a página pode sumir depois
@@ -479,7 +487,9 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
         }
         // Imagens protegidas/especiais exigem a política de MM/CI; SEC_BASED
         // exige reserva independente de processo. Nenhuma vira seção comum.
-        if request.flags & 0x370 != 0 || request.attributes & 0x0020_0000 != 0 {
+        // O SEC_IMAGE com 0x100000 (a flag BASE_BELOW_4GB do pacote) é aceito:
+        // é só a escolha da base da imagem.
+        if request.flags & 0x170 != 0 || request.attributes & 0x0020_0000 != 0 {
             return Ok(0xC000_00BB);
         }
         let backing: Option<Arc<dyn SectionFile>> = file.clone().map(|captured| captured as Arc<dyn SectionFile>);
@@ -490,7 +500,13 @@ fn create_common(output: u64, access: u32, object_attributes: u64, size_pointer:
             if let Some(captured) = file.as_ref().filter(|captured| captured.driver_file()) {
                 fsd_file::flush_data_section(captured.pointer());
             }
-            sections::create_image(backing.ok_or_else(|| KernelError::new("image section without file"))?, None, request.page_protect, request.flags & 0x400 == 0)?
+            let created = sections::create_image(backing.ok_or_else(|| KernelError::new("image section without file"))?, None, request.page_protect, request.flags & 0x400 == 0)?;
+            if let Ok(section) = &created {
+                if request.flags & BASE_BELOW_4GB != 0 {
+                    section.set_base_below_4gb();
+                }
+            }
+            created
         } else {
             let (section_size, committed, large) = dimensions.unwrap_or((0, false, false));
             // A seção de dados de um arquivo de file system não lê o arquivo

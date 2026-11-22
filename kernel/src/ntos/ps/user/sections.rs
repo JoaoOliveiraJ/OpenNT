@@ -242,6 +242,9 @@ pub struct Section {
     pub permanent: bool,
     /// A seção do Cache Manager sobre o stream (SharedCacheMap->Section).
     pub cache: bool,
+    /// O ImageFlags.BaseBelow4gb da imagem: as vistas ficam abaixo de 4 GB
+    /// (`mm/section/create.rs`, o SEC_IMAGE com 0x100000).
+    base_below_4gb: AtomicBool,
     pub state: SpinLock<SectionMut>,
 }
 
@@ -254,6 +257,17 @@ pub fn demand_paged(section: &Section) -> bool {
 }
 
 impl Section {
+    /// A imagem é mapeada abaixo de 4 GB (ImageFlags.BaseBelow4gb).
+    pub fn base_below_4gb(&self) -> bool {
+        self.base_below_4gb.load(Ordering::Acquire)
+    }
+
+    /// Liga o ImageFlags.BaseBelow4gb de uma seção de imagem recém-criada,
+    /// antes de qualquer vista.
+    pub fn set_base_below_4gb(&self) {
+        self.base_below_4gb.store(true, Ordering::Release);
+    }
+
     /// O tamanho da seção arredondado à página (o fim das vistas).
     pub fn size(&self) -> u64 {
         self.size.load(Ordering::Acquire)
@@ -1222,6 +1236,7 @@ fn new_section(size: u64, maximum_size: u64, page_protect: u32, attributes: u32,
         large,
         permanent,
         cache,
+        base_below_4gb: AtomicBool::new(false),
         state: SpinLock::new(SectionMut { area, area_released: false, views: Vec::new(), destroyed: false, node: None, release_file: None, partition: None, image_file_object: 0, mapped_base: 0, mapped_size: 0, cache_flags: 0, name, image_segment: None }),
     })
 }

@@ -54,6 +54,12 @@ fn read32(bytes: &[u8], at: usize) -> Option<u32> {
     bytes.get(at..at + 4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
 }
 
+/// O último endereço que uma vista de imagem pode cobrir: o pedido, e abaixo
+/// de 4 GB numa imagem com o ImageFlags.BaseBelow4gb (`create::BASE_BELOW_4GB`).
+pub fn view_upper(requested: u64, below_4gb: bool) -> u64 {
+    if below_4gb { requested.min(0xFFFF_FFFF) } else { requested }
+}
+
 pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: RegionKind) -> Result<Result<Mapped, u32>, KernelError> {
     let Some(file) = section.file.clone() else { return Ok(Err(0xC000_0185)) };
     // O cabeçalho PE dá a base preferida.
@@ -68,7 +74,7 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     let top_down = request.allocation & 0x10_0000 != 0;
     let space = user_memory::Space::of(process);
     let root = space.root();
-    let options = FindOptions { base: request.base, size, upper: Some(request.upper), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, root, ..FindOptions::default() };
+    let options = FindOptions { base: request.base, size, upper: Some(view_upper(request.upper, section.base_below_4gb())), alignment: memory_map::ALLOCATION_GRANULARITY, top_down, root, ..FindOptions::default() };
     let name = file.nt_path().or_else(|| section.name()).unwrap_or_default();
     let source = Arc::new(SectionSource { name: name.clone(), file: file.clone() });
     // A control area da imagem (montada uma vez por arquivo, lendo o
@@ -89,7 +95,7 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
     // primeira faixa livre (STATUS_IMAGE_NOT_AT_BASE).
     let mut found = None;
     let wanted = preferred.wrapping_add(offset);
-    if request.base == 0 && wanted % memory_map::ALLOCATION_GRANULARITY == 0 && memory_map::is_user_range(wanted, size) {
+    if request.base == 0 && wanted % memory_map::ALLOCATION_GRANULARITY == 0 && memory_map::is_user_range(wanted, size) && wanted.saturating_add(size.saturating_sub(1)) <= view_upper(request.upper, section.base_below_4gb()) {
         found = section_address::find(&FindOptions { base: wanted, ..options }, &occupied).ok();
     }
     let base = match found {
