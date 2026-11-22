@@ -1743,6 +1743,10 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attribute
         crate::debug_print!("[alpc] envio com mensagem de 32 bits (ALPC_MSGFLG_WOW64_CALL) fora de um processo WoW64: porta {:#x}", handle);
         return Ok(0xC000_00BB);
     }
+    // Os bits 31 e 30 juntos: a mensagem de um processo x86 já está na forma
+    // nativa (o AlpcpSendMessage do 19041 só lê a forma de 32 bits com o 31
+    // sem o 30) e os dois bits não pedem mais nada.
+    let flags = if flags & 0xC000_0000 == 0xC000_0000 { flags & !0xC000_0000 } else { flags };
     let status = send_receive(handle, flags, input, attributes, rsp)?;
     if status == INVALID {
         let mut detail = alloc::format!("[alpc] invalid send flags=0x{:x}", flags as u32);
