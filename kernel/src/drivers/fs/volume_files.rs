@@ -208,9 +208,77 @@ pub fn normalized_device_name(volume: &Ntfs, device_name: &str) -> String {
     }
 }
 
+/// O volume do kernel guarda os arquivos nos caminhos reais da instalação
+/// (`\Windows\System32\drivers\acpi.sys` em
+/// `/Windows/System32/drivers/acpi.sys`), como o xtask grava o volume do
+/// `--volume-sistema=ntfs.sys` (`windows_binaries::real_layout`), em vez da
+/// raiz achatada dos aliases de instalação. O xtask e o kernel decidem pela
+/// mesma opção; quando o leiaute real virar o padrão dos boots do NTFS do
+/// kernel, é esta decisão que muda.
+pub fn real_layout() -> bool {
+    crate::ntos::init::boot_config::system_volume_ntfs()
+}
+
+/// O `\SystemRoot` já leva ao volume do sistema servido pelo ntfs.sys (o
+/// IopReassignSystemRoot do `--volume-sistema=ntfs.sys`,
+/// `io/boot_partition.rs`): os nomes NT do sistema não traduzem mais para o
+/// volume do kernel, e quem lê arquivos do sistema vai pelo I/O Manager
+/// (`io/file/system_file`).
+static SWITCHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn switch_system_volume() {
+    SWITCHED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub fn system_volume_switched() -> bool {
+    SWITCHED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// O nome NT pelo `\SystemRoot` de um caminho do leiaute real
+/// (`/Windows/System32/ntdll.dll` é `\SystemRoot\System32\ntdll.dll`); `None`
+/// fora de `/Windows`.
+pub fn system_root_name(volume_path: &str) -> Option<String> {
+    let path = volume_path.replace('\\', "/");
+    let rest = path.strip_prefix('/').unwrap_or(&path);
+    let rest = if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case("Windows/") { &rest[8..] } else { return None };
+    Some(alloc::format!("\\SystemRoot\\{}", rest.replace('/', "\\")))
+}
+
+/// Os bytes de um arquivo do sistema pelo caminho do volume do kernel: antes
+/// da troca do `\SystemRoot`, pelo NTFS do kernel; depois dela, pelo I/O
+/// Manager (o ntfs.sys), no mesmo arquivo da instalação. `None` = ausente.
+pub fn read_system_file(volume_path: &str) -> Result<Option<Vec<u8>>, KernelError> {
+    if system_volume_switched() {
+        let Some(name) = system_root_name(volume_path) else { return Ok(None) };
+        return match crate::ntos::io::file::system_file::read_file(&name) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(0xC000_0034) | Err(0xC000_003A) => Ok(None),
+            Err(status) => Err(KernelError::with_status(alloc::format!("{name}: leitura pelo I/O Manager"), status)),
+        };
+    }
+    let Some(volume) = volume() else { return Ok(None) };
+    volume.read_bytes(volume_path)
+}
+
+/// O caminho no volume do kernel de um arquivo de `\Windows\System32`
+/// (`drivers/acpi.sys`, `l_intl.nls`): no leiaute real ([`real_layout`]),
+/// embaixo de `/Windows/System32`; na raiz achatada, o nome na raiz (os
+/// programas, as DLLs, os drivers e as tabelas NLS de System32 ficam lá).
+pub fn system32_path(relative: &str) -> String {
+    let relative = relative.replace('\\', "/");
+    let relative = relative.trim_start_matches('/');
+    if real_layout() {
+        alloc::format!("/Windows/System32/{relative}")
+    } else {
+        alloc::format!("/{}", relative.rsplit('/').next().unwrap_or(relative))
+    }
+}
+
 /// Normaliza separadores e prefixos NT/DOS, aceita as unidades C e D e
-/// preserva subdiretórios; só os aliases de instalação apontam para a raiz
-/// do disco de boot. `.`/`..` e caracteres proibidos são recusados.
+/// preserva subdiretórios. Na raiz achatada, só os aliases de instalação
+/// apontam para a raiz do disco de boot; no leiaute real ([`real_layout`]),
+/// o caminho é o da instalação (o `\SystemRoot` é o `\Windows`). `.`/`..` e
+/// caracteres proibidos são recusados.
 pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
     let mut path = nt_path.replace('/', "\\");
     for prefix in ["\\??\\", "\\\\?\\", "\\?\\"] {
@@ -221,12 +289,25 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
     }
     let bytes = path.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' {
-        if !matches!(bytes[0].to_ascii_lowercase(), b'c' | b'd') {
+        if !matches!(bytes[0].to_ascii_lowercase(), b'c' | b'd') || (real_layout() && !kernel_volume_letter(bytes[0])) {
             return None;
         }
         path = String::from(&path[2..]);
     }
     let mut path = String::from(path.trim_matches('\\'));
+    if real_layout() {
+        let lower = path.to_lowercase();
+        if lower == "device\\kernelvolume1" || lower.starts_with("device\\kernelvolume1\\") {
+            path = String::from(path["device\\kernelvolume1".len()..].trim_start_matches('\\'));
+        } else if system_volume_switched() {
+            // Depois da troca do `\SystemRoot`, as unidades e o `\SystemRoot`
+            // são do volume do sistema (o ntfs.sys), não do volume do kernel.
+            return None;
+        } else if lower == "systemroot" || lower.starts_with("systemroot\\") {
+            path = alloc::format!("Windows{}", &path["systemroot".len()..]);
+        }
+        return checked_volume_path(&path);
+    }
     for prefix in ["device\\kernelvolume1", "windows\\globalization\\sorting", "systemroot\\globalization\\sorting", "windows\\system32", "systemroot\\system32", "windows", "systemroot"] {
         let lower = path.to_lowercase();
         if lower == prefix {
@@ -238,6 +319,22 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
             break;
         }
     }
+    checked_volume_path(&path)
+}
+
+/// No leiaute real, a letra é do volume do kernel enquanto o
+/// `\GLOBAL??\X:` não existe (o começo do boot, antes das letras) ou leva
+/// ao dispositivo dele: depois do BOOT_DL_ASSIGNMENT o C: é o volume do
+/// ntfs.sys, mesmo antes da troca do `\SystemRoot`.
+fn kernel_volume_letter(letter: u8) -> bool {
+    let link = alloc::format!("\\GLOBAL??\\{}:", letter.to_ascii_uppercase() as char);
+    let exists = crate::ntos::ob::object_manager::resolve_lookup_from(&link, true, true, crate::ntos::ob::object_manager::ROOT).0.is_some();
+    !exists || crate::ntos::io::parse::kernel_volume_device(&link).is_some()
+}
+
+/// O caminho do volume (`/a/b`) de um caminho relativo com `\`, sem
+/// componentes `.`/`..` nem caracteres proibidos.
+fn checked_volume_path(path: &str) -> Option<String> {
     let components: Vec<&str> = path.split('\\').filter(|component| !component.is_empty()).collect();
     if components.iter().any(|component| *component == "." || *component == ".." || component.chars().any(|character| (character as u32) < 0x20 || ":*?\"<>|".contains(character))) {
         return None;

@@ -325,8 +325,14 @@ fn resolve(address: u64) -> Result<Option<u64>, KernelError> {
     Ok(Some(frame + (address & 4095)))
 }
 
-/// Despeja até `maximum` páginas elegíveis (de uma imagem ou de todas).
+/// Despeja até `maximum` páginas elegíveis (de uma imagem ou de todas). Com
+/// `--volume-sistema=ntfs.sys`, depois de o atapi.sys assumir a controladora
+/// nada sai: o despejo grava no NTFS do kernel, que então só lê, e as
+/// páginas dos drivers ficam residentes.
 pub fn trim(maximum: u64, address: Option<u64>, from_pressure: bool) -> Result<u64, KernelError> {
+    if crate::drivers::storage::ata_pio::handed_off() {
+        return Ok(0);
+    }
     low_irql()?;
     {
         let state = STATE.lock();

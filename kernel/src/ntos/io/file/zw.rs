@@ -839,6 +839,13 @@ pub fn set_volume_file_information(file: u64, class: u32, length: u32, buffer: u
 /// com posição de listagem por handle e filtro de nome exato.
 #[allow(clippy::too_many_arguments)]
 pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u32, class: u32, single: bool, file_name: u64, restart: bool) -> u32 {
+    // Um diretório de file system real: o IRP_MN_QUERY_DIRECTORY ao file
+    // system dono, com SL_RESTART_SCAN e SL_RETURN_SINGLE_ENTRY.
+    let mounted = FILE_HANDLES.lock().get(&((handle as u32) & !3)).filter(|entry| matches!(entry.backing, Backing::Mounted { .. })).map(|entry| entry.file_object);
+    if let Some(file_object) = mounted {
+        let flags = (restart as u8) | ((single as u8) << 1);
+        return crate::ntos::io::file::information::query_directory(file_object, io_status, buffer, length, class, flags, file_name).unwrap_or_else(|error| if error.status != 0 { error.status } else { 0xC000_0001 });
+    }
     if class != 1 && class != 38 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -925,10 +932,16 @@ pub fn query_directory_file(handle: u64, io_status: u64, buffer: u64, length: u3
     status
 }
 
-/// ZwFlushBuffersFile: as escritas são síncronas; só valida o handle.
+/// ZwFlushBuffersFile: num arquivo de file system real ou de dispositivo, o
+/// IRP_MJ_FLUSH_BUFFERS ao driver ([`super::information::flush_buffers`]);
+/// no volume do kernel as escritas já são síncronas e só o handle é
+/// conferido.
 pub fn flush_buffers_file(handle: u64, io_status: u64) -> u32 {
-    if entry_of(handle).is_none() {
-        return STATUS_INVALID_HANDLE;
+    let Some(entry) = entry_of(handle) else { return STATUS_INVALID_HANDLE };
+    if matches!(entry.backing, Backing::Mounted { .. } | Backing::Device { .. }) {
+        let status = super::information::flush_buffers(entry.file_object).unwrap_or_else(|error| if error.status != 0 { error.status } else { 0xC000_0001 });
+        write_io_status(io_status, status, 0);
+        return status;
     }
     write_io_status(io_status, 0, 0);
     0

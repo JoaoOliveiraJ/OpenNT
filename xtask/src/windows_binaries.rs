@@ -1738,6 +1738,35 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
     Ok(files)
 }
 
+/// O leiaute real de uma instalação: cada arquivo copiado do `\Windows`
+/// daqui vai para o caminho dele embaixo de `Windows/` (o `acpi.sys` em
+/// `Windows/System32/drivers/acpi.sys`, o `explorer.exe` em
+/// `Windows/explorer.exe`), com a grafia de lá, em vez da raiz achatada que o
+/// NTFS do kernel resolve pelos aliases de instalação
+/// (`volume_files::install_alias`). Os gerados e os que não vêm do
+/// `\Windows` ficam onde estão, menos a cópia achatada do `NTOSKRNL.EXE`,
+/// que já tem o caminho canônico. Um caminho que dois arquivos dariam fica
+/// com o primeiro.
+pub fn real_layout(files: Vec<Staged>) -> Vec<Staged> {
+    let windows = windows_directory();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut placed = Vec::with_capacity(files.len());
+    for mut file in files {
+        if file.host.is_none() && file.path.eq_ignore_ascii_case("NTOSKRNL.EXE") {
+            continue;
+        }
+        if let Some(relative) = file.host.as_deref().and_then(|host| host.strip_prefix(&windows).ok()) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let directory = if file.path.ends_with('/') { "/" } else { "" };
+            file.path = format!("Windows/{}{directory}", relative.trim_end_matches('/'));
+        }
+        if seen.insert(file.path.to_ascii_uppercase()) {
+            placed.push(file);
+        }
+    }
+    placed
+}
+
 #[cfg(test)]
 mod tests {
     use super::user_programs;
@@ -1763,6 +1792,26 @@ mod tests {
     }
 
     /// Do papel de parede padrão vão só as imagens img0 da instalação.
+    /// O leiaute real põe cada arquivo copiado do `\Windows` no caminho de
+    /// lá, tira a cópia achatada do NTOSKRNL.EXE gerado e deixa os outros
+    /// gerados onde estão; um caminho repetido fica com o primeiro.
+    #[test]
+    fn real_layout_places_files_at_their_installed_paths() {
+        use super::{real_layout, windows_directory, Staged};
+        let windows = windows_directory();
+        let files = vec![
+            Staged::copied(String::from("ACPI.SYS"), vec![1], &windows.join("System32/drivers/acpi.sys")),
+            Staged::copied(String::from("EXPLORER.EXE"), vec![2], &windows.join("explorer.exe")),
+            Staged::copied(String::from("acpi.sys"), vec![3], &windows.join("System32/drivers/acpi.sys")),
+            Staged::generated(String::from("NTOSKRNL.EXE"), vec![4]),
+            Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), vec![4]),
+            Staged::generated(String::from("VGK.SYS"), vec![5]),
+            Staged { path: String::from("winevt/Logs/"), bytes: Vec::new(), host: Some(windows.join("System32/winevt/Logs")) },
+        ];
+        let paths: Vec<String> = real_layout(files).into_iter().map(|file| file.path).collect();
+        assert_eq!(paths, ["Windows/System32/drivers/acpi.sys", "Windows/explorer.exe", "Windows/System32/ntoskrnl.exe", "VGK.SYS", "Windows/System32/winevt/Logs/"]);
+    }
+
     #[test]
     fn only_the_stock_wallpapers_are_staged() {
         assert!(super::stock_wallpaper("img0.jpg"));

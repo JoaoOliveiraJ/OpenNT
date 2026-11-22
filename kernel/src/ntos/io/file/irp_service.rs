@@ -1241,6 +1241,111 @@ pub fn notify_change_directory(arguments: &super::directory_notify::NotifyChange
     synchronous_service_tail(&target, packet)
 }
 
+/// Os argumentos do NtQueryDirectoryFile(Ex) de um arquivo de driver, já
+/// conferidos pelo serviço: a classe, o buffer sondado para escrita e o
+/// nome capturado (UNICODE_STRING e texto num bloco do pool, `file_name`;
+/// 0 sem nome), que vai no AuxiliaryBuffer do IRP e sai com ele.
+#[derive(Clone, Copy)]
+pub struct QueryDirectory {
+    pub handle: u64,
+    pub event: u64,
+    pub apc_routine: u64,
+    pub apc_context: u64,
+    pub io_status: u64,
+    pub buffer: u64,
+    pub length: u32,
+    pub class: u32,
+    /// SL_RESTART_SCAN, SL_RETURN_SINGLE_ENTRY, SL_INDEX_SPECIFIED,
+    /// SL_RETURN_ON_DISK_ENTRIES_ONLY e SL_NO_CURSOR_UPDATE_QUERY.
+    pub flags: u8,
+    pub file_name: u64,
+}
+
+/// O IRP_MJ_DIRECTORY_CONTROL com IRP_MN_QUERY_DIRECTORY do
+/// NtQueryDirectoryFileEx (o BuildQueryDirectoryIrp): FILE_LIST_DIRECTORY no
+/// handle, o Parameters.QueryDirectory com o tamanho, o nome, a classe e o
+/// FileIndex 0, os flags SL_* no slot e o buffer como o dispositivo pede
+/// (o SystemBuffer de um DO_BUFFERED_IO, o MDL de um DO_DIRECT_IO, senão o
+/// UserBuffer), pela cauda síncrona do I/O Manager.
+pub fn query_directory(arguments: &QueryDirectory) -> u32 {
+    const IRP_MJ_DIRECTORY_CONTROL: u8 = 0x0C;
+    const IRP_MN_QUERY_DIRECTORY: u8 = 0x01;
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+    let release_name = || {
+        if arguments.file_name != 0 {
+            let _ = pool_allocation::free(arguments.file_name, 0);
+        }
+    };
+    let target = match reference_for(arguments.handle, Some(IRP_MJ_DIRECTORY_CONTROL)) {
+        Ok(target) => target,
+        Err(status) => {
+            release_name();
+            return status;
+        }
+    };
+    let refuse = |status: u32, locked: bool, event: Option<Arc<EventObject>>| {
+        release_name();
+        conclude(&target, locked, event, status)
+    };
+    if target.access & FILE_LIST_DIRECTORY == 0 {
+        return refuse(STATUS_ACCESS_DENIED, false, None);
+    }
+    if file_at(target.file).completion_context.get() != 0 && arguments.apc_routine & !1 != 0 {
+        return refuse(STATUS_INVALID_PARAMETER, false, None);
+    }
+    if arguments.apc_routine != 0 {
+        return refuse(STATUS_NOT_SUPPORTED, false, None);
+    }
+    let event = match reference_event(arguments.event) {
+        Ok(event) => event,
+        Err(status) => return refuse(status, false, None),
+    };
+    let synchronous = target.synchronous();
+    if synchronous && information::acquire_file(target.file).is_err() {
+        return refuse(STATUS_INSUFFICIENT_RESOURCES, false, event);
+    }
+    dispatcher::clear_event(file_at(target.file).event.address());
+    let device_flags = device_at(target.device).flags.get();
+    let length = arguments.length;
+    let buffered = length != 0 && device_flags & DO_BUFFERED_IO != 0;
+    let direct = length != 0 && !buffered && device_flags & DO_DIRECT_IO != 0;
+    let (mut system, mut flags) = (0, 0);
+    if buffered {
+        system = guest::alloc_bytes(length as u64);
+        if system == 0 {
+            return refuse(STATUS_INSUFFICIENT_RESOURCES, synchronous, event);
+        }
+        guest::write_bytes(system, &alloc::vec![0u8; length as usize]);
+        flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_INPUT_OPERATION;
+    }
+    let user_buffer = if length != 0 && !direct { arguments.buffer } else { 0 };
+    let user_event = event.as_ref().map_or(0, |event| event.pointer);
+    let packet = allocate(&target, BuildOptions { major: IRP_MJ_DIRECTORY_CONTROL, minor: IRP_MN_QUERY_DIRECTORY, buffer: system, user_event, user_iosb: arguments.io_status, user_buffer, ..BuildOptions::default() }, flags);
+    if packet == 0 {
+        if system != 0 {
+            let _ = pool_allocation::free(system, 0);
+        }
+        return refuse(STATUS_INSUFFICIENT_RESOURCES, synchronous, event);
+    }
+    if direct {
+        if crate::ntos::io::mdl::allocate_mdl_for_irp(arguments.buffer, length, false, packet) == 0 {
+            irp_builder::free_irp(packet);
+            return refuse(STATUS_INSUFFICIENT_RESOURCES, synchronous, event);
+        }
+        crate::ntos::mm::mdl::probe_and_lock_pages(irp_at(packet).mdl_address.get(), 1);
+    }
+    irp_at(packet).tail.overlay.auxiliary_buffer.set(arguments.file_name);
+    let stack = top_location(packet);
+    let parameters = &stack.parameters.query_directory;
+    parameters.length.set(length);
+    parameters.file_name.set(arguments.file_name);
+    parameters.file_information_class.set(crate::ntos::inc::types::FileInformationClass(arguments.class as i32));
+    parameters.file_index.set(0);
+    stack.flags.set(arguments.flags);
+    track(packet, &target, event, 0, arguments.apc_context);
+    synchronous_service_tail(&target, packet)
+}
+
 // ---- travas de faixa de bytes --------------------------------------------------
 
 const IRP_MJ_LOCK_CONTROL: u8 = 0x11;
@@ -1950,21 +2055,63 @@ pub fn set_information(handle: u64, io_status: u64, buffer: u64, length: u32, cl
         return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
     }
     guest::write_bytes(system, &input);
+    let release_buffers = || {
+        for block in [system, local] {
+            if block != 0 {
+                guest::free_bytes(block);
+            }
+        }
+    };
+    // As classes de rename e link (NtSetInformationFile 0x2d3119): o
+    // FileNameLength par, não nulo e dentro do buffer; com nome absoluto ou
+    // RootDirectory, o IopOpenLinkOrRenameTarget abre o diretório de destino
+    // com a checagem de acesso, e o handle dele sai depois da conclusão.
+    let mut link_target = None;
+    if information::names_link_target(class) {
+        let word = |at: usize, size: usize| input.get(at..at + size).map_or(0, |bytes| bytes.iter().rev().fold(0u64, |value, &byte| value << 8 | byte as u64));
+        let name_length = word(0x10, 4) as u32;
+        if name_length == 0 || name_length & 1 != 0 || length.saturating_sub(0x14) < name_length {
+            release_buffers();
+            return conclude(&target, synchronous, None, STATUS_INVALID_PARAMETER);
+        }
+        if word(0x14, 2) == b'\\' as u64 || word(8, 8) != 0 {
+            match information::open_link_or_rename_target(target.file, system, true, USER_MODE) {
+                Ok(opened) => link_target = Some(opened),
+                Err(status) => {
+                    release_buffers();
+                    return conclude(&target, synchronous, None, status);
+                }
+            }
+        }
+    }
+    let close_link_target = |link_target: Option<(u64, u64)>| {
+        if let Some((handle, _)) = link_target {
+            let _ = crate::ntos::ob::close::close(handle, Some(0));
+        }
+    };
     dispatcher::clear_event(file.event.address());
     let flags = IRP_BUFFERED_IO | IRP_DEALLOCATE_BUFFER | IRP_DEFER_IO_COMPLETION | if local != 0 { IRP_SYNCHRONOUS_API } else { 0 };
     let (user_event, user_iosb) = if local != 0 { (local, local_iosb(local).address()) } else { (0, io_status) };
     let packet = allocate(&target, BuildOptions { major: IRP_MJ_SET_INFORMATION, buffer: system, user_event, user_iosb, ..BuildOptions::default() }, flags);
     if packet == 0 {
+        close_link_target(link_target);
         let _ = pool_allocation::free(system, 0);
         if local != 0 {
             guest::free_bytes(local);
         }
         return conclude(&target, synchronous, None, STATUS_INSUFFICIENT_RESOURCES);
     }
-    let parameters = &top_location(packet).parameters.set_file;
+    let location = top_location(packet);
+    let parameters = &location.parameters.set_file;
     parameters.length.set(length);
     parameters.file_information_class.set(crate::ntos::inc::types::FileInformationClass(class as i32));
-    parameters.file_object.set(0);
+    parameters.file_object.set(link_target.map_or(0, |(_, target_file)| target_file));
+    if information::names_link_target(class) {
+        // SAFETY: o FILE_RENAME_INFORMATION copiado no buffer de sistema.
+        information::prepare_link_target(class, unsafe { crate::ntos::inc::types::FileRenameInformation::at(system) }, location);
+    }
     track(packet, &target, None, local, 0);
-    information_tail(&target, packet, local, io_status)
+    let status = information_tail(&target, packet, local, io_status);
+    close_link_target(link_target);
+    status
 }

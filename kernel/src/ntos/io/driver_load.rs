@@ -454,10 +454,15 @@ pub fn image_volume_path(image_path: &str) -> Result<String, (u32, &'static str)
     if strip_prefix_ci(&path, "System32\\").is_some() {
         path = format!("\\SystemRoot\\{path}");
     }
+    // No leiaute real (`volume_files::real_layout`), o caminho da
+    // instalação: o `\SystemRoot` é o `\Windows` do volume.
+    let real = crate::drivers::fs::volume_files::real_layout();
     // Drivers de System32\Drivers ficam na raiz do volume do convidado.
-    let relative = if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\System32\\Drivers\\") {
+    let relative = if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\").filter(|_| real) {
+        format!("Windows\\{rest}")
+    } else if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\System32\\Drivers\\") {
         String::from(rest)
-    } else if let Some(rest) = strip_prefix_ci(&path, "C:\\Windows\\System32\\Drivers\\") {
+    } else if let Some(rest) = strip_prefix_ci(&path, "C:\\Windows\\System32\\Drivers\\").filter(|_| !real) {
         String::from(rest)
     } else if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\") {
         // O resto da instalação (o repositório de drivers em

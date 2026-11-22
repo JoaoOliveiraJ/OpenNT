@@ -139,11 +139,65 @@ fn remember(cell: &AtomicU32, value: u8) {
 }
 
 /// A pilha real (atapi.sys) assume a controladora: daqui em diante o driver
-/// interno não supõe nada sobre os registradores.
+/// interno não supõe nada sobre os registradores. Com
+/// `--volume-sistema=ntfs.sys` o driver interno não deveria receber mais
+/// nenhum comando (o marco S1 do volume do sistema): os que ainda vêm são
+/// contados ([`commands_after_handoff`]) e os primeiros saem na serial com a
+/// pilha de quem pediu.
 pub fn release_controller() {
     let _channel = CHANNEL.lock();
     FOREIGN_OWNER.store(true, Ordering::Relaxed);
     forget_registers();
+    if crate::ntos::init::boot_config::system_volume_ntfs() {
+        HANDOFF.store(true, Ordering::Release);
+    }
+}
+
+/// O atapi.sys tem a controladora no `--volume-sistema=ntfs.sys`.
+static HANDOFF: AtomicBool = AtomicBool::new(false);
+/// Comandos ao driver interno depois da entrega da controladora.
+static AFTER_HANDOFF: AtomicU32 = AtomicU32::new(0);
+/// As pilhas distintas (pelos primeiros quadros) que já saíram na serial.
+static HANDOFF_STACKS: crate::rtl::SpinLock<Vec<u64>> = crate::rtl::SpinLock::new(Vec::new());
+/// Quantas pilhas distintas saem na serial.
+const HANDOFF_REPORTS: usize = 64;
+
+/// O atapi.sys assumiu a controladora no `--volume-sistema=ntfs.sys`.
+pub fn handed_off() -> bool {
+    HANDOFF.load(Ordering::Acquire)
+}
+
+/// Os comandos que o driver interno recebeu depois de o atapi.sys assumir a
+/// controladora no `--volume-sistema=ntfs.sys`.
+pub fn commands_after_handoff() -> u32 {
+    AFTER_HANDOFF.load(Ordering::Acquire)
+}
+
+fn note_after_handoff(command: Command, lba: u64, count: u32, drive: u8) {
+    if !HANDOFF.load(Ordering::Acquire) {
+        return;
+    }
+    let index = AFTER_HANDOFF.fetch_add(1, Ordering::AcqRel);
+    if (index + 1) % 256 == 0 {
+        debug_print!("[ata] {} comandos ao driver interno depois do atapi.sys", index + 1);
+    }
+    let mut frames = [0u64; crate::ntos::ke::bugcheck_trace::MAX_FRAMES];
+    let count_frames = crate::ntos::ke::bugcheck_trace::kernel_frames(&mut frames);
+    // A pilha pelos quadros de quem pediu (os dois primeiros são do driver).
+    let key = frames[..count_frames].iter().skip(2).take(8).fold(0u64, |hash, &frame| hash.rotate_left(13) ^ frame);
+    {
+        let mut stacks = HANDOFF_STACKS.lock();
+        if stacks.len() >= HANDOFF_REPORTS || stacks.contains(&key) {
+            return;
+        }
+        stacks.push(key);
+    }
+    let mut line = String::new();
+    for &frame in &frames[..count_frames] {
+        line.push_str(" |");
+        crate::ntos::ke::bugcheck_trace::describe(&mut line, frame, 0x1000);
+    }
+    debug_print!("[ata] {:?} disco {} LBA {:#x} ({} setores) depois do atapi.sys:{}", command, drive, lba, count, line);
 }
 
 /// 8086:7010 (PIIX3) em 00:01.1 no QEMU pc.
@@ -325,6 +379,7 @@ impl Channel {
     /// terminou com erro volta sem reset. O pedido é mandado de novo até
     /// [`retries`] vezes (o NumRetries do classpnp) antes de falhar.
     fn run<T>(&mut self, command: Command, lba: u64, count: u32, drive: u8, mut attempt: impl FnMut(u64) -> Result<T, Failure>) -> Result<T, KernelError> {
+        note_after_handoff(command, lba, count, drive);
         let timeout = timeout_ms(command);
         // Um comando sem DMA liga o bit de interrupção do bus master.
         if !matches!(command, Command::ReadDma | Command::WriteDma) {

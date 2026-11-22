@@ -112,6 +112,11 @@ pub struct DriverCreateContext {
     /// (`io_manager::open_related_device_file_with_ea`).
     pub ea_buffer: u64,
     pub ea_length: u32,
+    /// O Options do IoCreateFile/IoCreateFileEx (IO_FORCE_ACCESS_CHECK,
+    /// IO_OPEN_PAGING_FILE, IO_OPEN_TARGET_DIRECTORY...; 0 no ZwCreateFile).
+    /// O byte baixo é o Flags do IRP_MJ_CREATE (os SL_* de mesmo valor),
+    /// como o IopParseDevice copia o Options do OPEN_PACKET (0x64f263).
+    pub options: u32,
 }
 
 /// Os parâmetros do ZwCreateFile que chegam ao file system.
@@ -201,7 +206,14 @@ fn device_at(address: u64) -> &'static DeviceObject {
 
 /// Divide `\Device\X\resto` no DEVICE_OBJECT mais longo do prefixo (links do
 /// namespace seguidos) que tem VPB e no nome restante, com a barra inicial.
+/// Um link cujo destino já traz parte do caminho (o `\SystemRoot`, que leva
+/// a `\Device\BootDevice\Windows`) entra pelo nome expandido
+/// ([`device_name`]).
 pub fn split_volume_path(path: &str) -> Option<(u64, String)> {
+    split_device_prefix(path).or_else(|| device_name(path).and_then(|expanded| split_device_prefix(&expanded)))
+}
+
+fn split_device_prefix(path: &str) -> Option<(u64, String)> {
     let parts: alloc::vec::Vec<&str> = path.split('\\').filter(|part| !part.is_empty()).collect();
     for split in (1..parts.len()).rev() {
         let prefix = alloc::format!("\\{}", parts[..split].join("\\"));
@@ -212,6 +224,30 @@ pub fn split_volume_path(path: &str) -> Option<(u64, String)> {
             continue;
         }
         return Some((device, alloc::format!("\\{}", parts[split..].join("\\"))));
+    }
+    None
+}
+
+/// O nome absoluto com os links simbólicos do começo trocados pelos
+/// destinos, como o ObpLookupObjectName recomeça a busca no STATUS_REPARSE
+/// de cada um, até o prefixo ser um objeto que não é link (o dispositivo
+/// que recebe o resto no IopParseDevice): `\SystemRoot\System32\smss.exe`
+/// vira `\Device\HarddiskVolume1\Windows\System32\smss.exe`. `None` quando
+/// nenhum prefixo é objeto ou os links passam das 0x40 voltas.
+pub fn device_name(path: &str) -> Option<String> {
+    let mut name = String::from(path);
+    for _ in 0..crate::ntos::io::reparse::MAXIMUM_REPARSE {
+        let parts: alloc::vec::Vec<&str> = name.split('\\').filter(|part| !part.is_empty()).collect();
+        let mut reparsed = None;
+        for split in (1..=parts.len()).rev() {
+            let prefix = alloc::format!("\\{}", parts[..split].join("\\"));
+            let (Some(node), _) = object_manager::resolve_lookup_from(&prefix, true, true, object_manager::ROOT) else { continue };
+            let Some(target) = object_manager::link_target(node) else { return Some(name) };
+            let rest = parts[split..].join("\\");
+            reparsed = Some(if rest.is_empty() { target } else { alloc::format!("{}\\{}", target.trim_end_matches('\\'), rest) });
+            break;
+        }
+        name = reparsed?;
     }
     None
 }
@@ -414,7 +450,7 @@ fn send_create(target: u64, file: u64, request: &OpenRequest) -> Result<(u32, u6
             crate::ntos::fsrtl::ecp::set_list_into_irp(irp, unsafe { crate::ntos::inc::types::extra_fsrtl::EcpList::at(ecp_list) });
         }
         stack.major_function.set(IRP_MJ_CREATE);
-        stack.flags.set(if request.case_insensitive { 0 } else { SL_CASE_SENSITIVE });
+        stack.flags.set(request.driver_context.options as u8 | if request.case_insensitive { 0 } else { SL_CASE_SENSITIVE });
         let create = &stack.parameters.create;
         create.security_context.set(context);
         create.options.set((request.disposition << 24) | (request.create_options & 0x00FF_FFFF));
@@ -429,6 +465,21 @@ fn send_create(target: u64, file: u64, request: &OpenRequest) -> Result<(u32, u6
 
 /// Abre `remaining` no volume montado em `device` (montando-o se preciso).
 pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<Opened, KernelError> {
+    open_file_relative(device, remaining, 0, request)
+}
+
+/// A abertura relativa a um arquivo de file system (o IopParseFile, que vai
+/// ao IopParseDevice do DeviceObject do arquivo com RelatedFileObject): o
+/// VPB do arquivo relacionado, referenciado sem montagem, e o FILE_OBJECT
+/// novo com RelatedFileObject e o nome relativo, como o file system o
+/// resolve no IRP_MJ_CREATE (o diretório do KnownDlls do smss).
+pub fn open_related_file(related: u64, remaining: &str, request: &OpenRequest) -> Result<Opened, KernelError> {
+    // SAFETY: o FILE_OBJECT relacionado, vivo pelo handle de quem abre.
+    let device = unsafe { FileObject::at(related) }.device_object.get();
+    open_file_relative(device, remaining, related, request)
+}
+
+fn open_file_relative(device: u64, remaining: &str, related: u64, request: &OpenRequest) -> Result<Opened, KernelError> {
     let real = device_at(device);
     // IopIncrementDeviceObjectRefCount: a abertura retém o dispositivo real.
     real.reference_count.atomic().fetch_add(1, Ordering::SeqCst);
@@ -436,7 +487,12 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
         real.reference_count.atomic().fetch_sub(1, Ordering::SeqCst);
         device_objects::changed(device);
     };
-    let vpb = match file_system::check_vpb_mounted(real, remaining.is_empty(), false) {
+    // Com arquivo relacionado, o VPB dele (IopParseDevice); senão o
+    // IopCheckVpbMounted do dispositivo, que monta o volume se preciso.
+    // SAFETY: o FILE_OBJECT relacionado, vivo pelo handle de quem abre.
+    let related_vpb = if related != 0 { unsafe { FileObject::at(related) }.vpb.get() } else { 0 };
+    let mounted = if related_vpb != 0 { file_system::reference_vpb(related_vpb).map(|()| Ok(related_vpb)) } else { file_system::check_vpb_mounted(real, remaining.is_empty(), related != 0) };
+    let vpb = match mounted {
         Ok(Ok(vpb)) => vpb,
         Ok(Err(status)) => {
             release_device();
@@ -467,6 +523,7 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
     // SAFETY: o FILE_OBJECT recém-criado.
     let object = unsafe { FileObject::at(file) };
     object.vpb.set(vpb);
+    object.related_file_object.set(related);
     object.flags.set(file_object_flags(request.create_options));
     let (status, information) = match send_create(target, file, request) {
         Ok(result) => result,
@@ -488,7 +545,7 @@ pub fn open_file(device: u64, remaining: &str, request: &OpenRequest) -> Result<
     // atendeu (FILE_DEVICE_CD_ROM_FILE_SYSTEM, DISK_FILE_SYSTEM, FILE_SYSTEM
     // ou TAPE_FILE_SYSTEM no dispositivo que recebeu o IRP) é a do volume
     // (IopParseDevice, rva 0x650214..0x650234).
-    if remaining.is_empty() && matches!(device_at(target).device_type.get(), 3 | 8 | 9 | 0x20) {
+    if remaining.is_empty() && related == 0 && matches!(device_at(target).device_type.get(), 3 | 8 | 9 | 0x20) {
         object.flags.atomic().fetch_or(FO_VOLUME_OPEN, Ordering::SeqCst);
     }
     if hint != 0 {

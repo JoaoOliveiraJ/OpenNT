@@ -352,6 +352,29 @@ pub fn capture_pointer(file_object: u64, protect: u32, image: bool, required: u3
     capture_selected(file_object, required, 0, protect, image, required)
 }
 
+/// Um arquivo do sistema (`\SystemRoot\...`, `C:\Windows\...`) para uma
+/// seção de dados do kernel, como as do locale.nls e das tabelas NLS do
+/// NtGetNlsSectionPtr, que o NT abre pelo ZwOpenFile: antes da troca do
+/// `\SystemRoot` (`--volume-sistema=ntfs.sys`), o arquivo do volume do
+/// kernel; depois dela, o do file system real, aberto pelo I/O Manager e
+/// retido pela seção (o handle fecha logo, e o FILE_OBJECT fica com a
+/// referência que a seção leva). `None` = ausente ou diretório.
+pub fn system_section_file(nt_path: &str) -> Result<Option<Arc<dyn SectionFile>>, u32> {
+    use crate::drivers::fs::volume_files;
+    if !volume_files::system_volume_switched() {
+        return Ok(volume_files::lookup_volume_file(nt_path).filter(|file| !file.directory()).map(|file| file as Arc<dyn SectionFile>));
+    }
+    let file = match crate::ntos::io::file::system_file::SystemFile::open_read(nt_path) {
+        Ok(file) => file,
+        Err(0xC000_0034) | Err(0xC000_003A) | Err(0xC000_00BA) => return Ok(None),
+        Err(status) => return Err(status),
+    };
+    // PAGE_READONLY e FILE_READ_DATA.
+    let captured = capture_pointer(file.file_object(), 2, false, 1)?;
+    captured.acquire().map_err(|error| if error.status != 0 { error.status } else { 0xC000_0001 })?;
+    Ok(Some(captured as Arc<dyn SectionFile>))
+}
+
 fn capture_selected(pointer: u64, access: u32, mode: u8, protect: u32, image: bool, required: u32) -> Result<Arc<CapturedFile>, u32> {
     let base = protect & 255;
     let write = base == 4 || base == 0x40;

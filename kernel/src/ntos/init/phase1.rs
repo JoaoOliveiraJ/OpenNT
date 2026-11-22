@@ -159,6 +159,11 @@ pub fn init() {
     if system_volume {
         load_cng();
         crate::ntos::io::pnp_notify::hold_volume_interface_changes();
+        // A árvore do IopInitializeBootDrivers só carrega drivers de boot: os
+        // nós dos outros (o i8042prt.sys do teclado, assinado por catálogo,
+        // que a CI validaria lendo o CatRoot) ficam para depois do volume de
+        // boot.
+        crate::ntos::io::pnp::tree::set_driver_start_type(crate::ntos::io::pnp::tree::SERVICE_BOOT_START);
         build_device_tree();
         // O ntfs.sys é driver de boot (grupo "Boot File System"): registrado
         // antes do PnpBootDeviceWait, monta o volume de boot na abertura do
@@ -177,6 +182,16 @@ pub fn init() {
     crate::ntos::io::boot_partition::boot_device_wait();
     crate::ntos::io::pnp::mark_boot_drivers_initialized();
     debug_print!("[boot] servicos carregados: {}", loaded);
+    // O PipProcessDevNodeTree do IopInitializeSystemDrivers, com o
+    // \SystemRoot já no volume do ntfs.sys: os nós que esperavam um driver
+    // que não é de boot recebem os drivers agora (SERVICE_DEMAND_START).
+    if system_volume {
+        crate::ntos::io::pnp::tree::set_driver_start_type(crate::ntos::io::pnp::tree::SERVICE_DEMAND_START);
+        match crate::ntos::io::pnp::tree::process_deferred() {
+            Ok(added) => debug_print!("[pnp] arvore depois do volume de boot: {} no(s) com drivers", added),
+            Err(error) => debug_print!("[pnp] arvore depois do volume de boot: {}", error),
+        }
+    }
     if !system_volume {
         load_cng();
     }

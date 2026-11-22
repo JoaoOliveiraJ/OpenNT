@@ -926,6 +926,61 @@ fn driver_file(handle: u64) -> bool {
     state::get_user_handle(handle).is_some_and(|entry| entry.kind() == "device")
 }
 
+/// NtQueryDirectoryFile(Ex) de um arquivo de driver (um diretório do
+/// ntfs.sys): as conferências do serviço (os flags, a classe e o tamanho
+/// mínimo dela, a sonda do buffer e a captura do nome num bloco do pool) e
+/// o IRP_MN_QUERY_DIRECTORY do I/O Manager (`irp_service::query_directory`).
+fn driver_query_directory(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64, extended: bool) -> u32 {
+    let (iosb, out, length, class) = (state::stack_arg(rsp, 5), state::stack_arg(rsp, 6), state::stack_arg32(rsp, 7), state::stack_arg32(rsp, 8));
+    let name_pointer = state::stack_arg(rsp, 10);
+    let flags = if extended { state::stack_arg32(rsp, 9) } else { (if state::stack_boolean(rsp, 9) { 2 } else { 0 }) | (if state::stack_boolean(rsp, 11) { 1 } else { 0 }) };
+    if flags & !0x1B != 0 {
+        return 0xC000_00BB;
+    }
+    let minimum: u32 = match class {
+        1 => 64,
+        2 => 68,
+        3 => 94,
+        12 => 12,
+        37 => 104,
+        38 => 80,
+        _ => return 0xC000_0003,
+    };
+    if length < minimum {
+        return 0xC000_0004;
+    }
+    if !state::probe_user_write(iosb, 16) || !state::probe_user_write(out, length as u64) {
+        return AV;
+    }
+    let mut file_name = 0;
+    if name_pointer != 0 {
+        if !state::probe_user_read(name_pointer, 16) {
+            return AV;
+        }
+        let Ok(name) = state::user_struct::<UnicodeString>(name_pointer) else { return AV };
+        let (Ok(name_length), Ok(pointer)) = (name.length.probe_get(), name.buffer.probe_get()) else { return AV };
+        let name_length = u64::from(name_length);
+        if name_length % 2 != 0 {
+            return INVALID;
+        }
+        if !state::probe_user_read(pointer, name_length) {
+            return AV;
+        }
+        let Ok(bytes) = guest::try_read_bytes(pointer, name_length as usize) else { return AV };
+        file_name = guest::alloc_bytes(UnicodeString::SIZE + name_length.max(2));
+        if file_name == 0 {
+            return 0xC000_009A;
+        }
+        guest::write_bytes(file_name + UnicodeString::SIZE, &bytes);
+        // SAFETY: a UNICODE_STRING no começo do bloco recém-alocado.
+        let captured = unsafe { UnicodeString::at(file_name) };
+        captured.length.set(name_length as u16);
+        captured.maximum_length.set(name_length as u16);
+        captured.buffer.set(file_name + UnicodeString::SIZE);
+    }
+    irp_service::query_directory(&irp_service::QueryDirectory { handle, event, apc_routine: apc, apc_context, io_status: iosb, buffer: out, length, class, flags: flags as u8, file_name })
+}
+
 /// NtReadFile/NtWriteFile de um arquivo de driver de neither I/O (os
 /// arquivos de file system de pipes e mailslots) pelo IRP do I/O Manager.
 fn driver_transfer(handle: u64, event: u64, apc: u64, context: u64, rsp: u64, write: bool) -> Option<u32> {
@@ -1403,6 +1458,9 @@ fn query_directory(handle: u64, event: u64, apc: u64, apc_context: u64, rsp: u64
     let iosb = state::stack_arg(rsp, 5);
     let out = state::stack_arg(rsp, 6);
     let length = state::stack_arg32(rsp, 7) as u64;
+    if driver_file(handle) {
+        return Ok(driver_query_directory(handle, event, apc, apc_context, rsp, extended));
+    }
     run(iosb, || {
         let (entry, user_file) = object(handle)?;
         let file = user_file.file.clone();

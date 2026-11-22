@@ -70,6 +70,56 @@ struct ActionWorker {
 
 static WORKER: SpinLock<ActionWorker> = SpinLock::new(ActionWorker { item: 0, queued: false, active: false });
 
+/// O DriverStartType do contexto do PipCallDriverAddDevice: um driver
+/// ainda não carregado só carrega com Start até ele. O IopInitializeBootDrivers
+/// processa a árvore com SERVICE_BOOT_START e o IopInitializeSystemDrivers,
+/// depois do volume de boot, com SERVICE_DEMAND_START; o nó cujo driver fica
+/// para depois continua Initialized. Sem limite (o padrão), a árvore única do
+/// fim da fase 1 carrega todos.
+static DRIVER_START_TYPE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// SERVICE_BOOT_START e SERVICE_DEMAND_START.
+pub const SERVICE_BOOT_START: u32 = 0;
+pub const SERVICE_DEMAND_START: u32 = 3;
+
+/// Muda o DriverStartType dos processamentos seguintes da árvore.
+pub fn set_driver_start_type(start_type: u32) {
+    DRIVER_START_TYPE.store(start_type, core::sync::atomic::Ordering::Release);
+}
+
+/// O driver `service` não está carregado e o Start dele passa do
+/// DriverStartType: o AddDevice do nó fica para um processamento seguinte.
+fn deferred_by_start_type(service: &str) -> bool {
+    let limit = DRIVER_START_TYPE.load(core::sync::atomic::Ordering::Acquire);
+    if limit == u32::MAX || lifecycle::driver_node(service).is_some() {
+        return false;
+    }
+    let start = install::read_dword(&format!("{}\\Services\\{service}", install::CONTROL_SET), "Start");
+    start.is_some_and(|start| start > limit)
+}
+
+/// O PipProcessDevNodeTree do IopInitializeSystemDrivers: com o
+/// DriverStartType novo, os nós que ficaram Initialized recebem os drivers,
+/// iniciam e são enumerados, na ordem da árvore (os pais antes dos filhos).
+/// Devolve quantos nós receberam drivers.
+pub fn process_deferred() -> Result<usize, KernelError> {
+    let pending: Vec<u64> = devnode::all().into_iter().filter(|node| node.state == State::Initialized && node.service.is_some()).map(|node| node.pdo).collect();
+    let mut added = 0;
+    for pdo in pending {
+        if !devnode::get(pdo).is_some_and(|node| node.state == State::Initialized) {
+            continue;
+        }
+        add_drivers(pdo)?;
+        if devnode::get(pdo).is_some_and(|node| node.state == State::DriversAdded) {
+            added += 1;
+            start_device_node(pdo)?;
+            enumerate_device(pdo)?;
+        }
+    }
+    drain()?;
+    Ok(added)
+}
+
 /// Chave `Enum\<instância>`.
 fn enum_key(instance_path: &str) -> String {
     format!("{}\\Enum\\{instance_path}", install::CONTROL_SET)
@@ -504,6 +554,13 @@ fn add_drivers(pdo: u64) -> Result<(), KernelError> {
     order.push((service.clone(), true));
     order.extend(filters(&key, "UpperFilters").into_iter().map(|name| (name, false)));
     order.extend(class_filters("UpperFilters").into_iter().map(|name| (name, false)));
+    // PipCallDriverAddDeviceQueryRoutine: um driver que ainda não carregou
+    // e cujo Start passa do DriverStartType deixa o nó Initialized, para o
+    // processamento seguinte da árvore.
+    if let Some((driver, _)) = order.iter().find(|(driver, _)| deferred_by_start_type(driver)) {
+        debug_print!("[pnp] {}: {} fica para o processamento depois do volume de boot (Start acima do DriverStartType)", node.instance_path, driver);
+        return Ok(());
+    }
     for (driver, function) in order {
         let before = device_objects::top(pdo);
         if let Err(code) = call_add_device(&driver, pdo) {

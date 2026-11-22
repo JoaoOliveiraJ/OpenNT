@@ -264,6 +264,42 @@ pub fn start_hive_list() {
     }
 }
 
+/// O IopReassignSystemRoot do `--volume-sistema=ntfs.sys` trocou o volume do
+/// `\SystemRoot`: as hives carregadas de lá (as da máquina, lidas pelo NTFS
+/// do kernel no papel do loader block) reabrem o primário e os logs pelo
+/// mesmo nome, agora servidos pelo ntfs.sys, como o CmpInitializeHiveList
+/// abre os arquivos das hives que o loader block trouxe na memória; a lista
+/// de hives passa a ter os nomes novos. Devolve quantas trocaram de arquivo.
+pub fn reopen_system_root_hives() -> u32 {
+    let _guard = FlushGuard::acquire();
+    let hives: Vec<(u32, String, bool, String)> = HIVES
+        .lock()
+        .iter()
+        .filter(|(_, hive)| hive.file_name.len() > 12 && hive.file_name[..12].eq_ignore_ascii_case("\\SystemRoot\\"))
+        .map(|(&identifier, hive)| (identifier, hive.file_name.clone(), hive.writable, hive.mount.clone()))
+        .collect();
+    let mut moved = 0;
+    for (identifier, file_name, writable, mount) in hives {
+        let mode = OpenMode { read_only: !writable, token: None };
+        let primary = match HiveFile::open_primary(&file_name, false, mode) {
+            Ok((primary, _)) => primary,
+            Err(status) => {
+                debug_print!("[cm] {} nao reaberto no volume novo do \\SystemRoot: {:#x}", file_name, status);
+                continue;
+            }
+        };
+        let logs = [0, 1].map(|index| HiveFile::open_log(&log_name(&file_name, index), mode).ok());
+        // Os arquivos antigos fecham fora da trava.
+        let old = HIVES.lock().get_mut(&identifier).map(|hive| (core::mem::replace(&mut hive.primary, primary), core::mem::replace(&mut hive.logs, logs)));
+        drop(old);
+        if HIVE_LIST_STARTED.load(Ordering::Acquire) {
+            add_to_hive_list(identifier, &mount, false);
+        }
+        moved += 1;
+    }
+    moved
+}
+
 /// Uma hive volátil nova em `mount` (a HARDWARE): sem arquivo, com a
 /// entrada vazia na lista de hives.
 pub fn create_volatile_hive(mount: &str) -> Result<u32, u32> {
@@ -493,12 +529,15 @@ fn shared_app_hive(file_name: &str, flags: u32) -> Result<String, u32> {
 }
 
 /// Grava uma descarga montada: primário invalidado, log, faixas e o bloco
-/// base validado.
+/// base validado, com o CmpFileFlush depois do log, das faixas e do bloco
+/// base (o ZwFlushBuffersFile num arquivo de file system real; no volume do
+/// kernel as escritas já estão no disco).
 fn write_plan(primary: &HiveFile, log: Option<&HiveFile>, plan: &sync::Plan) -> Result<(), u32> {
     primary.write(0, &plan.invalid_header)?;
     if let Some(log) = log {
         log.write(0, &plan.log)?;
         log.set_size(plan.log.len() as u64)?;
+        log.flush()?;
     }
     if primary.size() < plan.file_length {
         primary.set_size(plan.file_length)?;
@@ -506,7 +545,9 @@ fn write_plan(primary: &HiveFile, log: Option<&HiveFile>, plan: &sync::Plan) -> 
     for (offset, bytes) in &plan.writes {
         primary.write(*offset, bytes)?;
     }
-    primary.write(0, &plan.valid_header)
+    primary.flush()?;
+    primary.write(0, &plan.valid_header)?;
+    primary.flush()
 }
 
 /// Apelidos (sem posse do handle) do primário e do log corrente, que passa

@@ -11025,13 +11025,15 @@ fn io_file_system_support_exports(assert: Assert) {
     let empty_slot = Some(crate::ntos::init::exports::signed_status(crate::ntos::io::io_manager::status::NOT_SUPPORTED as u32));
     let basic = guest::alloc_bytes(0x28);
     assert(call_export("IoSetInformation", &[stream, 4, 0x28, basic]) == empty_slot, "io-fs-support: IoSetInformation propaga o status do driver");
-    // Rename com diretório de destino: sem IopOpenLinkOrRenameTarget -> NOT_IMPLEMENTED; ReplaceIfExists vai ao IRP.
+    // Rename com diretório de destino: o IopOpenLinkOrRenameTarget começa
+    // pelo IopGetBasicInformationFile do arquivo, que o driver sem rotinas
+    // recusa; a recusa completa o IRP sem chegar ao rename.
     let rename = guest::alloc_bytes(nt::FileRenameInformation::SIZE + 8);
     let rename_information = at::<nt::FileRenameInformation>(rename);
     rename_information.replace_if_exists.set(1);
     rename_information.file_name_length.set(2);
     rename_information.file_name[0].set(b'\\' as u16);
-    assert(call_export("IoSetInformation", &[stream, 10, nt::FileRenameInformation::SIZE + 8, rename]) == Some(0xFFFF_FFFF_C000_0002), "io-fs-support: rename com destino absoluto nao suportado");
+    assert(call_export("IoSetInformation", &[stream, 10, nt::FileRenameInformation::SIZE + 8, rename]) == empty_slot, "io-fs-support: rename com destino absoluto abre o diretorio de destino");
     // Nome DOS: o FS sem rotina de consulta devolve a falha da FileNameInformation.
     let information_output = guest::alloc_bytes(8);
     assert(call_export("IoQueryFileDosDeviceName", &[stream, information_output]) == empty_slot && at::<nt::Field<u64>>(information_output).get() == 0, "io-fs-support: IoQueryFileDosDeviceName propaga a falha do FS");

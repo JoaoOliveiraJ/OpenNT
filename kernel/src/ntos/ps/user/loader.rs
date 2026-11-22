@@ -261,6 +261,13 @@ pub fn ensure_ntdll() -> Result<(), KernelError> {
         let (image, notification) = crate::ntos::ps::create::volume_image_sources(name, file);
         return in_system(|| map_system_ntdll(image, notification, "real (NTFS)"));
     }
+    // Depois da troca do `\SystemRoot` para o volume do ntfs.sys, o arquivo
+    // dele, aberto pelo I/O Manager e retido pela imagem.
+    if volume_files::system_volume_switched() {
+        if let Some(Ok((image, notification))) = crate::ntos::ps::create::driver_image_sources("\\SystemRoot\\System32\\ntdll.dll") {
+            return in_system(|| map_system_ntdll(image, notification, "real (NTFS)"));
+        }
+    }
     let (bytes, origin) = read_ntdll_input()?;
     map_ntdll(bytes, origin)
 }
@@ -271,7 +278,7 @@ pub fn ensure_ntdll() -> Result<(), KernelError> {
 /// num boot sem a instalação do smss: usa a cópia real que o build põe em
 /// `Windows\System32`.
 pub fn read_ntdll_input() -> Result<(Vec<u8>, &'static str), KernelError> {
-    if let Some(bytes) = ntfs_volume().and_then(|volume| volume.read_bytes("/NTDLL.DLL").ok().flatten()) {
+    if let Some(bytes) = crate::drivers::fs::volume_files::read_system_file(&crate::drivers::fs::volume_files::system32_path("NTDLL.DLL")).ok().flatten() {
         return Ok((bytes, "real (NTFS)"));
     }
     if crate::ntos::init::boot_config::kernel_test_scope() == "e-process" {
@@ -294,7 +301,7 @@ fn ntdll_resolver(_dll: &str, symbol: &ImportSymbol) -> Option<ResolvedImport> {
 /// Mapeia a ntdll na raiz do System (anexado a ele) e a fotografa para as
 /// cópias de cada processo.
 pub fn map_ntdll(bytes: Vec<u8>, origin: &str) -> Result<(), KernelError> {
-    let source_name = if origin == "real (NTFS)" { crate::drivers::fs::ntfs::nt_path("/NTDLL.DLL") } else { String::from("\\BootBundle\\apps\\ntdll.dll") };
+    let source_name = if origin == "real (NTFS)" { crate::drivers::fs::ntfs::nt_path(&crate::drivers::fs::volume_files::system32_path("NTDLL.DLL")) } else { String::from("\\BootBundle\\apps\\ntdll.dll") };
     let image: Arc<dyn ImageSource> = Arc::new(MemorySource { name: source_name.clone(), bytes: bytes.clone() });
     let notification: Arc<dyn FileSource> = Arc::new(BytesSource { name: source_name, bytes: Arc::new(bytes) });
     in_system(|| map_system_ntdll(image, notification, origin))
@@ -355,8 +362,8 @@ pub fn ensure_api_set_schema() -> Result<(), KernelError> {
 }
 
 fn map_system_api_set_schema() -> Result<(), KernelError> {
-    let volume = require_volume("apisetschema")?;
-    let bytes = volume.read_bytes("/APISETSCHEMA.DLL")?.ok_or_else(|| KernelError::new("APISETSCHEMA.DLL ausente no volume"))?;
+    require_volume("apisetschema")?;
+    let bytes = crate::drivers::fs::volume_files::read_system_file(&crate::drivers::fs::volume_files::system32_path("APISETSCHEMA.DLL"))?.ok_or_else(|| KernelError::new("APISETSCHEMA.DLL ausente no volume"))?;
     let image = pe_loader::load_user(bytes, &LoadOptions { skip_imports: true, no_execute: true, notify_image: false, ..LoadOptions::default() })?;
     let section = image.sections.iter().find(|section| section.name == ".apiset").ok_or_else(|| KernelError::new("apisetschema sem secao .apiset"))?;
     system_frames(&image);
@@ -364,7 +371,7 @@ fn map_system_api_set_schema() -> Result<(), KernelError> {
     let map = image.image_base + section.va as u64;
     state::with(|state| state.api_set_map_va = map);
     *API_SET_IMAGE.lock() = (image.image_base, image.size_of_image);
-    push_image(Space::system(), image.image_base, image.size_of_image, crate::drivers::fs::ntfs::nt_path("/APISETSCHEMA.DLL"), None);
+    push_image(Space::system(), image.image_base, image.size_of_image, crate::drivers::fs::ntfs::nt_path(&crate::drivers::fs::volume_files::system32_path("APISETSCHEMA.DLL")), None);
     crate::debug_print!("[usermode] apiset schema em {:#x} ({} bytes)", map, section.virtual_size);
     Ok(())
 }
@@ -382,12 +389,12 @@ pub fn ensure_nls_data() -> Result<state::NlsVas, KernelError> {
 }
 
 fn map_system_nls_data() -> Result<state::NlsVas, KernelError> {
-    let volume = require_volume("dados NLS")?;
+    require_volume("dados NLS")?;
     state::with(|state| state.nls_vas = Some(state::NlsVas::default()));
-    let table = |oem: bool| alloc::format!("/{}", crate::ntos::rtl::nls_configuration::table_file(oem).to_uppercase());
-    for (path, key, name) in [(table(false), 0, "nls-ansi"), (table(true), 1, "nls-oem"), (String::from("/L_INTL.NLS"), 2, "nls-unicode")] {
+    let table = |oem: bool| crate::drivers::fs::volume_files::system32_path(&crate::ntos::rtl::nls_configuration::table_file(oem).to_uppercase());
+    for (path, key, name) in [(table(false), 0, "nls-ansi"), (table(true), 1, "nls-oem"), (crate::drivers::fs::volume_files::system32_path("L_INTL.NLS"), 2, "nls-unicode")] {
         let path = path.as_str();
-        let bytes = volume.read_bytes(path)?.ok_or_else(|| KernelError::new(alloc::format!("{path} ausente no volume")))?;
+        let bytes = crate::drivers::fs::volume_files::read_system_file(path)?.ok_or_else(|| KernelError::new(alloc::format!("{path} ausente no volume")))?;
         let size = (bytes.len() as u64).div_ceil(0x1000) * 0x1000;
         let va = memory::map_shared_user_region(size)?;
         write_user_bytes(va, &bytes)?;

@@ -2636,10 +2636,10 @@ cadeia inteira passar com a opção. As decisões:
    `kd/explore.rs`.
 5. **Os serviços de arquivo do modo usuário sobre arquivos de file
    system.** Já vão por IRP a leitura e a escrita, as consultas e o set
-   information, as classes de volume, o notify, os locks e o flush. Faltam
-   o NtQueryDirectoryFile(Ex), o NtDeleteFile, renomear e ligar (o
-   IopOpenLinkOrRenameTarget com SL_OPEN_TARGET_DIRECTORY), o STATUS_REPARSE
-   e os EAs no IRP_MJ_CREATE e a ApcRoutine do I/O de dispositivo.
+   information, as classes de volume, o notify, os locks, o flush, o
+   NtQueryDirectoryFile(Ex) e renomear e ligar (o IopOpenLinkOrRenameTarget
+   com SL_OPEN_TARGET_DIRECTORY). Faltam o NtDeleteFile, o STATUS_REPARSE e
+   os EAs no IRP_MJ_CREATE e a ApcRoutine do I/O de dispositivo.
 6. **A segurança dos arquivos.** O ntfs.sys confere o descritor de cada
    abertura; a imagem precisa dos descritores de uma instalação (herança
    OI/CI e ALL APPLICATION PACKAGES) antes de a cadeia rodar nele, senão os
@@ -2693,9 +2693,81 @@ primeira letra livre antes do BOOT_DL. O ExReinitializeResourceLite segue
 o 19041 (devolve sempre STATUS_SUCCESS e esquece a posse): o ntfs.sys
 reinicializa o ERESOURCE de um FCB que ele libera ainda adquirido e o
 reaproveita no FCB seguinte, e sem isso a primeira abertura no volume do
-sistema esperava para sempre. O `\SystemRoot` ainda leva ao
-volume do kernel, e o driver ATA interno continua servindo o NTFS do
-kernel depois do atapi.sys (o que o S1 tira).
+sistema esperava para sempre.
+
+O leiaute do volume. A imagem do NTFS do xtask guarda o conteúdo de
+System32 (e de System32\drivers) e o de `\Windows` achatados na raiz, e o
+NTFS do kernel os acha pelos aliases de instalação
+(`volume_files::install_alias`): um desvio de fidelidade (o `\Windows` e o
+`\Windows\System32` caem na mesma raiz, e um programa pode carregar a
+mesma DLL duas vezes). O ntfs.sys não conhece esses aliases, então o
+volume do `--volume-sistema=ntfs.sys` grava cada arquivo no caminho real
+da instalação (`windows_binaries::real_layout`, pelo caminho de origem
+embaixo do `\Windows` daqui), e o kernel decide pela mesma opção
+(`volume_files::real_layout`): o `nt_path_to_volume_path` devolve o
+caminho da instalação, sem aliases, e quem pedia um arquivo de System32
+pela raiz achatada pede pelo `volume_files::system32_path` (o sysload
+procura em System32\drivers e em System32, o loader lê a ntdll, o apiset e
+as tabelas NLS por ele, o ImagePath dos serviços vira o caminho embaixo de
+`/Windows`; as imagens do bundle, guardadas com o nome achatado, são
+achadas pelo nome do arquivo do caminho da instalação). Os consumidores já
+não dependem do leiaute: quando o leiaute real virar o padrão dos boots do
+NTFS do kernel, só o `real_layout` muda. No leiaute real, o C: e o D: só
+traduzem para o volume do kernel enquanto o `\GLOBAL??\X:` não existe ou
+leva ao dispositivo dele.
+
+O que o S1 faz (teste `volume-sistema`, `SYSTEM_VOLUME_SWITCHED_OK`):
+antes de o atapi.sys assumir a controladora, o NTFS do kernel deixa na
+memória o que o winload deixaria no loader block: as tabelas NLS (o
+upcase, o lowercase e as páginas de código ANSI e OEM) e as imagens dos
+drivers de boot com os imports delas
+(`io/boot_partition.rs::load_boot_files`,
+`sysload::kernel_image_source::preload_boot_images`); daí em diante cada
+comando ao driver ATA interno é contado e a primeira vez de cada pilha
+sai na serial com os quadros do kernel
+(`ata_pio::commands_after_handoff`). Depois do BOOT_DL, o
+IopReassignSystemRoot aponta o `\Device\BootDevice`, por onde o
+`\SystemRoot` passa, para o volume da partição, e os nomes NT do sistema
+deixam de traduzir para o volume do kernel
+(`volume_files::switch_system_volume`): quem lê um arquivo do sistema vai
+pelo I/O Manager (`io/file/system_file`, o ZwCreateFile, o ZwReadFile, o
+ZwWriteFile, o EndOfFile e o ZwFlushBuffersFile num handle de kernel, com
+o IRP_MJ_FLUSH_BUFFERS para os arquivos montados): o sysload depois da
+troca e a ntdll, o apiset e as NLS do loader de usuário
+(`volume_files::read_system_file`). As hives da máquina reabrem o primário
+e os logs pelo mesmo nome no volume novo, como o CmpInitializeHiveList
+abre os arquivos das hives do loader block
+(`cm::hive_list::reopen_system_root_hives`), e a E/S delas num arquivo de
+file system real vai pelo handle (`cm/hive_file.rs`), com o CmpFileFlush
+depois do log, das faixas e do bloco base; num handle assíncrono (os logs
+abrem sem FILE_SYNCHRONOUS_IO_*) o STATUS_PENDING espera o FileObject->Event.
+Um nome que passa por um link cujo destino já traz parte do caminho (o
+`\SystemRoot`, que leva a `\Device\BootDevice\Windows`) chega ao volume
+pelo nome expandido (`io/parse.rs::device_name`, como o
+ObpLookupObjectName recomeça no STATUS_REPARSE de cada link), nas aberturas
+do kernel e nas de usuário. Como no NT, a árvore do IopInitializeBootDrivers
+só carrega drivers de boot (o DriverStartType do PipCallDriverAddDevice,
+`pnp::tree::set_driver_start_type`): o nó cujo driver não é de boot fica
+Initialized, e o PipProcessDevNodeTree do IopInitializeSystemDrivers dá os
+drivers a ele depois da troca, com SERVICE_DEMAND_START
+(`pnp::tree::process_deferred`). Sem isso o i8042prt.sys, assinado por
+catálogo, chegava à CI antes do volume de boot, e a ci.dll varria o
+CatRoot pelo NTFS do kernel; depois da troca o ZwQueryDirectoryFile de
+modo kernel num diretório do ntfs.sys é o IRP_MN_QUERY_DIRECTORY. O teste
+confere o `\Device\BootDevice`, o `\SystemRoot\System32\ntdll.dll` aberto
+pelo I/O Manager (um arquivo do ntfs.sys com os bytes que o NTFS do kernel
+leu), a descarga das hives pelo ntfs.sys e, 75 s depois, nenhum comando ao
+driver ATA interno desde a entrega da controladora.
+
+O rename e o link num arquivo de file system abrem o diretório de destino
+como o IopOpenLinkOrRenameTarget do 19041 (`io/file/information.rs`): o
+acesso pelo IopGetBasicInformationFile, o IoCreateFileEx com
+IO_OPEN_TARGET_DIRECTORY (o Options do IoCreateFile vira o Flags do
+IRP_MJ_CREATE, como no IopParseDevice) e o FILE_OBJECT dele no
+Parameters.SetFile.FileObject, no IoSetInformation e no
+NtSetInformationFile. A abertura de usuário relativa a um arquivo de file
+system é o IopParseFile (`parse::open_related_file`: o VPB do arquivo
+relacionado e o FILE_OBJECT com RelatedFileObject).
 
 Os riscos conhecidos: o tempo de boot (cada leitura atravessa seis ou sete
 drivers e uma interrupção), o Cc e o ntfs.sys sob a carga da cadeia

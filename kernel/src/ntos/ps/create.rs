@@ -558,6 +558,18 @@ fn open_driver_image(path: &str, additional: u32) -> Option<Result<(Arc<DriverIm
     Some(Ok((Arc::new(DriverImage { nt_path: String::from(path), name, file_object, size }), access)))
 }
 
+/// Uma imagem de sistema num file system real (a ntdll do `\SystemRoot`
+/// depois da troca para o volume do ntfs.sys): a fonte do carregador e a
+/// das notificações sobre o arquivo aberto como o do executável, que a
+/// imagem retém. `None` para um nome fora de um volume com VPB.
+pub fn driver_image_sources(path: &str) -> Option<Result<(Arc<dyn ImageSource>, Arc<dyn FileSource>), u32>> {
+    Some(match open_driver_image(path, 0)? {
+        Ok((image, _)) => Ok((image.clone() as Arc<dyn ImageSource>, image as Arc<dyn FileSource>)),
+        Err(CreateFailure::FileOpen(status)) => Err(status),
+        Err(_) => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+    })
+}
+
 /// O acesso da abertura do executável (o IoCreateFileEx do
 /// NtCreateUserProcess, com FILE_SHARE_READ | FILE_SHARE_DELETE):
 /// SYNCHRONIZE | FILE_EXECUTE | AdditionalFileAccess; recusada com o acesso

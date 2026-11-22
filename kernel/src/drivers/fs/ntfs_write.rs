@@ -1522,6 +1522,12 @@ impl Ntfs {
     /// O estado do writer com o recurso do volume exclusivo: as leituras da
     /// operação e o commit não se misturam com leituras de outra CPU.
     fn with_writer<T>(&self, action: impl FnOnce(&mut Tx<'_>) -> Result<T, KernelError>) -> Result<T, KernelError> {
+        // `--volume-sistema=ntfs.sys`: depois de o atapi.sys assumir a
+        // controladora o disco é do ntfs.sys, e o NTFS do kernel (o papel do
+        // winload) só lê; uma escrita dele correria com as do ntfs.sys.
+        if crate::drivers::storage::ata_pio::handed_off() {
+            return Err(KernelError::with_status("NTFS do kernel so de leitura depois do atapi.sys", 0xC000_00A2));
+        }
         let _exclusive = self.resource().acquire_exclusive();
         let mut state = self.writer.lock();
         let mut tx = Tx { volume: self, state: &mut state };

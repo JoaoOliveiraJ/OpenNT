@@ -561,6 +561,38 @@ pub mod kernel_image_source {
         fn copy_to_physical(&self, _offset: u64, _address: u64, _length: u64) -> Option<Result<(), KernelError>> {
             None
         }
+        /// A decisão da CI de uma imagem do loader block, dada antes da
+        /// carga ([`preload_boot_images`]); `None` nas outras fontes, que a
+        /// CI valida na carga.
+        fn loader_validation(&self) -> Option<crate::ntos::mm::pe_loader::CodeIntegrity> {
+            None
+        }
+    }
+
+    /// Uma imagem do loader block (`--volume-sistema=ntfs.sys`): os bytes
+    /// lidos pelo NTFS do kernel antes de o atapi.sys assumir a controladora
+    /// e a decisão que a CI deu sobre o arquivo então.
+    pub struct BootImageSource {
+        name: String,
+        bytes: Arc<Vec<u8>>,
+        code_integrity: Option<crate::ntos::mm::pe_loader::CodeIntegrity>,
+    }
+
+    impl ImageSource for BootImageSource {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn size(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, KernelError> {
+            let start = (offset as usize).min(self.bytes.len());
+            let end = (offset.saturating_add(length) as usize).min(self.bytes.len());
+            Ok(self.bytes[start..end].to_vec())
+        }
+        fn loader_validation(&self) -> Option<crate::ntos::mm::pe_loader::CodeIntegrity> {
+            self.code_integrity
+        }
     }
 
     /// Imagem mantida em memória (arquivo do VFS ou bytes de teste).
@@ -615,14 +647,118 @@ pub mod kernel_image_source {
     /// Fonte de um caminho completo de driver: o disco em memória (bundle)
     /// primeiro, depois o volume NTFS. `None` = não encontrado.
     pub fn source_for_path(path: &str) -> Result<Option<Arc<dyn ImageSource>>, KernelError> {
-        if let Some(bytes) = memory_file_system::read_bytes(path) {
-            return Ok(Some(Arc::new(MemorySource { name: alloc::format!("\\FS{}", path.replace('/', "\\")), bytes })));
+        if let Some((found, bytes)) = bundled_image(path) {
+            return Ok(Some(Arc::new(MemorySource { name: alloc::format!("\\FS{}", found.replace('/', "\\")), bytes })));
+        }
+        if let Some(source) = boot_image(path) {
+            return Ok(Some(source));
+        }
+        if crate::drivers::fs::volume_files::system_volume_switched() {
+            return system_volume_source(path);
         }
         let Some(volume) = ntfs::mounted() else { return Ok(None) };
-        let Some(layout) = volume.file_layout(path)? else { return Ok(None) };
-        debug_print!("[ntoskrnl] {} via NTFS ({} bytes, streaming/DMA)", path, layout.size);
-        let source = NtfsSource { name: ntfs::nt_path(path), size: layout.size, has_runs: layout.runs.is_some(), path: alloc::string::String::from(path), volume };
-        Ok(Some(Arc::new(source)))
+        for candidate in volume_candidates(path) {
+            let Some(layout) = volume.file_layout(&candidate)? else { continue };
+            debug_print!("[ntoskrnl] {} via NTFS ({} bytes, streaming/DMA)", candidate, layout.size);
+            let source = NtfsSource { name: ntfs::nt_path(&candidate), size: layout.size, has_runs: layout.runs.is_some(), path: candidate, volume };
+            return Ok(Some(Arc::new(source)));
+        }
+        Ok(None)
+    }
+
+    /// A imagem do bundle (o VFS em memória, de nomes achatados
+    /// `/<arquivo>`, o papel das imagens que o winload carrega): pelo caminho
+    /// como veio ou, no leiaute real do volume
+    /// (`volume_files::real_layout`), pelo nome do arquivo do caminho da
+    /// instalação (`/Windows/System32/drivers/atapi.sys`).
+    fn bundled_image(path: &str) -> Option<(String, Vec<u8>)> {
+        if let Some(bytes) = memory_file_system::read_bytes(path) {
+            return Some((String::from(path), bytes));
+        }
+        if !crate::drivers::fs::volume_files::real_layout() {
+            return None;
+        }
+        let flat = alloc::format!("/{}", path.rsplit(['/', '\\']).next()?);
+        if flat.eq_ignore_ascii_case(path) {
+            return None;
+        }
+        memory_file_system::read_bytes(&flat).map(|bytes| (flat, bytes))
+    }
+
+    /// As imagens que o NTFS do kernel leu antes de o atapi.sys assumir a
+    /// controladora (`--volume-sistema=ntfs.sys`), o papel das que o winload
+    /// deixa na memória no loader block: pelo caminho do volume do kernel,
+    /// em minúsculas, com a decisão que a CI deu sobre o arquivo antes da
+    /// entrega (o winload valida os drivers de boot antes de carregá-los).
+    static BOOT_IMAGES: crate::rtl::SpinLock<alloc::collections::BTreeMap<String, (Arc<Vec<u8>>, Option<crate::ntos::mm::pe_loader::CodeIntegrity>)>> = crate::rtl::SpinLock::new(alloc::collections::BTreeMap::new());
+
+    /// Lê para a memória as imagens de `names` (`acpi.sys`, os nomes da raiz
+    /// achatada) ou de caminhos do volume, com os imports delas que também
+    /// estão no volume. Devolve quantas ficaram na memória.
+    pub fn preload_boot_images(names: &[&str]) -> usize {
+        let Some(volume) = ntfs::mounted() else { return 0 };
+        let mut pending: Vec<String> = names.iter().map(|name| if name.starts_with('/') { String::from(*name) } else { alloc::format!("/{}", name.to_lowercase()) }).collect();
+        let mut loaded = 0;
+        while let Some(path) = pending.pop() {
+            for candidate in volume_candidates(&path) {
+                let key = candidate.to_lowercase();
+                if BOOT_IMAGES.lock().contains_key(&key) {
+                    break;
+                }
+                let Ok(Some(layout)) = volume.file_layout(&candidate) else { continue };
+                let Ok(Some(bytes)) = volume.read_bytes(&candidate) else { continue };
+                // A CI decide pelo arquivo do volume, como na carga.
+                let file: Arc<dyn ImageSource> = Arc::new(NtfsSource { name: ntfs::nt_path(&candidate), size: layout.size, has_runs: layout.runs.is_some(), path: candidate.clone(), volume: volume.clone() });
+                let code_integrity = crate::ntos::mm::pe_loader::validate_early(&file, &crate::ntos::mm::pe_loader::LoadOptions::default());
+                drop(file);
+                let source = MemorySource { name: candidate.clone(), bytes };
+                for import in crate::ntos::mm::pe_loader::import_names(&source).unwrap_or_default() {
+                    // O ntoskrnl e a HAL são do próprio kernel.
+                    let import = import.to_lowercase();
+                    if import != "ntoskrnl.exe" && import != "hal.dll" {
+                        pending.push(alloc::format!("/{import}"));
+                    }
+                }
+                BOOT_IMAGES.lock().insert(key, (Arc::new(source.bytes), code_integrity));
+                loaded += 1;
+                break;
+            }
+        }
+        loaded
+    }
+
+    fn boot_image(path: &str) -> Option<Arc<dyn ImageSource>> {
+        let images = BOOT_IMAGES.lock();
+        let (path, (bytes, code_integrity)) = volume_candidates(path).into_iter().find_map(|candidate| images.get(&candidate.to_lowercase()).map(|entry| (candidate, entry.clone())))?;
+        Some(Arc::new(BootImageSource { name: ntfs::nt_path(&path), bytes, code_integrity }))
+    }
+
+    /// Depois da troca do `\SystemRoot`: a imagem lida pelo I/O Manager no
+    /// volume do sistema (o MmLoadSystemImage abrindo o arquivo pelo nome).
+    fn system_volume_source(path: &str) -> Result<Option<Arc<dyn ImageSource>>, KernelError> {
+        for candidate in volume_candidates(path) {
+            if let Some(bytes) = crate::drivers::fs::volume_files::read_system_file(&candidate)? {
+                let name = crate::drivers::fs::volume_files::system_root_name(&candidate).unwrap_or(candidate);
+                debug_print!("[ntoskrnl] {} pelo I/O Manager ({} bytes)", name, bytes.len());
+                return Ok(Some(Arc::new(MemorySource { name, bytes })));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Onde procurar no volume do kernel uma imagem pedida pela raiz
+    /// achatada (`/acpi.sys`): no leiaute real
+    /// (`volume_files::real_layout`), o System32\drivers e o System32 da
+    /// instalação; nos outros casos, o caminho como veio.
+    fn volume_candidates(path: &str) -> Vec<String> {
+        let name = path.strip_prefix('/').filter(|name| !name.is_empty() && !name.contains('/'));
+        match name {
+            Some(name) if crate::drivers::fs::volume_files::real_layout() => {
+                use crate::drivers::fs::volume_files::system32_path;
+                alloc::vec![system32_path(&alloc::format!("drivers/{name}")), system32_path(name)]
+            }
+            _ => alloc::vec![String::from(path)],
+        }
     }
 
     pub fn source_for(name: &str) -> Result<Arc<dyn ImageSource>, KernelError> {
@@ -635,9 +771,19 @@ pub mod kernel_image_source {
         if let Some(bytes) = memory_file_system::read_bytes(&path) {
             return Ok(Arc::new(MemorySource { name: alloc::format!("\\FS\\{name}"), bytes }));
         }
+        if let Some(source) = boot_image(&path) {
+            return Ok(source);
+        }
+        if crate::drivers::fs::volume_files::system_volume_switched() {
+            return system_volume_source(&path)?.ok_or_else(|| KernelError::new(alloc::format!("kernel image not found: {name}")));
+        }
         let volume = ntfs::mounted().ok_or_else(|| KernelError::new(alloc::format!("kernel image not found: {name}")))?;
-        let layout = volume.file_layout(&path)?.ok_or_else(|| KernelError::new(alloc::format!("kernel image not found: {name}")))?;
-        Ok(Arc::new(NtfsSource { name: ntfs::nt_path(&path), size: layout.size, has_runs: layout.runs.is_some(), path, volume }))
+        for candidate in volume_candidates(&path) {
+            if let Some(layout) = volume.file_layout(&candidate)? {
+                return Ok(Arc::new(NtfsSource { name: ntfs::nt_path(&candidate), size: layout.size, has_runs: layout.runs.is_some(), path: candidate, volume }));
+            }
+        }
+        Err(KernelError::new(alloc::format!("kernel image not found: {name}")))
     }
 }
 

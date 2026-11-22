@@ -237,6 +237,42 @@ pub fn file_entry_and_initialize(source: &dyn ImageSource) -> Result<(u64, bool)
     Ok((entry_rva, exports.exports.contains_key("DllInitialize")))
 }
 
+/// Os nomes dos módulos que a imagem importa (o API set já resolvido para o
+/// módulo que o hospeda), sem resolver nada: o que o winload lê para trazer
+/// as dependências dos drivers de boot.
+pub fn import_names(source: &dyn ImageSource) -> Result<Vec<String>, KernelError> {
+    let metadata = MetadataReader::new(source);
+    let pe_header = metadata.read_u32(0x3C)? as u64;
+    let coff = pe_header + 4;
+    let section_count = metadata.read_u16(coff + 2)? as u64;
+    let optional = coff + 20;
+    let section_table = optional + metadata.read_u16(coff + 16)? as u64;
+    let size_of_headers = metadata.read_u32(optional + 60)? as u64;
+    let import_rva = metadata.read_u32(optional + 120)? as u64;
+    let mut names = Vec::new();
+    if import_rva == 0 {
+        return Ok(names);
+    }
+    let importer = String::from(source.name());
+    let mut descriptor = section_file_offset(&metadata, section_table, section_count, size_of_headers, import_rva)?;
+    loop {
+        let ilt_rva = metadata.read_u32(descriptor)?;
+        let name_rva = metadata.read_u32(descriptor + 12)? as u64;
+        let iat_rva = metadata.read_u32(descriptor + 16)?;
+        if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
+            break;
+        }
+        let dll = read_c_string(&metadata, section_file_offset(&metadata, section_table, section_count, size_of_headers, name_rva)?)?;
+        let lower = dll.to_lowercase();
+        let host = if lower.starts_with("api-") || lower.starts_with("ext-") { crate::ntos::mm::sysload::kernel_api_set::resolve(&dll, &importer)? } else { Some(dll) };
+        if let Some(host) = host {
+            names.push(host);
+        }
+        descriptor += 20;
+    }
+    Ok(names)
+}
+
 static RESOLVERS: SpinLock<Vec<Resolver>> = SpinLock::new(Vec::new());
 /// (base física, quantidade) da tabela de trampolins.
 static THUNK_TABLE: SpinLock<Option<(u64, u32)>> = SpinLock::new(None);
@@ -534,9 +570,30 @@ pub fn load_user(bytes: Vec<u8>, options: &LoadOptions) -> Result<PeImage, Kerne
     load_from_source(Arc::new(MemorySource { name: String::new(), bytes }), &options)
 }
 
+/// A decisão da CI sobre uma imagem antes de a carregar, com a fonte solta
+/// logo depois: o papel do winload, que valida os drivers de boot antes de
+/// deixá-los no loader block (`sysload::kernel_image_source::preload_boot_images`).
+/// `None` sem a CI instalada ou numa falha da validação.
+pub fn validate_early(source: &Arc<dyn ImageSource>, options: &LoadOptions) -> Option<CodeIntegrity> {
+    let validator = (*VALIDATOR.lock())?;
+    let validation = validator(source, options).ok()?;
+    let result = validation.result;
+    (validation.release)();
+    Some(result)
+}
+
 /// O arquivo validado pela CI fica retido durante a cópia e os imports; a
-/// recusa acontece antes de qualquer imagem executável ser publicada.
+/// recusa acontece antes de qualquer imagem executável ser publicada. Uma
+/// imagem do loader block traz a decisão que a CI deu antes
+/// ([`ImageSource::loader_validation`]), como o NT não valida de novo os
+/// drivers de boot que o winload carregou.
 pub fn load_from_source(source: Arc<dyn ImageSource>, options: &LoadOptions) -> Result<PeImage, KernelError> {
+    if let Some(code_integrity) = source.loader_validation().filter(|_| !options.user_space) {
+        if code_integrity.status & 0x8000_0000 != 0 {
+            return Err(KernelError::with_status("CI rejected kernel image", code_integrity.status));
+        }
+        return load_prepared(source, options, Some(code_integrity));
+    }
     let validator = *VALIDATOR.lock();
     let Some(validator) = validator.filter(|_| !options.user_space) else { return load_prepared(source, options, None) };
     let validation = validator(&source, options)?;

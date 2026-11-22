@@ -203,10 +203,53 @@ pub fn system_volume_boot_device_wait() {
     crate::ntos::io::pnp_notify::release_volume_interface_changes();
     match boot {
         Some(path) => {
-            let _ = assign_system_volume_letter(&path);
+            if assign_system_volume_letter(&path).is_some() {
+                reassign_system_root(&path);
+            }
         }
         None => debug_print!("[mountmgr] FALHOU nenhum volume na particao de boot do disco {}", SYSTEM_DISK),
     }
+}
+
+/// As imagens que sobem com a árvore de dispositivos no
+/// `--volume-sistema=ntfs.sys` e o ntfs.sys, com os imports delas: os drivers
+/// de boot que o winload deixa na memória no loader block.
+const BOOT_DRIVER_IMAGES: &[&str] = &[
+    "acpi.sys", "pci.sys", "msisadrv.sys", "wdfldr.sys", "wdf01000.sys", "partmgr.sys", "volmgr.sys", "volume.sys", "ntfs.sys", "fltmgr.sys", "clfs.sys", "clipsp.sys", "ksecdd.sys", "i8042prt.sys", "kbdclass.sys", "mouclass.sys", "mountmgr.sys", "atapi.sys", "ataport.sys", "pciidex.sys", "intelide.sys", "disk.sys", "classpnp.sys",
+];
+
+/// `--volume-sistema=ntfs.sys`: o papel do winload antes de o atapi.sys
+/// assumir a controladora. O NTFS do kernel lê para a memória as tabelas NLS
+/// (o upcase, o lowercase e as páginas de código ANSI e OEM) e as imagens dos
+/// drivers de boot ([`BOOT_DRIVER_IMAGES`]); depois disso o driver ATA
+/// interno não recebe mais nada.
+pub fn load_boot_files() {
+    let nls = [
+        crate::ntos::rtl::unicode_case::upcase_char(u16::from(b'a')).is_ok(),
+        crate::ntos::rtl::unicode_case::downcase_char(u16::from(b'A')).is_ok(),
+        crate::ntos::rtl::ansi_code_page::current().is_ok(),
+        crate::ntos::rtl::oem_code_page::oem().is_ok(),
+    ];
+    let images = crate::ntos::mm::sysload::kernel_image_source::preload_boot_images(BOOT_DRIVER_IMAGES);
+    debug_print!("[boot] volume do sistema: tabelas NLS na memoria {:?}, {} imagens de drivers de boot na memoria", nls, images);
+}
+
+/// O IopReassignSystemRoot do `--volume-sistema=ntfs.sys`: o
+/// `\Device\BootDevice`, por onde o `\SystemRoot` passa, aponta para o
+/// volume da partição de boot, e daí em diante todo arquivo do sistema é
+/// aberto pelo I/O Manager e servido pelo ntfs.sys; os nomes NT do sistema
+/// deixam de traduzir para o volume do kernel
+/// (`volume_files::switch_system_volume`) e as hives da máquina reabrem os
+/// arquivos pelo volume novo (`cm::hive_list::reopen_system_root_hives`).
+fn reassign_system_root(device_path: &str) {
+    object_manager::unlink(BOOT_DEVICE);
+    if let Err(error) = object_manager::create_symlink(BOOT_DEVICE, device_path) {
+        debug_print!("[io] FALHOU IopReassignSystemRoot: {} para {}: {}", BOOT_DEVICE, device_path, error);
+        return;
+    }
+    crate::drivers::fs::volume_files::switch_system_volume();
+    let hives = crate::ntos::cm::hive_list::reopen_system_root_hives();
+    debug_print!("[io] IopReassignSystemRoot: {} -> {}, {} hives reabertas no volume novo", BOOT_DEVICE, device_path, hives);
 }
 
 /// `--volume-sistema=ntfs.sys`: o IopAssignBootDriveLetter do volume de

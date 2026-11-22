@@ -16,6 +16,14 @@
 //!
 //! A serial mostra `[system-volume]` em cada passo e `SYSTEM_VOLUME_NTFS_OK`
 //! no fim.
+//!
+//! O marco S1 (`SYSTEM_VOLUME_SWITCHED_OK`) vem depois: o
+//! IopReassignSystemRoot apontou o `\Device\BootDevice` para o volume da
+//! partição; o `\SystemRoot\System32\ntdll.dll` aberto pelo I/O Manager é
+//! um arquivo do ntfs.sys, com os mesmos bytes; a descarga das hives da
+//! máquina (reabertas no volume novo) vai pelo ntfs.sys; e, 75 s depois (o
+//! escritor preguiçoso do Registro já rodou), o driver ATA interno não
+//! recebeu nenhum comando desde que o atapi.sys assumiu a controladora.
 
 use alloc::format;
 use alloc::string::String;
@@ -23,6 +31,7 @@ use alloc::vec::Vec;
 
 use crate::ntos::inc::field::{Field, NtStruct};
 use crate::ntos::inc::types::{DeviceObject, IoStatusBlock};
+use crate::ntos::io::file::system_file::SystemFile;
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::ob::object_manager;
 use crate::ntos::test::file_system_mount::object_attributes;
@@ -85,6 +94,54 @@ pub fn check() {
         Ok(()) => debug_print!("SYSTEM_VOLUME_NTFS_OK"),
         Err(error) => debug_print!("[system-volume] {}", error),
     }
+    match switched(&reference) {
+        Ok(()) => {
+            debug_print!("[system-volume] \\SystemRoot no volume do sistema; {} comandos ao driver ATA interno depois do atapi.sys ate aqui", crate::drivers::storage::ata_pio::commands_after_handoff());
+            crate::ntos::ps::scheduler::spawn("volume-sistema", final_check());
+        }
+        Err(error) => debug_print!("[system-volume] S1: {}", error),
+    }
+}
+
+/// O marco S1 depois da troca do `\SystemRoot`.
+fn switched(reference: &[(&'static str, Vec<u8>)]) -> Result<(), String> {
+    let volume = boot_volume().ok_or_else(|| String::from("nenhum volume da pilha real com DO_SYSTEM_BOOT_PARTITION"))?;
+    let boot_device = object_manager::lookup("\\Device\\BootDevice").is_some_and(|link| object_manager::lookup(&volume) == Some(link));
+    if !boot_device || !crate::drivers::fs::volume_files::system_volume_switched() {
+        return Err(format!("\\Device\\BootDevice nao leva a {volume} (troca {})", crate::drivers::fs::volume_files::system_volume_switched()));
+    }
+    let (name, expected) = reference.first().ok_or_else(|| String::from("sem referencia"))?;
+    let path = format!("\\SystemRoot\\System32\\{}", name.replace('/', "\\"));
+    let file = SystemFile::open_read(&path).map_err(|status| format!("{path}: {status:#x}"))?;
+    if crate::ntos::io::file::zw::file_backing(file.file_object()).is_some() {
+        return Err(format!("{path} ainda e do volume do kernel"));
+    }
+    let bytes = file.read_at(0, LENGTH).map_err(|status| format!("{path}: leitura {status:#x}"))?;
+    drop(file);
+    if bytes != *expected {
+        return Err(format!("{path} pelo I/O Manager difere do NTFS do kernel ({} bytes)", bytes.len()));
+    }
+    debug_print!("[system-volume] {}: {} bytes pelo ntfs.sys iguais aos do NTFS do kernel", path, bytes.len());
+    let flushed = crate::ntos::cm::hive_list::flush_all();
+    if flushed != 0 {
+        return Err(format!("descarga das hives pelo volume novo: {flushed:#x}"));
+    }
+    debug_print!("[system-volume] hives da maquina descarregadas pelo ntfs.sys");
+    Ok(())
+}
+
+/// O fim do S1, 75 s depois: nenhum comando ao driver ATA interno desde a
+/// entrega da controladora ao atapi.sys.
+async fn final_check() -> u32 {
+    let deadline = crate::ntos::ke::clock::uptime_ms() + 75_000;
+    while crate::ntos::ke::clock::uptime_ms() < deadline {
+        crate::ntos::ps::scheduler::yield_now().await;
+    }
+    match crate::drivers::storage::ata_pio::commands_after_handoff() {
+        0 => debug_print!("SYSTEM_VOLUME_SWITCHED_OK"),
+        commands => debug_print!("[system-volume] S1: {} comandos ao driver ATA interno depois do atapi.sys", commands),
+    }
+    0
 }
 
 /// O volume da partição de boot: o `\Device\HarddiskVolumeN` marcado.

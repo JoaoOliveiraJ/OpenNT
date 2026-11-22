@@ -147,6 +147,15 @@ fn device_path_of(path: &str) -> Option<String> {
             device = Some(alloc::format!("{volume}{}", rest.get(2..).unwrap_or("")));
         }
     }
+    // Um nome por um link cujo destino já traz parte do caminho (o
+    // `\SystemRoot`, que leva a `\Device\BootDevice\Windows`): o nome
+    // expandido quando ele chega a um dispositivo fora do volume do kernel
+    // (depois da troca do `\SystemRoot` para o volume do ntfs.sys).
+    if device.is_none() && path.starts_with('\\') {
+        device = crate::ntos::io::parse::device_name(path).filter(|expanded| {
+            expanded != path && expanded.to_lowercase().starts_with("\\device\\") && !on_boot_volume_device(expanded) && crate::ntos::io::parse::kernel_volume_device(expanded).is_none()
+        });
+    }
     device
 }
 
@@ -235,6 +244,8 @@ fn open_file(handle_pointer: u64, attributes: u64, iosb: u64, disposition: u32, 
 
 /// FILE_OPEN_BY_FILE_ID.
 const FILE_OPEN_BY_FILE_ID: u32 = 0x2000;
+/// FILE_OBJECT.Flags de uma abertura direta do dispositivo.
+const FO_DIRECT_DEVICE_OPEN: u32 = 0x800;
 
 /// FILE_OPEN_BY_FILE_ID relativo a um handle do volume de boot (o
 /// OpenFileById do Win32: RootDirectory é qualquer arquivo do volume e o
@@ -299,6 +310,13 @@ fn user_ea(request: &OpenRequest) -> Result<(u64, u32), u32> {
 /// abertura de kernel de `io/file/zw.rs`).
 fn open_relative_to_device(handle_pointer: u64, root: &state::UserHandle, name: &str, object_flags: u32, iosb: u64, disposition: u32, request: &OpenRequest) -> Result<u32, KernelError> {
     let Some(device) = root.downcast::<UserDevice>() else { return Ok(fail_iosb(iosb, STATUS_INVALID_HANDLE)) };
+    // A raiz é um arquivo de file system (o diretório que o smss abre para
+    // o KnownDlls): o FILE_OBJECT novo é do mesmo volume, pelo VPB dela.
+    // SAFETY: o FILE_OBJECT vivo do handle da raiz.
+    let root_file = unsafe { crate::ntos::inc::types::FileObject::at(device.file_object) };
+    if root_file.vpb.get() != 0 && root_file.flags.get() & FO_DIRECT_DEVICE_OPEN == 0 {
+        return open_file_system_file(handle_pointer, iosb, device.device_path.clone(), (0, device.file_object), name, disposition, request, object_flags);
+    }
     let (ea_buffer, ea_length) = match user_ea(request) {
         Ok(ea) => ea,
         Err(status) => return Ok(fail_iosb(iosb, status)),
@@ -448,6 +466,14 @@ pub fn device_file_handle(name: &str, access: u32, share: u32, options: u32) -> 
 /// dispositivo, cuja descrição retém a referência do CREATE.
 #[allow(clippy::too_many_arguments)]
 fn open_mounted_file(handle_pointer: u64, iosb: u64, device_path: String, device: u64, remaining: &str, disposition: u32, request: &OpenRequest, object_flags: u32) -> Result<u32, KernelError> {
+    open_file_system_file(handle_pointer, iosb, device_path, (device, 0), remaining, disposition, request, object_flags)
+}
+
+/// [`open_mounted_file`] pelo dispositivo do volume (`target.0`) ou, com
+/// `target.1`, relativa a um arquivo do mesmo file system (o IopParseFile).
+#[allow(clippy::too_many_arguments)]
+fn open_file_system_file(handle_pointer: u64, iosb: u64, device_path: String, target: (u64, u64), remaining: &str, disposition: u32, request: &OpenRequest, object_flags: u32) -> Result<u32, KernelError> {
+    let (device, related) = target;
     if let Err(status) = file_io::validate_create(disposition, request) {
         return Ok(fail_iosb(iosb, status));
     }
@@ -460,7 +486,8 @@ fn open_mounted_file(handle_pointer: u64, iosb: u64, device_path: String, device
         case_insensitive: object_flags & 0x40 != 0,
         driver_context: crate::ntos::io::parse::DriverCreateContext::default(),
     };
-    let opened = match crate::ntos::io::parse::open_file(device, remaining, &file_request) {
+    let opened = if related != 0 { crate::ntos::io::parse::open_related_file(related, remaining, &file_request) } else { crate::ntos::io::parse::open_file(device, remaining, &file_request) };
+    let opened = match opened {
         Ok(opened) => opened,
         Err(error) if error.status != 0 => return Ok(fail_iosb(iosb, error.status)),
         Err(error) => return Err(error),

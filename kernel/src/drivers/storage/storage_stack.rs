@@ -171,6 +171,9 @@ pub fn before_tree() -> Option<Vec<u8>> {
     // depois, pelo NTFS do kernel (`test/system_volume`).
     if crate::ntos::init::boot_config::system_volume_ntfs() {
         crate::ntos::test::system_volume::capture_reference();
+        // O que o winload deixaria na memória: as tabelas NLS e os drivers
+        // que sobem com a árvore.
+        crate::ntos::io::boot_partition::load_boot_files();
     }
     // Daqui em diante o atapi.sys programa a controladora: as escritas dele
     // não passam pelo driver interno, o cache de metadados se esvazia e o

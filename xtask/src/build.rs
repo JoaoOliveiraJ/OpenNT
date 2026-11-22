@@ -292,6 +292,14 @@ impl BuildOptions {
     /// NTFS) e só diferem no bloco de opções de carga. O Debug lista todas as
     /// opções, inclusive as que vierem a existir: uma opção nova divide as
     /// imagens até entrar em [`Self::without_load_options`].
+    /// O volume NTFS com os arquivos nos caminhos reais da instalação
+    /// (`windows_binaries::real_layout`), não na raiz achatada: hoje só o do
+    /// `--volume-sistema=ntfs.sys`. O kernel acha o leiaute pela mesma opção
+    /// de carga (`volume_files::real_layout`).
+    pub fn real_layout(&self) -> bool {
+        !self.system_volume.is_empty()
+    }
+
     pub fn image_key(&self) -> String {
         format!("{:?}", self.without_load_options())
     }
@@ -477,6 +485,9 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // os do boot comum.
     let staged_programs = if options.console_process || options.kernel_test_scope == "e-process" { "smss" } else { options.initial_process.as_str() };
     let staged = crate::windows_binaries::ntfs_files(&root, &kernel_pe, staged_programs)?;
+    // O volume do sistema no ntfs.sys guarda cada arquivo no caminho real da
+    // instalação (o ntfs.sys não conhece os aliases do NTFS do kernel).
+    let staged = if options.real_layout() { crate::windows_binaries::real_layout(staged) } else { staged };
     // A origem daqui de cada arquivo, para o descritor de segurança dele
     // (`host_security::system_nodes`); um arquivo gerado não tem origem.
     let mut origins: Vec<(String, Option<std::path::PathBuf>)> = staged.iter().map(|file| (file.path.clone(), file.host.clone())).collect();

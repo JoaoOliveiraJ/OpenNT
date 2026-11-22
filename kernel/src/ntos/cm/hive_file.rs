@@ -36,6 +36,7 @@ use crate::ntos::ps::user::file_objects::UserFile;
 use crate::ntos::ps::user::state as user_state;
 use crate::ntos::inc::field::Field;
 use crate::ntos::inc::types::{IoStatusBlock, NtStruct, ObjectAttributes, UnicodeString};
+use crate::ntos::io::file::system_file::SystemFile;
 use crate::ntos::io::file::{query as query_file, zw as zw_files};
 use crate::ntos::mm::guest_memory as guest;
 use crate::ntos::rtl::guest_strings;
@@ -150,8 +151,19 @@ unsafe impl NtStruct for CreateRequest {}
 pub struct HiveFile {
     /// Handle de kernel próprio (0 quando o handle é do chamador).
     handle: u64,
-    volume: &'static dyn FileSystem,
-    path: String,
+    backing: Backing,
+}
+
+/// Onde a E/S de um arquivo de hive vai.
+#[derive(Clone)]
+enum Backing {
+    /// Arquivo do volume do kernel: a E/S vai ao FileSystem dele.
+    Volume { volume: &'static dyn FileSystem, path: String },
+    /// Arquivo de um file system real (o ntfs.sys do volume do sistema, com
+    /// `--volume-sistema=ntfs.sys`): o ZwReadFile, o ZwWriteFile e o
+    /// ZwSetInformationFile no handle de kernel (`io/file/system_file`), com
+    /// o nome do FILE_OBJECT como identidade.
+    Driver { handle: u64, name: String },
 }
 
 impl HiveFile {
@@ -202,14 +214,16 @@ impl HiveFile {
     }
 
     /// Os atributos que a criação do arquivo grava (o FileAttributes do
-    /// ZwCreateFile), somados aos que o volume deu ao arquivo novo.
+    /// ZwCreateFile), somados aos que o volume deu ao arquivo novo. Só no
+    /// volume do kernel: num file system real eles vêm da própria criação.
     fn add_attributes(&self, attributes: u32) {
+        let Backing::Volume { volume, path } = &self.backing else { return };
         let Some(ntfs) = crate::drivers::fs::volume_files::fixed_volume() else { return };
-        if !crate::drivers::fs::volume::same(self.volume, ntfs as &'static dyn FileSystem) {
+        if !crate::drivers::fs::volume::same(*volume, ntfs as &'static dyn FileSystem) {
             return;
         }
-        let current = self.volume.stat(&self.path).map_or(0, |stat| stat.attributes);
-        let _ = ntfs.set_basic(&self.path, None, current | attributes);
+        let current = volume.stat(path).map_or(0, |stat| stat.attributes);
+        let _ = ntfs.set_basic(path, None, current | attributes);
     }
 
     /// ZwCreateFile do nome NT num handle de kernel.
@@ -238,11 +252,16 @@ impl HiveFile {
             Ok(status) => return Err(status),
             Err(error) => return Err(if error.status != 0 { error.status } else { STATUS_REGISTRY_IO_FAILED }),
         }
-        let Some((volume, path)) = zw_files::file_backing(zw_files::file_object_of_handle(handle)) else {
-            zw_files::close_file_entry(handle as u32);
-            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        let file_object = zw_files::file_object_of_handle(handle);
+        let backing = match zw_files::file_backing(file_object) {
+            Some((volume, path)) => Backing::Volume { volume, path },
+            None if crate::ntos::ob::objects::file::is_file(file_object) => Backing::Driver { handle, name: String::from(name) },
+            None => {
+                zw_files::close_file_entry(handle as u32);
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
         };
-        Ok((HiveFile { handle, volume, path }, information))
+        Ok((HiveFile { handle, backing }, information))
     }
 
     /// O arquivo de um handle do chamador (IoConvertFileHandleToKernelHandle
@@ -256,7 +275,7 @@ impl HiveFile {
                         return Err(STATUS_ACCESS_DENIED);
                     }
                     let volume: &'static dyn FileSystem = volume_files::fixed_volume().ok_or(STATUS_OBJECT_TYPE_MISMATCH)?;
-                    return Ok(HiveFile { handle: 0, volume, path: file.file.volume_path() });
+                    return Ok(HiveFile { handle: 0, backing: Backing::Volume { volume, path: file.file.volume_path() } });
                 }
             }
         }
@@ -265,18 +284,22 @@ impl HiveFile {
             return Err(STATUS_ACCESS_DENIED);
         }
         let (volume, path) = zw_files::file_backing(selected.pointer).ok_or(STATUS_OBJECT_TYPE_MISMATCH)?;
-        Ok(HiveFile { handle: 0, volume, path })
+        Ok(HiveFile { handle: 0, backing: Backing::Volume { volume, path } })
     }
 
     /// O mesmo arquivo sem a posse do handle (para a E/S fora das travas).
     pub fn alias(&self) -> HiveFile {
-        HiveFile { handle: 0, volume: self.volume, path: self.path.clone() }
+        HiveFile { handle: 0, backing: self.backing.clone() }
     }
 
-    /// O caminho do arquivo no volume (a identidade do arquivo, como o
-    /// CmpIsThisSameFile compara os FILE_OBJECTs).
+    /// A identidade do arquivo, como o CmpIsThisSameFile compara os
+    /// FILE_OBJECTs: o caminho no volume do kernel, ou o nome aberto num file
+    /// system real.
     pub fn volume_path(&self) -> String {
-        self.path.clone()
+        match &self.backing {
+            Backing::Volume { path, .. } => path.clone(),
+            Backing::Driver { name, .. } => name.clone(),
+        }
     }
 
     /// O nome do FILE_OBJECT do handle próprio (o ObjectNameInformation do
@@ -300,40 +323,50 @@ impl HiveFile {
         // SAFETY: OBJECT_NAME_INFORMATION montado no bloco próprio.
         let name = (status == 0).then(|| guest_strings::read_unicode_string(unsafe { UnicodeString::at(buffer) }.address())).filter(|name| !name.is_empty());
         guest::free_bytes(buffer);
-        name.or_else(|| crate::drivers::fs::native_file_name::from_volume(self.volume, &self.path))
+        name.or_else(|| match &self.backing {
+            Backing::Volume { volume, path } => crate::drivers::fs::native_file_name::from_volume(*volume, path),
+            Backing::Driver { .. } => None,
+        })
     }
 
     pub fn size(&self) -> u64 {
-        self.volume.size(&self.path).unwrap_or(0)
+        match &self.backing {
+            Backing::Volume { volume, path } => volume.size(path).unwrap_or(0),
+            Backing::Driver { handle, .. } => SystemFile::borrowed(*handle).size().unwrap_or(0),
+        }
     }
 
     /// CmpFileRead de `length` bytes a partir de `offset`.
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>, u32> {
-        match self.volume.read_range(&self.path, offset, length) {
-            Ok(Some(bytes)) if bytes.len() as u64 == length => Ok(bytes),
+        let bytes = match &self.backing {
+            Backing::Volume { volume, path } => volume.read_range(path, offset, length).ok().flatten(),
+            Backing::Driver { handle, .. } => SystemFile::borrowed(*handle).read_at(offset, length).ok(),
+        };
+        match bytes {
+            Some(bytes) if bytes.len() as u64 == length => Ok(bytes),
             _ => Err(STATUS_REGISTRY_IO_FAILED),
         }
     }
 
     /// CmpFileRead do arquivo inteiro.
     pub fn read(&self) -> Result<Vec<u8>, u32> {
-        let size = self.size();
-        match self.volume.read_range(&self.path, 0, size) {
-            Ok(Some(bytes)) if bytes.len() as u64 == size => Ok(bytes),
-            _ => Err(STATUS_REGISTRY_IO_FAILED),
-        }
+        self.read_range(0, self.size())
     }
 
     /// CmpFileWrite.
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), u32> {
-        match self.volume.write_at(&self.path, offset, data) {
+        let written = match &self.backing {
+            Backing::Volume { volume, path } => volume.write_at(path, offset, data).map_err(|error| alloc::format!("{error}")),
+            Backing::Driver { handle, .. } => SystemFile::borrowed(*handle).write_at(offset, data).map_err(|status| alloc::format!("{status:#x}")),
+        };
+        match written {
             Ok(written) if written == data.len() as u64 => Ok(()),
             Ok(written) => {
-                debug_print!("[cm] escrita de {} em {:#x}: {} de {} bytes", self.path, offset, written, data.len());
+                debug_print!("[cm] escrita de {} em {:#x}: {} de {} bytes", self.volume_path(), offset, written, data.len());
                 Err(STATUS_REGISTRY_IO_FAILED)
             }
             Err(error) => {
-                debug_print!("[cm] escrita de {} em {:#x} ({} bytes): {}", self.path, offset, data.len(), error);
+                debug_print!("[cm] escrita de {} em {:#x} ({} bytes): {}", self.volume_path(), offset, data.len(), error);
                 Err(STATUS_REGISTRY_IO_FAILED)
             }
         }
@@ -344,13 +377,26 @@ impl HiveFile {
         if self.size() == size {
             return Ok(());
         }
-        match self.volume.resize(&self.path, size) {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(error)) => {
-                debug_print!("[cm] tamanho de {} para {:#x}: {}", self.path, size, error);
-                Err(STATUS_REGISTRY_IO_FAILED)
-            }
-            None => Err(STATUS_REGISTRY_IO_FAILED),
+        let resized = match &self.backing {
+            Backing::Volume { volume, path } => match volume.resize(path, size) {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(error)) => Err(alloc::format!("{error}")),
+                None => Err(String::from("sem redimensionamento")),
+            },
+            Backing::Driver { handle, .. } => SystemFile::borrowed(*handle).set_size(size).map_err(|status| alloc::format!("{status:#x}")),
+        };
+        resized.map_err(|error| {
+            debug_print!("[cm] tamanho de {} para {:#x}: {}", self.volume_path(), size, error);
+            STATUS_REGISTRY_IO_FAILED
+        })
+    }
+
+    /// CmpFileFlush: num file system real, o ZwFlushBuffersFile; no volume
+    /// do kernel as escritas já foram ao disco.
+    pub fn flush(&self) -> Result<(), u32> {
+        match &self.backing {
+            Backing::Volume { .. } => Ok(()),
+            Backing::Driver { handle, .. } => SystemFile::borrowed(*handle).flush(),
         }
     }
 }

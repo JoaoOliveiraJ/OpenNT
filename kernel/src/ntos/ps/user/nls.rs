@@ -8,10 +8,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::sections::{self, CreateOptions, MapRequest, Section, SectionFile};
+use super::sections::{self, CreateOptions, MapRequest, Section};
 use super::state::{self, probe_user_write};
 use crate::ntos::cm::registry;
-use crate::drivers::fs::volume_files;
 use crate::ntos::mm::memory_map::USER_ADDRESS_LIMIT;
 use crate::rtl::{KernelError, SpinLock};
 use crate::ntos::mm::guest_memory as guest;
@@ -55,9 +54,12 @@ fn map_locale_table() -> Result<Result<(u64, u64), u32>, KernelError> {
     let section = match cached {
         Some(section) => section,
         None => {
-            let Some(file) = volume_files::lookup_volume_file("C:\\Windows\\System32\\locale.nls").filter(|file| !file.directory()) else { return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)) };
-            let size = file.size();
-            let backing: Arc<dyn SectionFile> = file;
+            let backing = match crate::ntos::mm::section::file::system_section_file("C:\\Windows\\System32\\locale.nls") {
+                Ok(Some(file)) => file,
+                Ok(None) => return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)),
+                Err(status) => return Ok(Err(status)),
+            };
+            let size = backing.size();
             let created = match sections::create(CreateOptions { size, file: Some(backing), page_protect: PAGE_READONLY, attributes: SEC_COMMIT, permanent: true, ..CreateOptions::default() })? {
                 Ok(section) => section,
                 Err(status) => return Ok(Err(status)),
@@ -157,9 +159,12 @@ fn nls_section(section_type: u32, data: u32) -> Result<Result<Arc<Section>, u32>
         Ok(path) => path,
         Err(status) => return Ok(Err(status)),
     };
-    let Some(file) = volume_files::lookup_volume_file(&path).filter(|file| !file.directory()) else { return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)) };
-    let size = file.size();
-    let backing: Arc<dyn SectionFile> = file;
+    let backing = match crate::ntos::mm::section::file::system_section_file(&path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)),
+        Err(status) => return Ok(Err(status)),
+    };
+    let size = backing.size();
     Ok(match sections::create(CreateOptions { size, file: Some(backing), page_protect: PAGE_READONLY, attributes: SEC_COMMIT, name: Some(name.clone()), permanent: true, ..CreateOptions::default() })? {
         Ok(section) => {
             crate::debug_print!("[nls] {} criada de {}", name, path);
