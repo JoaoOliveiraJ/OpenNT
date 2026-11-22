@@ -4859,6 +4859,13 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   bits no volume não há WoW64. O `\KnownDlls32` da ntdll de 32 bits é do
   smss.exe na cadeia real; só no boot sem o smss (o `wow64-console`) o
   kernel o cria e o provisiona de SysWOW64, como já faz com o `\KnownDlls`.
+  O smss cria as KnownDlls de CPU do WoW64 (o `_wow64cpu`) com SEC_IMAGE |
+  0x100000: a seção guarda o ImageFlags.BaseBelow4gb e as vistas dela ficam
+  abaixo de 4 GB (`mm/section/create.rs`, `mm/section/image_view.rs`). O
+  wow64cpu troca o GS base do usuário ao voltar ao código de 32 bits; como
+  no KiPageFault, a falta do código de 64 bits com o GS base diferente da
+  TEB repete a instrução, também num callback de modo usuário (o intervalo
+  aninhado guarda os segmentos do usuário).
   Testes: `ntos/test/wow64.rs` (a GDT, o modo de compatibilidade no anel 3
   com a preempção, o PE32, o limite de VA, a área de CPU, as opções de
   execução, o `\KnownDlls32` só sem o smss, a junção do contexto x86 e o
@@ -5913,6 +5920,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   atributos de 32 bits viram a forma nativa numa cópia no processo de quem
   chama e voltam à forma de 32 bits na saída (no 19041 a conversão é dos
   AlpcpProbeAndCaptureMessageHeader e AlpcpCapture/Expose*Attribute32).
+  Com os bits 31 e 30 juntos a mensagem do processo x86 já está na forma
+  nativa e os dois bits não pedem mais nada.
   O autoteste `kwait` recusa uma conexão com e sem a 0x80000. O
   NtQueryInformationPort só confere o handle e zera o ReturnLength.
   NtReplyWaitReplyPort e as mensagens com PORT_DATA_INFORMATION
