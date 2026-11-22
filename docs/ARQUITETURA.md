@@ -7267,7 +7267,11 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
       `wait-serial` as últimas 20 da COM1. Dentro de laços e tratadores, a
       falha diz onde a execução estava (`dentro de: for-each da linha 30
       ($t = 0x...) > on-break ...`).
-    - Variáveis: `save <nome> <expr>` (número) e `set <nome> <texto>`. Da
+    - Variáveis: `$cpu` é o processador da parada (vale também nas
+      condições dos breakpoints: `/w "$cpu == 1"` só para num AP). O
+      test-boot define `smp` (quantos processadores), `processadores` (a
+      lista `1,2,...` do `cpulist` com todos parados) e `user_smp` (1 com
+      `--user-smp`). `save <nome> <expr>` (número) e `set <nome> <texto>`. Da
       saída do comando anterior: `save-word <nome> <texto> <coluna>
       [ocorrência]` (o número na coluna da linha que tem o texto; colunas a
       partir de 0, negativas contam do fim), `save-text` (o mesmo, a palavra

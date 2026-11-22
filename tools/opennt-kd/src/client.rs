@@ -575,6 +575,11 @@ impl Client {
         self.stopped = true;
         self.registers = None;
         self.stops += 1;
+        // `$cpu`: o processador da parada, nas condições dos breakpoints
+        // (`/w "$cpu == 1"` só para num AP) e nos roteiros.
+        if let Some(processor) = stop.processor() {
+            self.variables.insert(String::from("cpu"), processor);
+        }
         // Os registradores adiantados da resposta dispensam o `g` (CS e RIP
         // abaixo, as condições dos breakpoints).
         self.expedited = expedited_general(&stop);

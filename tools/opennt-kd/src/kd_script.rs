@@ -63,6 +63,10 @@ pub struct ScriptOptions {
     /// Para onde as linhas vão no lugar da saída padrão (uma janela, um
     /// servidor MCP pelo stdio): cada linha impressa, com o fim de linha.
     pub capture: Option<Arc<Mutex<String>>>,
+    /// Variáveis definidas antes da primeira linha (o test-boot passa as da
+    /// máquina: `smp`, `processadores` e `user_smp`); um texto que é número
+    /// também vale como `$nome` nas expressões.
+    pub variables: Vec<(String, String)>,
 }
 
 /// O anfitrião de um roteiro fora do test-boot (a janela do `opennt-dbg`,
@@ -691,6 +695,12 @@ impl<'c, 'h> Runner<'c, 'h> {
                     runner.emit(&format!("[kd-script] transcricao em {}", path.display()));
                 }
                 Err(error) => runner.emit(&format!("[kd-script] sem a transcricao {}: {error}", path.display())),
+            }
+        }
+        for (name, text) in &options.variables {
+            runner.variables.insert(name.clone(), text.clone());
+            if let Some(value) = parse_number(text) {
+                runner.client.variables.insert(name.clone(), value);
             }
         }
         runner

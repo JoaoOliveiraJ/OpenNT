@@ -680,8 +680,18 @@ fn script_session(arguments: &Arguments, options: &BuildOptions, machine: &Machi
     let text = std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
     let elf = debug::kernel_elf(images);
     let address = format!("127.0.0.1:{port}");
-    let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(log)), capture: None };
+    let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(log)), capture: None, variables: script_variables(machine, options) };
     Ok(Some(Box::new(move |serial| debug::run_script(&address, &root, &elf, &text, Some(serial), &script_options))))
+}
+
+/// As variáveis da máquina para os roteiros do kd: `smp` (quantos
+/// processadores), `processadores` (as threads do protocolo de todos eles,
+/// `1,2,...`, a lista do `cpulist` com todos parados) e `user_smp` (1 com
+/// `--user-smp`: os APs despacham threads de usuário e têm a IDT inteira).
+fn script_variables(machine: &MachineOptions, options: &BuildOptions) -> Vec<(String, String)> {
+    let count = machine.smp.max(1);
+    let threads: Vec<String> = (1..=count).map(|thread| thread.to_string()).collect();
+    vec![(String::from("smp"), count.to_string()), (String::from("processadores"), threads.join(",")), (String::from("user_smp"), (options.user_smp as u32).to_string())]
 }
 
 /// `cargo xtask debug`: conecta a um QEMU aberto (`--connect`), roda um
@@ -695,7 +705,7 @@ fn debug_command(arguments: Arguments) -> Result<(), String> {
         return match &arguments.script {
             Some(script) => {
                 let text = std::fs::read_to_string(script).map_err(|error| format!("{script}: {error}"))?;
-                let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(&build_dir.join("serial.log"))), capture: None };
+                let script_options = opennt_kd::kd_script::ScriptOptions { name: script.clone(), transcript: Some(debug::transcript_path(&build_dir.join("serial.log"))), capture: None, variables: script_variables(&arguments.machine, &arguments.build) };
                 debug::run_script(address, &root, &elf, &text, None, &script_options)
             }
             None => debug::interactive(address, &root, &elf, arguments.machine.monitor_port.map(|port| format!("127.0.0.1:{port}")), None),

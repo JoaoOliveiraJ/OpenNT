@@ -409,14 +409,16 @@ fn memory_breakpoint_by_page() {
 /// O roteiro: as linhas do breakpoint de log saem na transcrição à medida
 /// que chegam (antes da parada), o tratador da parada roda e deixa a
 /// máquina parada, as condições, os laços pelas linhas, processos e
-/// threads, as variáveis tiradas da saída e as esperas pela COM1 com prazo.
+/// threads, as variáveis tiradas da saída, as da máquina (as opções do
+/// roteiro), o `$cpu` da parada e as esperas pela COM1 com prazo.
 #[test]
 fn script_log_lines_handlers_conditions_and_loops() {
-    // Dois acertos do breakpoint de log (RAX 1 e 2) e a parada no chamador.
+    // Dois acertos do breakpoint de log (RAX 1 e 2) e a parada no chamador,
+    // esta no segundo processador.
     let stops = vec![
         Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 1, load: None },
         Stop { rip: CODE + 0x10, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 2, load: None },
-        Stop { rip: CODE + 0x2000, rsp: STACK, packet: "T05thread:1;swbreak:;", rax: 7, load: None },
+        Stop { rip: CODE + 0x2000, rsp: STACK, packet: "T05thread:2;swbreak:;", rax: 7, load: None },
     ];
     let (address, log) = start(stops);
     let mut client = connect(&address);
@@ -437,6 +439,11 @@ expect-stop breakpoint #1
 expect-eq $contador 1
 expect-eq $hits 1
 expect-eq @rax 7
+expect-eq $cpu 1
+expect-eq $smp 2
+if "${processadores}" != "1,2" {
+    fail processadores: ${processadores}
+}
 if console-has rax=2 {
     echo o log chegou
 } else {
@@ -473,7 +480,8 @@ repeat 3 volta {
 }
 expect-eq $ultima 2
 "#;
-    let options = ScriptOptions { name: "teste.txt".into(), transcript: Some(transcript.clone()), capture: None };
+    let variables = vec![(String::from("smp"), String::from("2")), (String::from("processadores"), String::from("1,2"))];
+    let options = ScriptOptions { name: "teste.txt".into(), transcript: Some(transcript.clone()), capture: None, variables };
     let result = client.run_script_with(script, &options);
     let text = std::fs::read_to_string(&transcript).unwrap_or_default();
     let _ = std::fs::remove_file(&transcript);
