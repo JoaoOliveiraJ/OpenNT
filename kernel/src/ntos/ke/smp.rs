@@ -699,6 +699,14 @@ pub fn send_reschedule(number: usize) {
     crate::ntos::ps::dispatch_perf::RESCHEDULE_IPIS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// O identificador do APIC do processador de número `number`, sem a trava
+/// do estado (o depurador do kernel congela os outros processadores com a
+/// máquina parada, e o código interrompido pode ser o dono dela); `None`
+/// fora dos online.
+pub fn processor_apic_id(number: usize) -> Option<u32> {
+    PROCESSOR_APIC.get(number).map(|cell| cell.load(core::sync::atomic::Ordering::Acquire)).filter(|&identifier| identifier != u32::MAX)
+}
+
 /// Daqui em diante os APs armados despacham threads de usuário no laço
 /// ocioso ([`processor_loop`]), junto com o BSP.
 pub fn enable_user_dispatch() {

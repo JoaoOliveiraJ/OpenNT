@@ -466,12 +466,32 @@ irq_nmi:
 irq_nmi_kernel:
     # Do anel 0 com o GS do usuario: uma fronteira (logo depois do SYSCALL,
     # antes do SWAPGS e da troca de pilha; ou entre o SWAPGS e o IRETQ da
-    # volta). A pilha pode ser a do usuario: a parada fica para o proximo
-    # tique do relogio no anel 0, sem tocar no GS.
+    # volta). A pilha pode ser a do usuario: sem tocar no GS nem crescer a
+    # pilha, o congelamento pedido por outro dono prende o BSP ali mesmo
+    # (`opennt_kd_freeze_boundary`, com o quadro completo), e o pedido de
+    # parada fica para o proximo tique do relogio no anel 0.
     mov ecx, 0xC0000101
     rdmsr
     test edx, edx
     js irq_nmi_kernel_gs
+    cmp byte ptr [rip + opennt_kd_freeze_active], 0
+    je irq_nmi_defer
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rdi, rsp
+    call opennt_kd_freeze_boundary
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    jmp irq_nmi_return
+irq_nmi_defer:
     lock or byte ptr [rip + opennt_kd_tick_request], 1
     jmp irq_nmi_return
 irq_nmi_kernel_gs:

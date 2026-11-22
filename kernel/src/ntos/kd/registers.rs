@@ -15,9 +15,10 @@
 //! | 59-80  | ymm0h-ymm15h, dr0-dr3, dr6, dr7 (só por `p`, `kd::extended_state`) | 16/8 |
 //!
 //! Os inteiros vêm do quadro de trap (`TrapFrame`, com o quadro do hardware
-//! depois do vetor); x87 e SSE da área FXSAVE64 da entrada do depurador (um
-//! processador congelado pela NMI não tem essa área: os registradores ficam
-//! indisponíveis, `xx` no pacote). O FXSAVE64 guarda FIP e FDP de 64 bits:
+//! depois do vetor); x87 e SSE da área FXSAVE64 da entrada do depurador ou
+//! da NMI de congelamento (um processador preso numa fronteira com o GS do
+//! usuário não tem essa área: os registradores ficam indisponíveis, `xx` no
+//! pacote). O FXSAVE64 guarda FIP e FDP de 64 bits:
 //! fioff/fooff recebem os 32 bits baixos e fiseg/foseg os altos, e a
 //! palavra de tags completa sai da abreviada pela classe de cada registrador.
 

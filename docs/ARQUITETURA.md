@@ -3612,17 +3612,41 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     pilha, ou entre o `swapgs` e o `iretq`) fica para o próximo tique do
     relógio no anel 0. `monitor nmi` mostra os contadores e o estado de cada
     processador.
-  - Congelamento: o processador da parada congela os outros com NMI
-    pelo código de IPI do Ke (`smp::send_nmi_to_application_processors`; a
-    NMI dos APs prende o processador em `rs_kd_freeze_processor` com o
-    quadro publicado) e só os degela ao continuar. KPRCB.IpiFrozen leva o
-    estado com os valores do 19041: 4 no dono, 5 no alvo pendente, 2 no
-    preso, 3 no degelo, 0 rodando. Os APs não têm `int 3` (a IDT deles só
-    tem o portão da NMI, e um `int 3` ali era falta tripla): um bugcheck, um
-    pânico, um DbgBreakPointWithStatus ou o 0x03 lido num DbgPrint de um AP
-    viram um pedido ao BSP por NMI, e a parada mostra o AP (`thread:` dele;
-    a thread 0 do protocolo é o processador da parada). O passo é recusado
-    nessa parada.
+  - Congelamento, como o KdpReport e o KeFreezeExecution do 19041: o
+    processador que recebe a exceção relata a parada e vira o dono (o
+    KiFreezeOwner), em qualquer CPU. O KiSendFreeze (0x51e0c0): cada outro
+    processador online, o BSP inclusive quando o dono é um AP, passa de 0 a
+    5 (TARGET_PENDING) no KPRCB.IpiFrozen e recebe a NMI (o ICR do LAPIC,
+    sem as travas do Ke). Na NMI, o KiCheckForFreezeExecution: o alvo
+    publica o quadro completo e a área FXSAVE64, passa a 2 (TARGET_FROZEN) e
+    fica preso (o KiFreezeTargetExecution, 0x51dda0) até o dono gravar 3
+    (TARGET_THAW) no degelo; então descarta o TLB, carrega os registradores
+    de depuração do kernel com os comparadores do depurador (o
+    KiRestoreProcessorControlState: um breakpoint de hardware armado numa
+    parada vale em todos os processadores) e volta a 0. O dono fica em 4
+    (FREEZE_OWNER) e espera cada alvo chegar a 2, com o prazo do
+    KiFreezeTimeout, mandando a NMI de novo a cada 20 ms a quem ainda está
+    pendente: sob o WHPX a NMI pode se perder, como no shootdown de TLB do
+    Ke. As NMIs repetidas que chegam depois do degelo são contadas e
+    consumidas (no BSP, a NMI comum é o pedido de parada do host). Os APs
+    pegam a NMI pelo portão próprio (`ap_tlb_nmi`): do anel 3 (um AP com
+    threads de usuário), o `swapgs` e o banco de depuração da fronteira
+    comum, e a parada mostra o quadro do usuário; no anel 0 com o GS do
+    usuário (a fronteira do SYSCALL, ainda na pilha do usuário, ou a do
+    IRETQ), o alvo, AP ou BSP, fica preso ali mesmo, no asm
+    (`opennt_kd_freeze_boundary`): a KPCR pelo IA32_KERNEL_GS_BASE, o quadro
+    completo e o CR3 publicados, sem tocar no GS nem crescer a pilha (os
+    registradores x87/SSE ficam indisponíveis). Um processador que já se
+    prendeu sozinho na entrada (outro dono chegou antes) conta como
+    congelado e, no degelo, repete a exceção. Os APs com o anel 3 armado
+    (`--user-smp`) têm a IDT inteira (a cópia da do BSP) e param sozinhos:
+    breakpoint de software ou de hardware do kernel, passo, falta, bugcheck,
+    pânico, o `int 3` fixo e as paradas do anel 3 das threads deles. Os
+    outros APs só têm os portões 0-2 (um `int 3` ali era falta tripla): um
+    bugcheck, um pânico, um DbgBreakPointWithStatus ou o 0x03 lido num
+    DbgPrint de um deles viram um pedido ao BSP por NMI, e a parada mostra o
+    AP (`thread:` dele; a thread 0 do protocolo é o processador da parada).
+    O passo é recusado nessa parada.
   - Passo: roda só no processador da parada, com o IF mascarado durante a
     instrução. O IF original volta depois, e um `pushfq` passo a passo grava
     o IF original. Continuar de um breakpoint dá antes um passo com o byte

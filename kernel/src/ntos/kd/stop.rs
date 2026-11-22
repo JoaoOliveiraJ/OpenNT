@@ -21,12 +21,19 @@
 //! - a exceção de kernel sem tratador (`rs_kernel_exception`), antes do
 //!   diagnóstico fatal.
 //!
-//! O primeiro processador a entrar vira o dono da parada; os outros recebem
-//! NMI pelo código de IPI do Ke (`smp::send_nmi_to_application_processors`)
-//! e ficam presos (`park`) até o degelo, com o quadro publicado para o host
-//! ler e alterar. O estado de cada processador fica também em
-//! KPRCB.IpiFrozen, com os valores do 19041: 4 no dono, 5 no alvo enquanto a
-//! NMI não chega, 2 no preso, 3 no degelo e 0 rodando. Um passo (`s`)
+//! O processador que recebe a exceção relata a parada (o KdpReport do
+//! 19041): vira o dono (o KiFreezeOwner do KeFreezeExecution) e congela os
+//! outros, o BSP inclusive quando o dono é um AP. O congelamento segue o
+//! KiSendFreeze (0x51e0c0) e o KiFreezeTargetExecution (0x51dda0): cada
+//! processador online passa de 0 a 5 (TARGET_PENDING) no KPRCB.IpiFrozen e
+//! recebe a NMI; na NMI, o alvo que se acha pendente
+//! (KiCheckForFreezeExecution) publica o quadro, passa a 2 (TARGET_FROZEN) e
+//! fica preso (`park`) até o dono gravar 3 (TARGET_THAW) no degelo; então
+//! carrega os registradores de depuração do kernel (o
+//! KiRestoreProcessorControlState) e volta a 0. O dono fica em 4
+//! (FREEZE_OWNER) e espera cada alvo chegar a 2, mandando a NMI de novo a
+//! quem ainda está pendente (sob o WHPX a NMI pode se perder, como no
+//! shootdown de TLB do Ke), com prazo (o KiFreezeTimeout). Um passo (`s`)
 //! mantém os outros congelados e roda só a instrução do dono, com as
 //! interrupções mascaradas durante o passo (o IF original volta depois, e um
 //! `pushfq` passo a passo grava o IF original na pilha). Continuar de um
@@ -39,9 +46,13 @@
 //! HalHandleNMI (o relatório do WHEA e o bugcheck), a NMI com o depurador
 //! ligado é a parada pedida pelo host, e continuar volta ao código
 //! interrompido. A NMI que chega no anel 0 com o GS do usuário (numa
-//! fronteira de SYSCALL ou de IRETQ) é atendida no próximo tique do relógio
-//! no anel 0. Os APs não têm `int 3` (a IDT deles só tem o portão da NMI):
-//! um bugcheck, um pânico ou um pedido de parada num AP é pedido ao BSP por
+//! fronteira de SYSCALL ou de IRETQ, talvez ainda na pilha do usuário):
+//! com o congelamento pedido, o alvo fica preso ali mesmo, no asm
+//! (`opennt_kd_freeze_boundary`), sem tocar no GS nem crescer a pilha;
+//! sem ele, o pedido de parada é atendido no próximo tique do relógio no
+//! anel 0. Os APs com o anel 3 armado (`--user-smp`) têm a IDT inteira e
+//! param sozinhos como o BSP; os outros APs só têm o portão da NMI: um
+//! bugcheck, um pânico ou um pedido de parada neles é pedido ao BSP por
 //! NMI, e a parada mostra o AP (`thread:` do AP).
 //!
 //! Com a máquina num estado ruim, a sessão sobrevive: um comando do host que
@@ -67,7 +78,7 @@ use super::registers::View;
 use super::{memory, recovery, session, trace, transport, user_debug};
 use crate::hal::amd64::irqstubs::TrapFrame;
 use crate::hal::{cpu, lapic};
-use crate::ntos::inc::types::{Kpcr, NtStruct};
+use crate::ntos::inc::types::{Kprcb, NtStruct};
 use crate::ntos::ke::{clock, pcr, smp};
 use crate::ntos::mm::memory_map::MAX_CPUS;
 
@@ -89,6 +100,12 @@ const RESUME_FLAG: u64 = 1 << 16;
 const DR6_SINGLE_STEP: u64 = 1 << 14;
 /// Prazo do congelamento e do degelo (o do shootdown de TLB do Ke).
 const FREEZE_TIMEOUT_MS: u64 = 5_000;
+/// Intervalo entre as NMIs de congelamento repetidas a um alvo que ainda
+/// está pendente (o NMI_RESEND_MS do shootdown de TLB do Ke).
+const FREEZE_RESEND_MS: u64 = 20;
+/// Por quanto tempo depois do degelo uma NMI repetida pode chegar ao alvo
+/// que já tinha ficado preso pela primeira.
+const STRAY_GRACE_MS: u64 = 1_000;
 /// IA32_KERNEL_GS_BASE: com a KPCR no GS, o GS do usuário (a TEB).
 const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
@@ -109,6 +126,19 @@ static POLL_PORT: AtomicU16 = AtomicU16::new(0);
 /// Congelamento pedido: a NMI prende o processador (lido pela NMI dos APs).
 #[export_name = "opennt_kd_freeze_active"]
 static FREEZE: AtomicU8 = AtomicU8::new(0);
+/// O quadro completo e o CR3 de cada processador preso numa fronteira com o
+/// GS do usuário (`opennt_kd_freeze_boundary`; 0 = nenhum).
+#[export_name = "opennt_kd_boundary_frame"]
+static BOUNDARY_FRAME: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+#[export_name = "opennt_kd_boundary_cr3"]
+static BOUNDARY_CR3: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// NMIs de congelamento repetidas a cada alvo no congelamento corrente.
+static RESENT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+/// NMIs de congelamento que ainda podem chegar a cada processador depois do
+/// degelo (as repetidas, e a de um alvo que não chegou a ficar preso) e o
+/// prazo delas: a que chega é consumida, e não vira pedido de parada.
+static STRAY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+static STRAY_UNTIL: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Entrada pedida para o próximo tique do relógio no anel 0, mesmo sem byte
 /// na porta (lido e gravado pelos trampolins): `TICK_NMI` é a NMI que chegou
 /// numa fronteira com o GS do usuário, `TICK_TEST` um autoteste.
@@ -302,6 +332,60 @@ opennt_kd_load_break:
 "#
 );
 
+global_asm!(
+    r#"
+.pushsection .text.kd, "ax", @progbits
+# O KiFreezeTargetExecution numa fronteira: a NMI chegou no anel 0 com o GS
+# do usuario (logo depois do SYSCALL, antes da troca de pilha, ou entre o
+# SWAPGS e o IRETQ da volta), talvez ainda na pilha do usuario. Sem tocar no
+# GS nem crescer a pilha: a KPCR vem do IA32_KERNEL_GS_BASE, o quadro
+# completo (RDI, o TrapFrame na pilha interrompida) e o CR3 ficam publicados,
+# e o processador pendente (KPRCB.IpiFrozen 5) passa a 2 e espera aqui ate o
+# degelo. Usa RAX, RCX, RDX e RSI (ja salvos no quadro).
+.global opennt_kd_freeze_boundary
+opennt_kd_freeze_boundary:
+    mov ecx, 0xC0000102
+    rdmsr
+    shl rdx, 32
+    or rdx, rax
+    # Sem KPCR no KernelGSbase (um AP que ainda parte): nada a fazer.
+    test rdx, rdx
+    jns opennt_kd_boundary_done
+    mov esi, dword ptr [rdx + {number}]
+    cmp esi, {max_cpus}
+    jae opennt_kd_boundary_done
+    lea rax, [rip + opennt_kd_boundary_cr3]
+    mov rcx, cr3
+    mov qword ptr [rax + rsi*8], rcx
+    lea rax, [rip + opennt_kd_boundary_frame]
+    mov qword ptr [rax + rsi*8], rdi
+    mov eax, {pending}
+    mov ecx, {target}
+    lock cmpxchg dword ptr [rdx + {ipi_frozen}], ecx
+    jne opennt_kd_boundary_unpublish
+opennt_kd_boundary_wait:
+    pause
+    cmp byte ptr [rip + opennt_kd_freeze_active], 0
+    je opennt_kd_boundary_thawed
+    cmp dword ptr [rdx + {ipi_frozen}], {target}
+    je opennt_kd_boundary_wait
+opennt_kd_boundary_thawed:
+    mov dword ptr [rdx + {ipi_frozen}], {running}
+opennt_kd_boundary_unpublish:
+    lea rax, [rip + opennt_kd_boundary_frame]
+    mov qword ptr [rax + rsi*8], 0
+opennt_kd_boundary_done:
+    ret
+.popsection
+"#,
+    number = const crate::ntos::ke::pcr::layout::PRCB_NUMBER,
+    ipi_frozen = const crate::ntos::ke::pcr::layout::PRCB_IPI_FROZEN,
+    max_cpus = const MAX_CPUS,
+    pending = const FROZEN_PENDING,
+    target = const FROZEN_TARGET,
+    running = const FROZEN_RUNNING,
+);
+
 extern "sysv64" {
     fn opennt_kd_break_in();
     fn opennt_kd_bugcheck_break();
@@ -359,15 +443,32 @@ pub fn owner() -> Option<usize> {
     }
 }
 
-/// Processadores visíveis ao host: o dono e os congelados.
+/// Processadores visíveis ao host: o dono e os congelados (também os presos
+/// numa fronteira).
 pub fn processor_stopped(number: usize) -> bool {
-    number < MAX_CPUS && (owner() == Some(number) || PROCESSORS[number].frozen.load(Ordering::Acquire))
+    number < MAX_CPUS && (owner() == Some(number) || PROCESSORS[number].frozen.load(Ordering::Acquire) || boundary_frame(number) != 0)
+}
+
+/// O quadro do processador preso numa fronteira com o GS do usuário (0 se
+/// não está).
+fn boundary_frame(number: usize) -> u64 {
+    let frame = BOUNDARY_FRAME[number].load(Ordering::Acquire);
+    if frame != 0 && ipi_frozen_of(number) == FROZEN_TARGET {
+        frame
+    } else {
+        0
+    }
 }
 
 /// Estado de registradores do processador `number`, se parado.
 pub fn view(number: usize) -> Option<View> {
     if !processor_stopped(number) {
         return None;
+    }
+    if owner() != Some(number) && !PROCESSORS[number].frozen.load(Ordering::Acquire) {
+        // Preso numa fronteira: o quadro completo, sem a área FXSAVE; o GS
+        // ainda é o do usuário, e os seletores, os dele.
+        return Some(View { frame: boundary_frame(number), error_code: false, fx: 0, segments: [0x2B, 0x2B, 0x53, 0x2B], fs_base: 0, gs_base: 0 });
     }
     let record = &PROCESSORS[number];
     let segments = record.segments.load(Ordering::Relaxed);
@@ -384,23 +485,71 @@ pub fn view(number: usize) -> Option<View> {
 /// CR3 do processador parado `number` (o espaço de endereços dos acessos
 /// do host).
 pub fn address_space(number: usize) -> u64 {
-    PROCESSORS[number.min(MAX_CPUS - 1)].cr3.load(Ordering::Relaxed)
+    let number = number.min(MAX_CPUS - 1);
+    if boundary_only(number) {
+        return BOUNDARY_CR3[number].load(Ordering::Acquire);
+    }
+    PROCESSORS[number].cr3.load(Ordering::Relaxed)
 }
 
-/// IRQL (CR8) do processador parado `number`.
+/// O processador está preso só numa fronteira (sem o estado da `capture`).
+fn boundary_only(number: usize) -> bool {
+    owner() != Some(number) && !PROCESSORS[number].frozen.load(Ordering::Acquire) && boundary_frame(number) != 0
+}
+
+/// IRQL (CR8) do processador parado `number` (numa fronteira de serviço,
+/// PASSIVE_LEVEL).
 pub fn processor_irql(number: usize) -> u8 {
-    PROCESSORS[number.min(MAX_CPUS - 1)].irql.load(Ordering::Relaxed)
+    let number = number.min(MAX_CPUS - 1);
+    if boundary_only(number) {
+        return 0;
+    }
+    PROCESSORS[number].irql.load(Ordering::Relaxed)
 }
 
 /// KPCR do processador parado `number`.
 pub fn processor_control_region(number: usize) -> u64 {
-    PROCESSORS[number.min(MAX_CPUS - 1)].pcr.load(Ordering::Relaxed)
+    let number = number.min(MAX_CPUS - 1);
+    match PROCESSORS[number].pcr.load(Ordering::Relaxed) {
+        0 if boundary_only(number) => kpcr_of(number),
+        address => address,
+    }
+}
+
+/// O processador `number` está online (o BSP sempre; os APs pelo número
+/// que o Ke deu a cada um, sem trava).
+fn online(number: usize) -> bool {
+    number == 0 || (number < MAX_CPUS && smp::processor_apic_id(number).is_some())
+}
+
+/// A KPCR do processador online `number` (a reserva fixa dele), ou 0.
+fn kpcr_of(number: usize) -> u64 {
+    if !online(number) || pcr::get_pcr_address() == 0 {
+        return 0;
+    }
+    pcr::prcb_address(number as u32) - pcr::layout::PRCB
+}
+
+/// A KPRCB do processador online `number`.
+fn prcb_of(number: usize) -> Option<&'static Kprcb> {
+    if !online(number) || pcr::get_pcr_address() == 0 {
+        return None;
+    }
+    // SAFETY: a KPRCB de cada processador online fica mapeada por toda a
+    // vida do sistema.
+    Some(unsafe { Kprcb::at(pcr::prcb_address(number as u32)) })
+}
+
+/// KPRCB.IpiFrozen do processador `number` (0 fora dos online).
+fn ipi_frozen_of(number: usize) -> u32 {
+    prcb_of(number).map_or(FROZEN_RUNNING, |prcb| prcb.ipi_frozen.atomic().load(Ordering::Acquire))
 }
 
 /// Algum processador parado tinha trava do kernel (SpinLock ou
 /// SharedLock): consultas que usam as estruturas do Rust não podem rodar.
 pub fn locks_held() -> bool {
-    (0..MAX_CPUS).any(|number| processor_stopped(number) && PROCESSORS[number].locks.load(Ordering::Relaxed) != 0)
+    // Numa fronteira de serviço nenhuma trava está tomada.
+    (0..MAX_CPUS).any(|number| processor_stopped(number) && !boundary_only(number) && PROCESSORS[number].locks.load(Ordering::Relaxed) != 0)
 }
 
 /// Motivo da última parada: sinal, classe, dado (endereço vigiado) e
@@ -481,79 +630,194 @@ fn publish_user_segments(number: usize, user_gs_base: u64) {
 /// KPRCB.IpiFrozen do processador corrente.
 fn set_own_ipi_frozen(value: u32) {
     if pcr::get_pcr_address() != 0 {
-        pcr::current().prcb.ipi_frozen.set(value);
+        pcr::current().prcb.ipi_frozen.atomic().store(value, Ordering::Release);
     }
 }
 
-/// KPRCB.IpiFrozen de outro processador, pela KPCR que ele publicou na
-/// última vez que ficou preso (antes disso, nada a gravar).
-fn set_ipi_frozen_of(number: usize, value: u32) {
-    let address = PROCESSORS[number].pcr.load(Ordering::Relaxed);
-    if address != 0 {
-        // SAFETY: a KPCR de cada CPU fica mapeada por toda a vida do sistema.
-        unsafe { Kpcr::at(address) }.prcb.ipi_frozen.set(value);
+fn own_ipi_frozen() -> u32 {
+    if pcr::get_pcr_address() == 0 {
+        return FROZEN_RUNNING;
     }
+    pcr::current().prcb.ipi_frozen.atomic().load(Ordering::Acquire)
 }
 
-/// Prende o processador corrente até o degelo (KiFreezeTargetExecution).
+/// O KiFreezeTargetExecution: o processador corrente publica o quadro,
+/// passa a TARGET_FROZEN e fica preso até o degelo (TARGET_THAW, gravado
+/// pelo dono, ou o fim de um congelamento que não o viu chegar). No degelo
+/// o TLB sai (as PTEs mudaram na parada: breakpoint de memória) e os
+/// registradores de depuração voltam com os comparadores do depurador (o
+/// KiRestoreProcessorControlState carrega o KernelDr0-7 da
+/// KPRCB.ProcessorState de cada processador): um breakpoint de hardware
+/// armado numa parada vale em todos os processadores com a IDT inteira. Do
+/// anel 3, os trampolins já trocaram o banco de depuração pelo do kernel e
+/// o devolvem depois, com o do kernel guardado.
 fn park(number: usize, frame: u64, fx: u64, error_code: bool) {
+    // Uma vigia de dados não dispara dentro da prisão.
+    breakpoints::disarm_processor();
     capture(number, frame, fx, error_code);
+    // A NMI que chegou no código do usuário: os seletores e o GS dele (no
+    // KernelGSbase enquanto a KPCR está no GS).
+    if (View { frame, error_code, ..View::default() }).cs() & 3 == 3 {
+        publish_user_segments(number, cpu::read_msr(MSR_KERNEL_GS_BASE));
+    }
     set_own_ipi_frozen(FROZEN_TARGET);
     PROCESSORS[number].frozen.store(true, Ordering::Release);
-    while FREEZE.load(Ordering::Acquire) != 0 {
+    while own_ipi_frozen() == FROZEN_TARGET && FREEZE.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
-    // As PTEs mudaram na parada (breakpoint de memória): o TLB sai.
     super::page_breakpoints::after_thaw();
+    // Um AP sem a IDT inteira não tem o portão do #DB: os comparadores
+    // ficam desligados nele (um disparo ali seria falta tripla).
+    if has_debug_vectors() {
+        breakpoints::load_into_processor();
+    }
     set_own_ipi_frozen(FROZEN_RUNNING);
     PROCESSORS[number].frozen.store(false, Ordering::Release);
 }
 
-/// Congela os outros processadores (KeFreezeExecution): NMI a cada AP
-/// online e espera de cada um preso.
+/// O KiCheckForFreezeExecution da NMI (e do tique do relógio): com o
+/// congelamento pedido por outro dono, o processador fica preso (um que já
+/// estava preso, por conta própria na entrada, só volta à prisão). Sem
+/// congelamento, uma NMI repetida de um congelamento que já acabou é
+/// consumida. Devolve se a NMI era do congelamento.
+fn check_for_freeze(number: usize, frame: u64, fx: u64) -> bool {
+    let me = number as u32 + 1;
+    if FREEZE.load(Ordering::Acquire) != 0 {
+        if OWNER.load(Ordering::Acquire) == me {
+            return false;
+        }
+        if !PROCESSORS[number].frozen.load(Ordering::Acquire) {
+            park(number, frame, fx, false);
+        }
+        return true;
+    }
+    if consume_stray(number) {
+        NMI_IGNORED.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Uma NMI de congelamento que chegou depois do degelo (a repetida a um
+/// alvo que já estava preso, ou a de um alvo que não chegou a tempo),
+/// dentro do prazo dela.
+fn consume_stray(number: usize) -> bool {
+    let cell = &STRAY[number];
+    let mut current = cell.load(Ordering::Acquire);
+    while current != 0 {
+        match cell.compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                if clock::uptime_ms() < STRAY_UNTIL[number].load(Ordering::Acquire) {
+                    return true;
+                }
+                cell.store(0, Ordering::Release);
+                return false;
+            }
+            Err(value) => current = value,
+        }
+    }
+    false
+}
+
+/// A NMI de congelamento ao processador `number`.
+fn send_freeze_nmi(number: usize) {
+    let target = match smp::processor_apic_id(number) {
+        Some(identifier) => identifier,
+        None if number == 0 => BSP_APIC_ID.load(Ordering::Acquire),
+        None => return,
+    };
+    if target <= 0xFF {
+        send_nmi_to(target);
+    }
+}
+
+/// Os alvos de um congelamento pedido por `number`: cada outro processador
+/// online. Sem o depurador ligado (o KeBugCheckEx sem host), a NMI do BSP
+/// não vai ao congelamento: só os APs são alvos.
+fn freeze_targets(number: usize) -> u32 {
+    (0..MAX_CPUS).filter(|&other| other != number && online(other) && (other != 0 || active())).fold(0, |mask, other| mask | 1 << other)
+}
+
+/// O KeFreezeExecution: o processador corrente é o dono (FREEZE_OWNER) e
+/// congela os outros. O KiSendFreeze: cada alvo passa de RUNNING a
+/// TARGET_PENDING no KPRCB.IpiFrozen (o que já se prendeu sozinho na
+/// entrada, em TARGET_FROZEN, conta como congelado) e recebe a NMI. A espera
+/// vai até cada alvo chegar a TARGET_FROZEN, com prazo (o KiFreezeTimeout);
+/// a quem ainda está pendente a NMI vai de novo a cada FREEZE_RESEND_MS.
 fn freeze_others(number: usize) {
     if FREEZE.swap(1, Ordering::AcqRel) != 0 {
         return;
     }
-    // KiSendFreeze: os alvos conhecidos ficam pendentes até a NMI chegar (o
-    // BSP não é alvo: a NMI vai só aos APs).
-    for other in 1..MAX_CPUS {
-        if other != number && !PROCESSORS[other].frozen.load(Ordering::Acquire) {
-            set_ipi_frozen_of(other, FROZEN_PENDING);
+    let targets = freeze_targets(number);
+    for other in (0..MAX_CPUS).filter(|&other| targets & 1 << other != 0) {
+        RESENT[other].store(0, Ordering::Release);
+        let Some(prcb) = prcb_of(other) else { continue };
+        let cell = prcb.ipi_frozen.atomic();
+        match cell.compare_exchange(FROZEN_RUNNING, FROZEN_PENDING, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => send_freeze_nmi(other),
+            Err(FROZEN_TARGET) => {}
+            Err(_) => {
+                // Ainda saindo da prisão do congelamento anterior.
+                cell.store(FROZEN_PENDING, Ordering::Release);
+                send_freeze_nmi(other);
+            }
         }
     }
-    let sent = smp::send_nmi_to_application_processors() as usize;
-    let deadline = clock::uptime_ms() + FREEZE_TIMEOUT_MS;
+    let start = clock::uptime_ms();
+    let mut last_send = start;
     loop {
-        let frozen = (0..MAX_CPUS).filter(|&other| other != number && PROCESSORS[other].frozen.load(Ordering::Acquire)).count();
-        if frozen >= sent {
+        let waiting = (0..MAX_CPUS).filter(|&other| targets & 1 << other != 0 && ipi_frozen_of(other) != FROZEN_TARGET).fold(0u32, |mask, other| mask | 1 << other);
+        if waiting == 0 {
             break;
         }
-        if clock::uptime_ms() >= deadline {
-            debug_print!("[kd] {} de {} processadores congelados no prazo", frozen, sent);
+        let now = clock::uptime_ms();
+        if now >= start + FREEZE_TIMEOUT_MS {
+            debug_print!("[kd] processadores {:#x} sem congelar no prazo (alvos {:#x})", waiting, targets);
             break;
+        }
+        if now >= last_send + FREEZE_RESEND_MS {
+            last_send = now;
+            for other in (0..MAX_CPUS).filter(|&other| waiting & 1 << other != 0) {
+                let Some(prcb) = prcb_of(other) else { continue };
+                let cell = prcb.ipi_frozen.atomic();
+                let state = cell.load(Ordering::Acquire);
+                // Um alvo que saiu da prisão anterior depois de marcado
+                // (e se gravou RUNNING) fica pendente de novo.
+                if state != FROZEN_PENDING && cell.compare_exchange(state, FROZEN_PENDING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    continue;
+                }
+                RESENT[other].fetch_add(1, Ordering::AcqRel);
+                send_freeze_nmi(other);
+            }
         }
         core::hint::spin_loop();
     }
 }
 
-/// Degela os outros (KeThawExecution) e espera cada um sair da prisão: a
-/// próxima NMI de congelamento não pode encontrá-lo ainda lá dentro.
+/// O KeThawExecution e o KiSendThawExecution: cada alvo preso passa a
+/// TARGET_THAW, e o que não chegou a ficar preso volta a RUNNING; o dono
+/// espera cada um sair da prisão (a próxima NMI de congelamento não pode
+/// encontrá-lo ainda lá dentro). As NMIs repetidas, e a de um alvo que não
+/// chegou, ainda podem chegar depois: ficam contadas para a NMI do BSP não
+/// as tomar por um pedido de parada.
 fn thaw_others(number: usize) {
-    for other in 0..MAX_CPUS {
-        if other == number {
-            continue;
+    let now = clock::uptime_ms();
+    for other in (0..MAX_CPUS).filter(|&other| other != number) {
+        let mut stray = RESENT[other].swap(0, Ordering::AcqRel);
+        if let Some(prcb) = prcb_of(other) {
+            let cell = prcb.ipi_frozen.atomic();
+            if cell.compare_exchange(FROZEN_TARGET, FROZEN_THAW, Ordering::AcqRel, Ordering::Acquire).is_err() && cell.compare_exchange(FROZEN_PENDING, FROZEN_RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                stray += 1;
+            }
         }
-        if PROCESSORS[other].frozen.load(Ordering::Acquire) {
-            set_ipi_frozen_of(other, FROZEN_THAW);
-        } else if other != 0 {
-            // Um alvo que não chegou a ficar preso deixa de estar pendente.
-            set_ipi_frozen_of(other, FROZEN_RUNNING);
+        if stray != 0 {
+            STRAY_UNTIL[other].store(now + STRAY_GRACE_MS, Ordering::Release);
+            STRAY[other].fetch_add(stray, Ordering::AcqRel);
         }
     }
     FREEZE.store(0, Ordering::Release);
     let deadline = clock::uptime_ms() + FREEZE_TIMEOUT_MS;
-    while (0..MAX_CPUS).any(|other| other != number && PROCESSORS[other].frozen.load(Ordering::Acquire)) {
+    while (0..MAX_CPUS).any(|other| other != number && (PROCESSORS[other].frozen.load(Ordering::Acquire) || BOUNDARY_FRAME[other].load(Ordering::Acquire) != 0)) {
         if clock::uptime_ms() >= deadline {
             break;
         }
@@ -996,18 +1260,30 @@ extern "sysv64" fn rs_kd_trap(frame: *mut TrapFrame, fx: u64, reason: u32) -> u3
 fn poll(number: usize, frame: u64, fx: u64) -> u32 {
     let request = TICK_REQUEST.swap(0, Ordering::AcqRel);
     if OWNER.load(Ordering::Acquire) != 0 {
-        // A máquina está num passo: o pedido fica para depois dele.
+        // Outro processador é o dono e este não ficou preso (a NMI de
+        // congelamento se perdeu): o KiCheckForFreezeExecution do tique.
+        if FREEZE.load(Ordering::Acquire) != 0 {
+            check_for_freeze(number, frame, fx);
+        }
+        // A máquina está num passo, ou parada por outro: o pedido fica para
+        // depois.
         if request != 0 {
             TICK_REQUEST.fetch_or(request, Ordering::AcqRel);
         }
         return HANDLED;
     }
     if request & TICK_NMI != 0 {
-        // A NMI que chegou numa fronteira com o GS do usuário.
-        NMI_DEFERRED.fetch_add(1, Ordering::Relaxed);
         if request & !TICK_NMI != 0 {
             TICK_REQUEST.fetch_or(request & !TICK_NMI, Ordering::AcqRel);
         }
+        // Uma NMI repetida de um congelamento que já acabou, chegada numa
+        // fronteira, não é pedido de parada.
+        if consume_stray(number) {
+            NMI_IGNORED.fetch_add(1, Ordering::Relaxed);
+            return HANDLED;
+        }
+        // A NMI que chegou numa fronteira com o GS do usuário.
+        NMI_DEFERRED.fetch_add(1, Ordering::Relaxed);
         return nmi_break(number, frame, fx);
     }
     if request & TICK_TEST != 0 {
@@ -1039,15 +1315,15 @@ fn poll(number: usize, frame: u64, fx: u64) -> u32 {
 fn nmi(number: usize, frame: u64, fx: u64, stepping: bool) -> u32 {
     let me = number as u32 + 1;
     NMI_RECEIVED[number].fetch_add(1, Ordering::Relaxed);
-    let owner = OWNER.load(Ordering::Acquire);
-    // KiCheckForFreezeExecution: o congelamento pedido prende o processador.
-    if FREEZE.load(Ordering::Acquire) != 0 && owner != me {
-        park(number, frame, fx, false);
+    // KiCheckForFreezeExecution: o congelamento pedido por outro dono prende
+    // o processador; uma NMI repetida de um congelamento que já acabou é
+    // consumida.
+    if check_for_freeze(number, frame, fx) {
         return HANDLED;
     }
     // A máquina já está parada aqui (uma segunda NMI do host na sessão ou no
     // meio de um passo): nada a fazer.
-    if owner == me || stepping {
+    if OWNER.load(Ordering::Acquire) == me || stepping {
         NMI_IGNORED.fetch_add(1, Ordering::Relaxed);
         return HANDLED;
     }
@@ -1067,8 +1343,7 @@ fn nmi_break(number: usize, frame: u64, fx: u64) -> u32 {
     // KiNMILock, tomada sem esperar: enquanto outro processador a tem, este
     // confere o congelamento (o laço do KiProcessNMI).
     while NMI_LOCK.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_err() {
-        if FREEZE.load(Ordering::Acquire) != 0 && OWNER.load(Ordering::Acquire) != me {
-            park(number, frame, fx, false);
+        if FREEZE.load(Ordering::Acquire) != 0 && check_for_freeze(number, frame, fx) {
             return HANDLED;
         }
         core::hint::spin_loop();
@@ -1096,13 +1371,16 @@ fn nmi_break(number: usize, frame: u64, fx: u64) -> u32 {
     HANDLED
 }
 
-/// NMI de congelamento nos APs (o portão de NMI da IDT deles).
+/// NMI de congelamento nos APs (o portão de NMI da IDT deles), com o
+/// congelamento ativo e o GS do kernel: o quadro completo e a área FXSAVE64
+/// da entrada (`hal::amd64::aptrampoline`). O dono da parada recebe a NMI
+/// de um shootdown de TLB por aqui também, e só a atende.
 #[no_mangle]
-extern "sysv64" fn rs_kd_freeze_processor(frame: *mut TrapFrame) {
+extern "sysv64" fn rs_kd_freeze_processor(frame: *mut TrapFrame, fx: u64) {
     let number = current_processor();
     NMI_RECEIVED[number].fetch_add(1, Ordering::Relaxed);
-    if FREEZE.load(Ordering::Acquire) != 0 && OWNER.load(Ordering::Acquire) != number as u32 + 1 {
-        park(number, frame as u64, 0, false);
+    if FREEZE.load(Ordering::Acquire) != 0 {
+        check_for_freeze(number, frame as u64, fx);
     }
 }
 
@@ -1138,9 +1416,26 @@ pub fn request_tick(bits: u8) {
     TICK_REQUEST.fetch_or(bits, Ordering::AcqRel);
 }
 
-/// Um AP não tem `int 3` (a IDT dele só tem o portão da NMI): a parada é
-/// pedida ao BSP por NMI, e este processador fica preso com os outros até o
-/// degelo. Sem resposta do BSP no prazo, segue sem parar.
+/// O processador corrente tem a IDT inteira: o BSP e os APs com o anel 3
+/// armado (`smp::start_scheduling` copia a IDT do BSP), em que o `int 3` e
+/// o #DB chegam ao depurador pelos trampolins. Os outros APs só têm os
+/// portões 0-2 (o da NMI): um `int 3` ali seria falta tripla.
+fn has_debug_vectors() -> bool {
+    #[repr(C, packed)]
+    struct TableRegister {
+        limit: u16,
+        base: u64,
+    }
+    let mut register = TableRegister { limit: 0, base: 0 };
+    // SAFETY: `sidt` grava os 10 bytes do IDTR no registro local.
+    unsafe { core::arch::asm!("sidt [{}]", in(reg) &mut register as *mut TableRegister, options(nostack, preserves_flags)) };
+    let limit = register.limit;
+    limit as usize >= 4 * 16 - 1
+}
+
+/// Um AP sem a IDT inteira não tem `int 3`: a parada é pedida ao BSP por
+/// NMI, e este processador fica preso com os outros até o degelo. Sem
+/// resposta do BSP no prazo, segue sem parar.
 fn request_stop_from_application_processor(number: usize, signal: u8) {
     let target = BSP_APIC_ID.load(Ordering::Acquire);
     if target > 0xFF || number + 1 > 0xFF {
@@ -1235,7 +1530,7 @@ pub fn break_in_now() {
         return;
     }
     let number = current_processor();
-    if number != 0 {
+    if number != 0 && !has_debug_vectors() {
         request_stop_from_application_processor(number, SIGINT);
         return;
     }
@@ -1257,7 +1552,7 @@ pub fn bug_check(code: u32, parameters: [u64; 4]) {
     debug_print!("[kd] bugcheck {:#010x} parado no depurador", code);
     session::announce_fatal(code, parameters);
     let number = current_processor();
-    if number != 0 {
+    if number != 0 && !has_debug_vectors() {
         request_stop_from_application_processor(number, SIGABRT);
         return;
     }
@@ -1280,7 +1575,7 @@ pub fn bug_check_in_debugger(code: u32, parameters: [u64; 4]) {
 pub fn freeze_for_bug_check() -> usize {
     let number = current_processor();
     freeze_others(number);
-    (0..MAX_CPUS).filter(|&other| other != number && PROCESSORS[other].frozen.load(Ordering::Acquire)).count()
+    (0..MAX_CPUS).filter(|&other| other != number && ipi_frozen_of(other) == FROZEN_TARGET).count()
 }
 
 /// O KiSendThawExecution do KeBugCheckEx antes do reinício.
@@ -1301,7 +1596,7 @@ pub fn panic_stop() {
     if stopped() {
         return;
     }
-    if number != 0 {
+    if number != 0 && !has_debug_vectors() {
         request_stop_from_application_processor(number, SIGABRT);
         return;
     }
@@ -1324,7 +1619,7 @@ pub fn load_break(base: u64, size: u64, process_id: u64, name: u64, name_length:
 /// RCX; o host continua depois dele. Num AP, a parada pedida ao BSP.
 pub fn break_with_status(status: u32) {
     let number = current_processor();
-    if number != 0 {
+    if number != 0 && !has_debug_vectors() {
         if !stopped() {
             request_stop_from_application_processor(number, SIGTRAP);
         }
@@ -1345,22 +1640,17 @@ pub fn describe_nmi(out: &mut Payload) {
         NMI_IGNORED.load(Ordering::Relaxed),
         recovery::recovered()
     );
-    for number in 0..MAX_CPUS {
-        let pcr = PROCESSORS[number].pcr.load(Ordering::Relaxed);
+    for number in (0..MAX_CPUS).filter(|&number| online(number)) {
         let received = NMI_RECEIVED[number].load(Ordering::Relaxed);
-        let is_owner = owner() == Some(number);
-        if pcr == 0 && received == 0 && !is_owner {
-            continue;
-        }
-        let state = if is_owner {
+        let state = if owner() == Some(number) {
             "dono da parada"
         } else if PROCESSORS[number].frozen.load(Ordering::Acquire) {
             "congelado"
+        } else if boundary_frame(number) != 0 {
+            "congelado numa fronteira com o GS do usuario"
         } else {
             "rodando"
         };
-        // SAFETY: a KPCR publicada do processador, mapeada por toda a vida do sistema.
-        let frozen = if pcr != 0 { unsafe { Kpcr::at(pcr) }.prcb.ipi_frozen.get() } else { 0 };
-        let _ = writeln!(out, "CPU {}: {} (KPRCB.IpiFrozen {}), NMIs recebidas {}", number, state, frozen, received);
+        let _ = writeln!(out, "CPU {}: {} (KPRCB.IpiFrozen {}), NMIs recebidas {}", number, state, ipi_frozen_of(number), received);
     }
 }

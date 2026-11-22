@@ -50,6 +50,9 @@ pub mod layout {
     pub const PRCB_IDLE_THREAD: u64 = PRCB + offset_of!(Kprcb, idle_thread) as u64;
     pub const PRCB_NESTING_LEVEL: u64 = PRCB + offset_of!(Kprcb, nesting_level) as u64;
     pub const PRCB_NUMBER: u64 = PRCB + offset_of!(Kprcb, number) as u64;
+    /// KPRCB.IpiFrozen: o estado de congelamento do processador (o
+    /// depurador do kernel, `kd::stop`).
+    pub const PRCB_IPI_FROZEN: u64 = PRCB + offset_of!(Kprcb, ipi_frozen) as u64;
     pub const LOCK_QUEUE_ARRAY: u64 = PRCB + offset_of!(Kprcb, lock_queue) as u64;
     pub const PRCB_DPC_ROUTINE_ACTIVE: u64 = PRCB + offset_of!(Kprcb, dpc_routine_active) as u64;
     pub const PRCB_DPC_REQUEST_SUMMARY: u64 = PRCB + offset_of!(Kprcb, dpc_request_summary) as u64;

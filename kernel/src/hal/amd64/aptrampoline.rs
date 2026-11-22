@@ -203,8 +203,14 @@ ap_park:
 ap_tlb_nmi:
     # Congelamento do depurador do kernel: o AP fica preso em
     # `rs_kd_freeze_processor` com o quadro completo (o TrapFrame dos
-    # trampolins: R15..RAX, vetor 2 e o quadro do hardware) publicado; no
-    # degelo, um shootdown postado nesse meio-tempo e atendido na saida.
+    # trampolins: R15..RAX, vetor 2 e o quadro do hardware) e o x87/SSE numa
+    # area FXSAVE64 publicados; no degelo, um shootdown postado nesse
+    # meio-tempo e atendido na saida. O GS e conferido pelo MSR, como no
+    # KiNmiInterrupt: do anel 3 (um AP com threads de usuario), o SWAPGS e o
+    # banco de depuracao da fronteira comum; no anel 0 com o GS do usuario
+    # (logo depois do SYSCALL, ainda na pilha do usuario, ou entre o SWAPGS e
+    # o IRETQ da volta), a espera fica no asm (`opennt_kd_freeze_boundary`),
+    # sem tocar no GS nem crescer a pilha.
     cmp byte ptr [rip + opennt_kd_freeze_active], 0
     je ap_tlb_nmi_service
     push 2
@@ -224,10 +230,36 @@ ap_tlb_nmi:
     push r14
     push r15
     mov rbp, rsp
-    and rsp, -16
+    xor r12d, r12d
+    test byte ptr [rbp + 136], 3
+    jz ap_kd_kernel_frame
+    swapgs
+    call user_debug_leave
+    mov r12d, 1
+    jmp ap_kd_freeze
+ap_kd_kernel_frame:
+    mov ecx, 0xC0000101
+    rdmsr
+    test edx, edx
+    js ap_kd_freeze
     mov rdi, rbp
+    call opennt_kd_freeze_boundary
+    jmp ap_kd_freeze_done
+ap_kd_freeze:
+    and rsp, -16
+    sub rsp, 512
+    fxsave64 [rsp]
+    mov rdi, rbp
+    mov rsi, rsp
     cld
     call rs_kd_freeze_processor
+    fxrstor64 [rsp]
+    mov rsp, rbp
+    test r12d, r12d
+    jz ap_kd_freeze_done
+    call user_debug_enter
+    swapgs
+ap_kd_freeze_done:
     mov rsp, rbp
     pop r15
     pop r14
