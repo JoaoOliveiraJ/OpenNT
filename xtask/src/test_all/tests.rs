@@ -95,14 +95,15 @@ fn the_whole_round_compiles_one_kernel() {
     // teste (com ou sem entrada: o --start-menu do menu-iniciar e o --run
     // do prompt-de-comando ligam o gancho das contas embutidas, que o da
     // conta já cobre) e o da conta de teste com o gancho que desliga a
-    // cadeia (o desligamento-cadeia), mais o do e-process e o do
-    // volume-sistema.
+    // cadeia (o desligamento-cadeia), mais o do e-process e os do
+    // volume-sistema (o boot comum e o da cadeia do smss).
     let expected = [
         ("", false, false, false, false, false, false),
         ("", false, false, false, false, false, true),
         ("", false, false, false, false, true, false),
         ("", true, false, false, false, false, false),
         ("smss", false, false, false, false, false, false),
+        ("smss", false, false, false, false, false, true),
         ("smss", false, false, true, false, false, false),
         ("smss", false, true, false, false, false, false),
         ("smss", false, true, false, true, false, false),
