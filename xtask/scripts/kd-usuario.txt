@@ -12,7 +12,9 @@
 # depois dos acertos e o boot chega ao fim do roteiro do smss. No fim, a
 # pilha de cada thread em espera do smss.exe e do csrss.exe chega ao começo
 # da thread, também a das threads sem serviço suspenso (uma espera adiada),
-# lida do CONTEXT do anel 3 delas.
+# lida do CONTEXT do anel 3 delas. Com o anel 3 nos APs (`user_smp` 1, o
+# teste `kd-usuario-smp2`), uma parada de usuário forçada num AP, com o
+# passo dela e os outros processadores congelados.
 
 attach
 expect-stop SIGINT
@@ -30,6 +32,30 @@ expect-stop RtlFreeHeap
 s
 expect-stop SIGTRAP
 expect-stop RtlFreeHeap+
+
+# Com o anel 3 nos APs: um breakpoint no csrss.exe que só para no AP (a
+# condição sobre `$cpu`, o processador da parada; os acertos em outra CPU
+# seguem sem contar). A parada é do AP (o dono, KPRCB.IpiFrozen 4), com o
+# BSP congelado (2), e o passo da thread também para.
+if $user_smp == 1 {
+    bu /p csrss.exe ntdll!RtlLeaveCriticalSection /w "$cpu == 1" /max 1
+    continue
+    wait-stop 600000
+    expect-stop RtlLeaveCriticalSection
+    expect-eq $cpu 1
+    cpulist
+    expect processadores parados: ${processadores}
+    # A thread corrente do AP é a do csrss.exe.
+    cpus
+    expect csrss.exe
+    monitor nmi
+    expect CPU 1: dono da parada (KPRCB.IpiFrozen 4)
+    expect CPU 0: congelado
+    expect (KPRCB.IpiFrozen 2)
+    s
+    expect-stop SIGTRAP
+    expect-stop RtlLeaveCriticalSection+
+}
 continue
 wait-serial /t 600000 SMSS_CSRSS_OK
 break

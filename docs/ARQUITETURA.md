@@ -566,10 +566,12 @@ e uma por porta ALPC ou servidor com pedidos pendentes
 duas CPUs ele não fica mais rápido, só ocupa duas CPUs do anfitrião. Os
 testes `logonui-smp2`, `area-de-trabalho-smp2` e `barra-de-tarefas-smp2`
 repetem os boots e as conferências dos originais com `--smp=2 --user-smp`.
-O depurador do kernel ainda não para no breakpoint de usuário atingido num
-AP: a parada chega a ele como pedido de parada (SIGINT) na CPU 0, sem a
-thread do breakpoint, e os testes com `--kd` ficam com `--smp=1`. O
-autoteste `ntos/test/multiprocess/user_smp.rs` (com dois processadores ou
+O depurador do kernel para em qualquer processador: o AP com o anel 3
+armado tem a IDT inteira e relata as próprias paradas (breakpoint de
+usuário ou de kernel, passo, falta), congelando o BSP por NMI (o
+congelamento do depurador, abaixo); `kd-smp2` e `kd-usuario-smp2` repetem
+os roteiros do `kd` e do `kd-usuario` com `--smp=2 --user-smp`, mais uma
+parada forçada no AP. O autoteste `ntos/test/multiprocess/user_smp.rs` (com dois processadores ou
 mais) liga o despacho de usuário nos APs e, com o BSP só girando, confere
 que o serviço é atendido num AP, que cada sinal do BSP conclui exatamente
 uma espera adiada de uma thread num AP sem o anel 3 ver STATUS_PENDING,
@@ -7883,6 +7885,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   segunda; um comando que falta e um que chama KeBugCheckEx, abandonados;
   o passo sobre `hlt`; e uma #GP no meio de um passo, retomada pelo host
   pulando a instrução.
+
+  Os testes `kd-smp2` e `kd-usuario-smp2` rodam os roteiros do `kd` e do
+  `kd-usuario` com `--smp=2 --user-smp`, com as mesmas conferências (o
+  test-boot dá ao roteiro as variáveis `smp`, `processadores`, a lista do
+  `cpulist` com todos parados, e `user_smp`). Com `user_smp` 1 cada roteiro
+  força uma parada no AP e confere que ela é dele (`$cpu` 1), que o BSP
+  fica congelado (KPRCB.IpiFrozen 2, o AP dono em 4) e que os dois
+  processadores ficam visíveis ao host. No `kd`, o autoteste `monitor
+  kdtest ap` (uma worker do kernel põe na caixa do AP um trabalho com um
+  `int 3` fixo e chamadas de `kd::self_test::ap_target`): o passo no AP, o
+  breakpoint de hardware armado com o BSP parado e o de software, ambos
+  atingidos pelo AP. No `kd-usuario`, um breakpoint no csrss.exe com a
+  condição `$cpu == 1` e o passo da thread.
 
   O boot com `--kd` roda também `ntos/test/kernel_debugger.rs`
   (`KD_EXPORTS_OK`).

@@ -9,6 +9,10 @@
 # (docs/ARQUITETURA.md): o tratador de parada (on-break), as condições, os
 # laços pelos processos, threads e módulos e as variáveis tiradas da saída.
 # A transcrição da sessão fica em kd-sessao.log, ao lado do serial.log.
+# O test-boot define `smp`, `processadores` (as threads do protocolo de
+# todos os processadores: 1,2,3,4 com quatro) e `user_smp` (1 com
+# --user-smp); com o anel 3 nos APs (o teste `kd-smp2`), o roteiro também
+# para num AP (`monitor kdtest ap`) antes de se desligar.
 
 # Anexar: o primeiro pacote com a máquina rodando a para no tique seguinte.
 attach
@@ -16,7 +20,7 @@ expect-stop SIGINT
 kd
 expect KdDebuggerEnabled=1 KdDebuggerNotPresent=0
 cpulist
-expect processadores parados: 1,2,3,4
+expect processadores parados: ${processadores}
 cpus
 
 # Memória: o cabeçalho do PE do kernel na VA em que ele roda, e uma escrita
@@ -235,6 +239,54 @@ expect a funcao retornou
 trace status
 expect retorno da funcao
 hbc kernel::ntos::ke::run_kernel_tasks
+
+# Com o anel 3 nos APs (--user-smp), a parada num AP: o autoteste `kdtest
+# ap` põe na caixa do AP um trabalho que executa um `int 3` fixo e chama
+# ap_target duas vezes. A parada é do AP (CPU 1, o dono, KPRCB.IpiFrozen
+# 4): o BSP fica congelado (2), com o quadro dele legível. O passo roda no
+# AP; o breakpoint de hardware armado com o BSP parado vale no AP (ele
+# carrega os registradores de depuração no degelo), e o de software também
+# para lá.
+if $user_smp == 1 {
+    hbp kernel::ntos::kd::self_test::ap_target
+    monitor kdtest ap 2
+    expect autoteste armado
+    continue
+    wait-stop 60000
+    expect-stop SIGTRAP
+    expect-stop opennt_kd_test_processor_break
+    expect-eq $cpu 1
+    cpulist
+    expect processadores parados: ${processadores}
+    monitor nmi
+    expect CPU 1: dono da parada (KPRCB.IpiFrozen 4)
+    expect CPU 0: congelado
+    expect (KPRCB.IpiFrozen 2)
+    thread 1
+    expect (CPU 0)
+    k 4
+    expect Child-SP
+    thread 2
+    step
+    expect-stop SIGTRAP
+    expect-eq $cpu 1
+    expect-stop processor_job
+    continue
+    wait-stop 60000
+    expect-stop hwbreak
+    expect-eq $cpu 1
+    expect-eq %rip kernel::ntos::kd::self_test::ap_target
+    hbc kernel::ntos::kd::self_test::ap_target
+    bp kernel::ntos::kd::self_test::ap_target
+    continue
+    wait-stop 60000
+    expect-stop swbreak
+    expect-eq $cpu 1
+    expect-eq %rip kernel::ntos::kd::self_test::ap_target
+    cpulist
+    expect processadores parados: ${processadores}
+    bc all
+}
 
 # Desliga: a máquina segue até o fim do boot (o shell e o serviço de
 # teclado lendo do driver real, em qualquer ordem).
