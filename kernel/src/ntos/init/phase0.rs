@@ -123,17 +123,31 @@ pub fn init() {
     crate::ntos::cm::physical_memory_resources::initialize().unwrap_or_else(|error| panic!("{error}"));
 }
 
+/// Os diretórios de KnownDlls que o kernel cria, com o KnownDllPath de cada
+/// um. São do smss: no boot do processo inicial real
+/// (`--initial-process=smss`) o kernel não cria nenhum (o
+/// SmpInitializeKnownDlls do smss.exe cria o `\KnownDlls` e, com o WoW64, o
+/// `\KnownDlls32`). No boot sem o smss, o `\KnownDlls` e, com o volume do
+/// WoW64, o `\KnownDlls32` da ntdll de 32 bits.
+pub fn kernel_known_dll_directories(smss: bool, wow64: bool) -> &'static [(&'static str, &'static str)] {
+    const NATIVE: (&str, &str) = ("\\KnownDlls", "C:\\Windows\\System32");
+    const WOW64: (&str, &str) = ("\\KnownDlls32", "C:\\Windows\\SysWOW64");
+    match (smss, wow64) {
+        (true, _) => &[],
+        (false, false) => &[NATIVE],
+        (false, true) => &[NATIVE, WOW64],
+    }
+}
+
 /// Diretórios e links do namespace NT, na ordem de criação, com a
 /// partição do sistema e os eventos `\KernelObjects\*`.
 fn namespace() -> Result<(), crate::rtl::KernelError> {
     crate::ntos::se::se_exports::init()?; // SE_EXPORTS na reserva permanente da imagem
     object_manager::create_directory("\\Device")?;
     object_manager::create_directory("\\Driver")?;
-    // O \KnownDlls é do smss: no boot do processo inicial real
-    // (`--initial-process=smss`) o kernel não o cria.
-    if !crate::ntos::init::boot_config::smss_boot() {
-        object_manager::create_directory("\\KnownDlls")?;
-        object_manager::create_symlink("\\KnownDlls\\KnownDllPath", "C:\\Windows\\System32")?;
+    for (directory, path) in kernel_known_dll_directories(crate::ntos::init::boot_config::smss_boot(), crate::ntos::init::boot_config::wow64()) {
+        object_manager::create_directory(directory)?;
+        object_manager::create_symlink(&alloc::format!("{directory}\\KnownDllPath"), path)?;
     }
     // CreateSystemRootLink: o \ArcName, \Device\BootDevice apontando para o
     // volume de boot (no NT, pelo \ArcName do dispositivo de boot; o OpenNT

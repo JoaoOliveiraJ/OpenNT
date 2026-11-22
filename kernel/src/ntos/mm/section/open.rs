@@ -2,9 +2,10 @@
 //!
 //! Abre a SECTION existente conservando a identidade nativa e o backing. A
 //! ordem de validação segue o NtOpenSection/Ob do NT de referência; as
-//! entradas de `\KnownDlls` são provisionadas do volume na primeira busca,
-//! exceto no boot do processo inicial real (`--initial-process=smss`), em que
-//! o smss cria o diretório e as seções.
+//! entradas de `\KnownDlls` (de System32) e, com o WoW64, as de
+//! `\KnownDlls32` (de SysWOW64) são provisionadas do volume na primeira
+//! busca, exceto no boot do processo inicial real (`--initial-process=smss`),
+//! em que o smss cria os diretórios e as seções.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -252,6 +253,22 @@ pub fn lookup(info: &Captured, mode: u8) -> Found {
     walk(info, start, name, 0, enforce, bypass, subject, insensitive)
 }
 
+/// A entrada `leaf` de um diretório de KnownDlls que o kernel provisiona do
+/// volume no boot sem o smss: o diretório e o caminho da imagem (o
+/// `\KnownDlls` de System32 e, nos processos WoW64 x86, o `\KnownDlls32` de
+/// SysWOW64). No boot do processo inicial real (`smss`) nunca: os diretórios
+/// e as seções são do smss.exe.
+pub fn kernel_known_dll(parent: &str, leaf: &str, smss: bool) -> Option<(&'static str, String)> {
+    if smss {
+        return None;
+    }
+    match parent.to_lowercase().as_str() {
+        "\\knowndlls" => Some(("\\KnownDlls", String::from(leaf))),
+        "\\knowndlls32" => Some(("\\KnownDlls32", alloc::format!("\\SystemRoot\\SysWOW64\\{leaf}"))),
+        _ => None,
+    }
+}
+
 /// NtOpenSection: grava o temporário do Ob na saída em sucesso e em falha.
 pub fn open(output: u64, desired: u32, attributes: u64, mode: u8) -> Result<u32, KernelError> {
     if irql::get_irql() != 0 {
@@ -270,10 +287,11 @@ pub fn open(output: u64, desired: u32, attributes: u64, mode: u8) -> Result<u32,
         let mut found = lookup(&info, mode);
         // Política de KnownDlls: provisiona o PE real do volume na primeira
         // busca e segue pelas mesmas permissões e caminho de handle do Ob.
-        if !crate::ntos::init::boot_config::smss_boot() && found.status == 0xC000_0034 && found.parent.and_then(object_manager::path_of).is_some_and(|path| path.to_lowercase() == "\\knowndlls") {
-            if let Some(file) = crate::drivers::fs::volume_files::lookup_volume_file(&found.leaf) {
+        let known = found.parent.and_then(object_manager::path_of).and_then(|path| kernel_known_dll(&path, &found.leaf, crate::ntos::init::boot_config::smss_boot()));
+        if let Some((directory, source)) = known.filter(|_| found.status == 0xC000_0034) {
+            if let Some(file) = crate::drivers::fs::volume_files::lookup_volume_file(&source) {
                 let image: alloc::sync::Arc<dyn crate::ntos::ps::user::sections::SectionFile> = file;
-                let section = match crate::ntos::ps::user::sections::create_image(image, Some(alloc::format!("\\KnownDlls\\{}", found.leaf)), 0x40, false)? {
+                let section = match crate::ntos::ps::user::sections::create_image(image, Some(alloc::format!("{}\\{}", directory, found.leaf)), 0x40, false)? {
                     Ok(section) => section,
                     Err(status) => return Ok(status),
                 };
