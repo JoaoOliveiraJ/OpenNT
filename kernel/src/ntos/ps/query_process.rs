@@ -69,6 +69,29 @@ pub fn query_mode(class: u32, output: u64, length: u32, returned: u64, process_o
     Ok(0)
 }
 
+/// PROCESSINFOCLASS ProcessExecuteFlags.
+pub const PROCESS_EXECUTE_FLAGS: u32 = 34;
+
+/// O ramo da classe ProcessExecuteFlags (34) do NtQueryInformationProcess
+/// 19041 (rva 0x622c32), com o buffer e o ReturnLength já sondados: um ULONG
+/// (outro tamanho dá STATUS_INFO_LENGTH_MISMATCH), o processo corrente pelo
+/// pseudo-handle ou o do handle com PROCESS_QUERY_INFORMATION, o
+/// KeGetExecuteOptions dele (`ke/execute_options`) e ReturnLength 4.
+pub fn query_execute_flags(output: u64, length: u32, returned: u64, process_of: impl FnOnce(u32) -> Result<u64, u32>) -> Result<u32, KernelError> {
+    if length != 4 {
+        return Ok(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    let process = match process_of(PROCESS_QUERY_INFORMATION) {
+        Ok(process) => process,
+        Err(status) => return Ok(status),
+    };
+    guest::try_write::<u32>(output, crate::ntos::ke::execute_options::get(process))?;
+    if returned != 0 {
+        guest::try_write::<u32>(returned, 4)?;
+    }
+    Ok(0)
+}
+
 /// ObReferenceObjectByHandle(handle, access, PsProcessType, KernelMode):
 /// `Ok(Ok(EPROCESS))` com uma referência que [`release_process`] solta, ou o
 /// NTSTATUS da recusa.

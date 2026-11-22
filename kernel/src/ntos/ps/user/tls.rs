@@ -1,7 +1,11 @@
 //! ProcessTlsInformation da ABI x64 das DLLs do volume.
 //!
 //! Layout confirmado na ntdll e no ntoskrnl: cabeçalho de 16 bytes e
-//! entradas de 24 bytes; TlsData é entrada/saída.
+//! entradas de 24 bytes; TlsData é entrada/saída. Com o bit 0 de Flags (que
+//! o whNtSetInformationProcessTlsInformation do wow64.dll liga para a ntdll
+//! de 32 bits), o vetor é o TEB32.ThreadLocalStoragePointer de cada thread,
+//! com ponteiros de 32 bits, como no ramo da classe 35 do
+//! NtSetInformationProcess 19041 (0x6590e1): só num processo WoW64 x86.
 
 use super::{state, syscalls_core, threads};
 use crate::rtl::KernelError;
@@ -9,7 +13,7 @@ use core::mem::offset_of;
 use core::sync::atomic::Ordering;
 
 use crate::ntos::mm::guest_memory as guest;
-use crate::ntos::inc::types::{NtStruct, ProcessTlsInformation, Teb, ThreadTlsInformation};
+use crate::ntos::inc::types::{NtStruct, ProcessTlsInformation, Teb, Teb32, ThreadTlsInformation};
 
 fn set_information(process: u64, buffer: u64, length: u64) -> Result<u32, KernelError> {
     if process != u64::MAX {
@@ -38,10 +42,13 @@ fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
     if operation > 1 || flags & !1 != 0 || count != (length - header) / ThreadTlsInformation::SIZE {
         return Ok(0xC000_0004);
     }
-    // Não existe TEB WOW64 neste processo x64.
-    if flags & 1 != 0 {
+    // O vetor de 32 bits só existe num processo WoW64 x86.
+    let wow64 = flags & 1 != 0;
+    if wow64 && !crate::ntos::ps::wow64::is_x86_process(crate::ntos::ps::process::get_current_process()) {
         return Ok(0xC000_000D);
     }
+    // O tamanho de um ponteiro do vetor.
+    let slot_size: u64 = if wow64 { 4 } else { 8 };
     let thread_data = |index: u64| state::user_struct::<ThreadTlsInformation>(buffer + header + index * ThreadTlsInformation::SIZE);
     for index in 0..count {
         if thread_data(index)?.flags.probe_get()? != 0 {
@@ -57,12 +64,19 @@ fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
         if entry_index == count {
             break;
         }
-        // TEB.ThreadLocalStoragePointer da thread (memória de usuário).
-        let vector_field = state::user_struct::<Teb>(teb)?.thread_local_storage_pointer.address();
-        if !state::probe_user_write(vector_field, 8) {
+        // TEB.ThreadLocalStoragePointer da thread (memória de usuário), ou o
+        // da TEB de 32 bits.
+        let vector_field = if wow64 {
+            state::user_struct::<Teb32>(teb + crate::ntos::ps::wow64::TEB32_OFFSET)?.thread_local_storage_pointer.address()
+        } else {
+            state::user_struct::<Teb>(teb)?.thread_local_storage_pointer.address()
+        };
+        if !state::probe_user_write(vector_field, slot_size) {
             return Ok(0xC000_0005);
         }
-        let vector = guest::try_read::<u64>(vector_field)?;
+        let read_pointer = |address: u64| if wow64 { guest::try_read::<u32>(address).map(u64::from) } else { guest::try_read::<u64>(address) };
+        let write_pointer = |address: u64, value: u64| if wow64 { guest::try_write::<u32>(address, value as u32) } else { guest::try_write::<u64>(address, value) };
+        let vector = read_pointer(vector_field)?;
         // A thread ainda não inicializou o TLS.
         if vector == 0 {
             continue;
@@ -72,7 +86,7 @@ fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
         let previous;
         if operation == 1 {
             previous = if vector == vector_field { 0 } else { vector };
-            let bytes = index_or_previous_count * 8;
+            let bytes = index_or_previous_count * slot_size;
             if previous != 0 && bytes != 0 {
                 if !state::probe_user_write(previous, bytes) || !state::probe_user_write(replacement, bytes) {
                     return Ok(0xC000_0005);
@@ -81,18 +95,18 @@ fn swap_vectors(buffer: u64, length: u64) -> Result<u32, KernelError> {
                 let values = guest::try_read_bytes(previous, bytes as usize)?;
                 guest::try_write_bytes(replacement, &values)?;
             }
-            if replacement == 0 || !state::probe_user_write(replacement, 8) {
+            if replacement == 0 || !state::probe_user_write(replacement, slot_size) {
                 return Ok(0xC000_0005);
             }
-            guest::try_write::<u64>(vector_field, replacement)?;
+            write_pointer(vector_field, replacement)?;
             entry.thread_id.probe_set(thread.thread_id)?;
         } else {
-            let slot = vector + index_or_previous_count * 8;
-            if !state::probe_user_write(slot, 8) {
+            let slot = vector + index_or_previous_count * slot_size;
+            if !state::probe_user_write(slot, slot_size) {
                 return Ok(0xC000_0005);
             }
             // Troca do slot numa instrução: o valor antigo vai para OldTlsData.
-            previous = guest::try_atomic_u64(slot)?.swap(replacement, Ordering::SeqCst);
+            previous = if wow64 { read_pointer(slot).and_then(|previous| write_pointer(slot, replacement).map(|_| previous))? } else { guest::try_atomic_u64(slot)?.swap(replacement, Ordering::SeqCst) };
         }
         entry.old_tls_data.probe_set(previous)?;
         // Troca concluída: o chamador pode liberar o bloco antigo.

@@ -26,6 +26,7 @@ pub mod test_alert;
 pub mod thread_priority;
 pub mod fast_mutex;
 pub mod process_attachment;
+pub mod execute_options;
 pub mod context_switch;
 pub mod debugger_data;
 pub mod persistent_thread_state;

@@ -825,13 +825,13 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
     }
     // ProcessQuotaLimits, ProcessVmCounters, ProcessTimes,
     // ProcessPriorityClass, ProcessImageFileNameWin32,
-    // ProcessMitigationPolicy (`ps/query_process`) e
+    // ProcessMitigationPolicy, ProcessExecuteFlags (`ps/query_process`) e
     // ProcessTelemetryIdInformation (`etw/process_telemetry`): o
     // ProbeForWrite de alinhamento 4 só pela faixa e o ReturnLength sondado
     // antes da classe.
     use crate::ntos::etw::process_telemetry;
     use crate::ntos::ps::query_process;
-    if matches!(class, query_process::PROCESS_QUOTA_LIMITS | query_process::PROCESS_VM_COUNTERS | query_process::PROCESS_TIMES | query_process::PROCESS_PRIORITY_CLASS | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY | process_telemetry::PROCESS_TELEMETRY_ID_INFORMATION) {
+    if matches!(class, query_process::PROCESS_QUOTA_LIMITS | query_process::PROCESS_VM_COUNTERS | query_process::PROCESS_TIMES | query_process::PROCESS_PRIORITY_CLASS | query_process::PROCESS_IMAGE_FILE_NAME_WIN32 | query_process::PROCESS_MITIGATION_POLICY | query_process::PROCESS_EXECUTE_FLAGS | process_telemetry::PROCESS_TELEMETRY_ID_INFORMATION) {
         if length != 0 {
             if buffer & 3 != 0 {
                 return Ok(0x8000_0002);
@@ -857,6 +857,7 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             query_process::PROCESS_TIMES => query_process::query_times(buffer, length as u32, returned, process_of),
             query_process::PROCESS_PRIORITY_CLASS => query_process::query_priority_class(buffer, length as u32, returned, process_of),
             query_process::PROCESS_IMAGE_FILE_NAME_WIN32 => query_process::query_image_file_name_win32(buffer, length as u32, returned, process_of),
+            query_process::PROCESS_EXECUTE_FLAGS => query_process::query_execute_flags(buffer, length as u32, returned, process_of),
             // O handle com PROCESS_QUERY_LIMITED_INFORMATION e o
             // EtwQueryProcessTelemetryInfo em UserMode.
             process_telemetry::PROCESS_TELEMETRY_ID_INFORMATION => match process_of(PROCESS_QUERY_LIMITED_INFORMATION) {
@@ -1218,6 +1219,33 @@ fn nt_set_information_process(handle: u64, class: u64, buffer: u64, length: u64,
         }
         let (Ok(policy), Ok(flags)) = (guest::try_read::<u32>(buffer), guest::try_read::<u32>(buffer + 4)) else { return Ok(0xC000_0005) };
         return crate::ntos::ps::mitigation_policy::set(handle as u32 == u32::MAX, policy, flags);
+    }
+    // ProcessExecuteFlags (o ramo de 0x658f01): o ULONG sondado com
+    // alinhamento 4, outro tamanho dá STATUS_INFO_LENGTH_MISMATCH, só o
+    // processo corrente pelo pseudo-handle (outro handle dá
+    // STATUS_INVALID_PARAMETER) e o KeSetExecuteOptions
+    // (`ke/execute_options`). Depois de desligar a execução, o original chama
+    // o MmRemoveExecuteGrants, que tira a execução que o Mm concedeu às
+    // páginas de dados do processo enquanto ela estava ligada; este Mm não
+    // concede execução a páginas de dados, então não há o que tirar.
+    if class as u32 == crate::ntos::ps::query_process::PROCESS_EXECUTE_FLAGS {
+        if length != 0 && (buffer & 3 != 0) {
+            return Ok(0x8000_0002);
+        }
+        if length != 0 && !probe_user_read(buffer, length) {
+            return Ok(0xC000_0005);
+        }
+        if length != 4 {
+            return Ok(0xC000_0004);
+        }
+        if handle as i64 != -1 {
+            return Ok(0xC000_000D);
+        }
+        let value = match guest::try_read::<u32>(buffer) {
+            Ok(value) => value,
+            Err(error) => return Ok(error.status),
+        };
+        return crate::ntos::ke::execute_options::set(crate::ntos::ps::process::get_current_process(), value);
     }
     // As classes que mudam o EPROCESS (`ps/set_process_information`).
     use crate::ntos::ps::set_process_information as set_process;
