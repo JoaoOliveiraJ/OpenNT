@@ -307,6 +307,16 @@ falha conhecida, contada à parte sem reprovar a rodada, e
 `coberto_pela_suite = true` um teste cujos marcadores as suítes já conferem
 (só roda com `--only`). O comando sai com erro se alguma execução falhar.
 
+Os testes que só precisam da área de trabalho com o usuário logado
+(`--primeiro-logon-feito`) sobem de um volume em que o convidado já fez o
+primeiro logon: um boot da cadeia chega à área de trabalho, espera o disco
+parar e desliga pelo `shutdown -s -t 0` da caixa Executar, e o volume que ele
+gravou fica num cache (`OPENNT_PRIMEIRO_LOGON`, padrão `build/primeiro-logon`)
+com a chave no hash das imagens, da máquina e do QEMU. No `test-all` esse boot
+é a execução `primeiro-logon`, antes dos testes que a usam; os testes do
+primeiro logon (logon-do-usuario, perfil-do-usuario, sihost, area-de-trabalho)
+continuam no volume novo.
+
 Para carregar um driver real, o build copia do Windows da própria máquina os
 `.sys`/`.dll` de que ele precisa (hal.dll, i8042prt, kbdclass, atapi, cng.sys,
 ci.dll…) e os coloca no volume NTFS da imagem. **Nenhum binário da Microsoft ou

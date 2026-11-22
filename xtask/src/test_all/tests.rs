@@ -31,6 +31,13 @@ fn every_components_test_is_a_valid_test_boot() {
         assert!(test.accelerator.as_deref().is_none_or(|accelerator| plan::ACCELERATORS.contains(&accelerator)), "{}", test.id);
     }
     assert!(chosen.iter().any(|&index| tests[index].id == "suite-smp4"));
+    // O primeiro logon continua conferido do volume novo nos testes dele; os
+    // que só precisam da área de trabalho sobem do volume já logado.
+    let first_logon = |id: &str| tests.iter().find(|test| test.id == id).unwrap().first_logon.is_some();
+    for fresh in ["logon-do-usuario", "perfil-do-usuario", "sihost", "userinit", "explorer", "area-de-trabalho", "desligamento-cadeia"] {
+        assert!(!first_logon(fresh), "{fresh} confere o primeiro logon: sobe do volume novo");
+    }
+    assert!(first_logon("barra-de-tarefas") && first_logon("reinicio-do-shell"));
     let only = plan::select(&tests, &[String::from("suite-smp1")], &[], Suites::Included, Extras::default()).unwrap();
     assert_eq!(only.len(), 1);
     assert!(plan::select(&tests, &[String::from("nao-existe")], &[], Suites::Included, Extras::default()).is_err());

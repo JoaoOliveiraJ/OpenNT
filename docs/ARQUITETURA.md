@@ -6920,6 +6920,87 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   esperada e sem marcador de falha na serial (`report::qemu_killed`; o
   test-boot dá o motivo "QEMU encerrado de fora"). Erros de compilação,
   falhas de teste, prazos esgotados e STOPs nunca se repetem.
+- **Volume do primeiro logon feito** (`xtask/src/first_logon.rs`,
+  `test-boot --primeiro-logon-feito` e `--gerar-primeiro-logon`, só com
+  `--conta-de-teste` e `--display=basic`): o primeiro logon da conta de
+  teste é a parte mais lenta do boot da cadeia e a mais sensível à carga do
+  hospedeiro (o gancho de primeiro boot com o net.exe, a criação do perfil,
+  os bancos do StateRepository com milhares de escritas síncronas, o
+  registro dos pacotes da caixa). Os testes que só precisam da área de
+  trabalho com o usuário logado sobem de um volume em que o próprio
+  convidado já fez esse trabalho:
+  - O gerador é um boot da cadeia sobre uma cópia gravável do `ntfs.img` do
+    build, com a máquina do teste (CPUs, memória, dispositivos, acelerador)
+    e as opções de carga dele sem os diagnósticos (`producer_options`: sem
+    o depurador, os rastros, o perfil, os drivers extras e os testes de
+    desligamento e de pressão de memória). Ele vai até o `DESKTOP_OK` da
+    vigia da tela, espera o disco de dados parar de gravar (as escritas do
+    `ide0-hd1` no `info blockstats` do monitor HMP: 20 s seguidos sem
+    escrita, depois de pelo menos 30 s e por até 5 min) e desliga como uma
+    pessoa: Win+R, a caixa Executar conferida na tela, `shutdown -s -t 0`
+    e Enter (o shutdown.exe real, o InitiateShutdownW pelo RPC do wininit,
+    o fim da sessão pelo winlogon com o LogonUI, o perfil descarregado pelo
+    serviço de perfis e o NtShutdownSystem). A cadeia conferida é
+    `USER_LOGON_OK`, `PROFILE_LOADED`, `EXPLORER_STARTED`, `DESKTOP_OK`,
+    `[po] desligamento ordenado`, `[ntfs] desligamento:`, `FLUSHED`,
+    `POWER_OFF` e o evento SHUTDOWN do QMP com o motivo `guest-shutdown`.
+    Só então a cópia vira a entrada do cache. O xtask não escreve nada
+    nela: o que difere do volume do build é o que o convidado gravou nesse
+    boot (a conta e os IDs do SAM, o perfil e o `NTUSER.DAT` dele, os
+    bancos do StateRepository, os arquivos de paginação, os logs, a lista
+    da caixa Executar com o comando de desligamento).
+  - A chave da entrada é o hash (XXH64) do conteúdo de tudo o que o boot do
+    gerador usa: o `ntfs.img` (com o kernel, os binários do Windows, as
+    hives das sementes e os perfis), o `os.img` com as opções de carga do
+    gerador gravadas, o texto das opções e da máquina, o tamanho e a data
+    do executável do QEMU e a versão da receita (`first_logon::RECIPE`, que
+    muda com o procedimento do gerador). Qualquer mudança dá outra chave.
+    As hives geradas levam a mesma hora fixa de instalação dos arquivos do
+    volume (`ntfs_image::INSTALL_TIME`), então um build sem mudança monta o
+    mesmo `ntfs.img` e acha a entrada de antes.
+  - O cache fica em `OPENNT_PRIMEIRO_LOGON` (sem a variável,
+    `build/primeiro-logon` do workspace), uma pasta por chave com o
+    `ntfs.img`, o `serial.log` do gerador e o `chave.txt` (o que a chave
+    cobre e quanto o gerador levou); ficam as duas entradas mais novas e as
+    de menos de 6 h (uma rodada pode estar subindo testes delas). A entrada
+    só aparece inteira (a pasta `<chave>.parcial` muda de nome no fim). A
+    trava `<chave>.trava` é um arquivo travado pelo sistema
+    (`File::try_lock`) enquanto o gerador vive, e o processo morto (o
+    test-boot que o test-all mata no prazo) a solta; outro gerador da mesma
+    chave espera a entrada dele.
+  - O teste sobe a entrada como o volume de dados com `snapshot=on`, como
+    o volume do build (as escritas dele vão para o overlay qcow2 do QEMU
+    em `qemu-tmp` e a entrada fica intacta). O `--primeiro-logon-feito`
+    que não acha a entrada roda o gerador antes do teste, na pasta
+    `primeiro-logon` da `--build-dir`; o `--gerar-primeiro-logon` só gera.
+  - No test-all, os testes com `--primeiro-logon-feito` ganham um gerador
+    por boot de gerador diferente (as imagens, a máquina, o acelerador e as
+    opções de carga dele; `plan::add_producers`), a execução
+    `primeiro-logon` com linha própria na tabela, a primeira da pasta de
+    imagens dela e uma vez só com `--repeat`. As execuções que sobem o
+    volume esperam o gerador; se ele falha, elas falham com o motivo dele
+    sem subir o QEMU. Com a conta de teste, as contas embutidas desligadas
+    (que a entrada pelo monitor liga) não mudam o volume, então os testes
+    com e sem entrada dividem a pasta de imagens e o gerador.
+  - Sobem do volume do primeiro logon feito: barra-de-tarefas,
+    reinicio-do-shell, menu-de-contexto, pasta-este-computador,
+    prompt-de-comando, bloco-de-notas e gerenciador-de-tarefas. O primeiro
+    logon continua conferido do volume novo nos testes logon-do-usuario,
+    perfil-do-usuario, sihost, userinit, explorer, area-de-trabalho e
+    area-de-trabalho-smp2, barra-de-tarefas-smp2, menu-iniciar e
+    desligamento-cadeia (o teste `every_components_test_is_a_valid_test_boot`
+    confere os do logon), e o próprio gerador é um boot do volume novo até a
+    área de trabalho.
+  - Medido (WHPX, uma CPU): com o anfitrião ocioso, o barra-de-tarefas
+    chega ao `EXPLORER_STARTED` aos 19,5 s e ao `DESKTOP_OK` aos 40,7 s no
+    volume do primeiro logon feito, contra 32,1 s e 46,8 s no volume novo; o
+    gerador leva 3m14s no test-all (a área de trabalho, uns 110 s de
+    escritas do convidado depois dela e 54 s de desligamento). Com o
+    anfitrião carregado o primeiro logon é o que mais se estica: o volume
+    novo chegou ao `EXPLORER_STARTED` aos 233 s e o mesmo disco, depois do
+    desligamento, aos 49 s; o gerador levou 393 s. No volume já logado o
+    boot não roda o gancho de primeiro boot (cmd, net, secinit, reg) nem o
+    FirstLogonAnim.exe, e os outros processos são os mesmos.
 - **Acelerador**: o `test-boot` usa `--accel=auto` por padrão: o WHPX (a
   virtualização do processador pelo Windows Hypervisor Platform) quando o
   QEMU o lista no `-accel help` e a partição sobe nesta máquina, senão o
