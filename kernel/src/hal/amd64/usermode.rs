@@ -1232,9 +1232,14 @@ fn nested_interval(teb: u64, enter: impl FnOnce(&UserExecutionBlock, u64) -> u64
     // o callback parte dele, como no KiCallUserMode.
     crate::ntos::ke::xstate::save_current(area);
     cpu::write_msr(MSR_KERNEL_GS_BASE, teb);
+    // Os segmentos do usuário como num intervalo: o CMTEB e o FS de uma
+    // thread WoW64 na entrada e, na saída, o FS base e o GS base do usuário
+    // (a falta do código de 64 bits de um callback confere o GS base dele).
+    load_user_segments(teb);
     let result = enter(block, stack);
     // O fim do intervalo voltou com STI: o IF do serviço de fora volta.
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    save_user_segments();
     let nested_kind = block.exit_kind.get();
     load_kernel_stack(outer_stack);
     cpu::write_msr(MSR_KERNEL_GS_BASE, swap_gs);
