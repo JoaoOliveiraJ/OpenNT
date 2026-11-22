@@ -243,7 +243,9 @@ impl HiveFile {
         request.attributes.length.set(ObjectAttributes::SIZE as u32);
         request.attributes.object_name.set(request.name.address());
         request.attributes.attributes.set(object_attributes);
-        let status = zw_files::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), share, disposition, options);
+        // O ZwCreateFile do CmpOpenHiveFile roda em KernelMode, também numa
+        // chamada de sistema de modo usuário (o NtLoadKey, o NtInitializeRegistry).
+        let status = crate::ntos::ps::previous_mode::with_kernel(|| zw_files::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), share, disposition, options)).and_then(|status| status);
         let handle = request.handle.get();
         let information = request.io_status.information.get();
         guest::free_bytes(block);

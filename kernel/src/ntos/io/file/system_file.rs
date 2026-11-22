@@ -86,7 +86,7 @@ impl SystemFile {
         request.attributes.length.set(ObjectAttributes::SIZE as u32);
         request.attributes.object_name.set(request.name.address());
         request.attributes.attributes.set(OPEN_ATTRIBUTES);
-        let status = zw::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), share, disposition, options);
+        let status = crate::ntos::ps::previous_mode::with_kernel(|| zw::create_kernel_file(request.handle.address(), access, request.attributes.address(), request.io_status.address(), share, disposition, options)).and_then(|status| status);
         let (handle, information) = (request.handle.get(), request.io_status.information.get());
         guest::free_bytes(block);
         match status {
@@ -245,7 +245,10 @@ pub fn read_file(nt_path: &str) -> Result<Vec<u8>, u32> {
 }
 
 /// Executa `operation` com um bloco de rascunho zerado (o IO_STATUS_BLOCK,
-/// o LARGE_INTEGER e o FILE_STANDARD_INFORMATION).
+/// o LARGE_INTEGER e o FILE_STANDARD_INFORMATION), em KernelMode como os
+/// serviços Zw: quem chama pode estar numa chamada de sistema de modo
+/// usuário (o NtFlushKey do smss que descarrega uma hive), e o handle de
+/// kernel e os buffers do kernel não valem em UserMode.
 fn with_transfer<T>(operation: impl FnOnce(&TransferRequest) -> Result<T, u32>) -> Result<T, u32> {
     let block = guest::alloc_bytes(TransferRequest::SIZE);
     if block == 0 {
@@ -253,7 +256,7 @@ fn with_transfer<T>(operation: impl FnOnce(&TransferRequest) -> Result<T, u32>) 
     }
     guest::write_bytes(block, &alloc::vec![0u8; TransferRequest::SIZE as usize]);
     // SAFETY: o bloco de rascunho recém-alocado e zerado.
-    let result = operation(unsafe { TransferRequest::at(block) });
+    let result = crate::ntos::ps::previous_mode::with_kernel(|| operation(unsafe { TransferRequest::at(block) })).unwrap_or(Err(STATUS_UNSUCCESSFUL));
     guest::free_bytes(block);
     result
 }

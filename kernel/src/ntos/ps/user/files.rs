@@ -411,11 +411,15 @@ pub fn device_file_target(name: &str) -> Option<(String, String)> {
 }
 
 /// O volume com VPB e o nome dentro dele de um arquivo de file system
-/// (`\Device\HarddiskVolume1` e `\EPROC.EXE`): `None` sem nome restante ou
-/// num dispositivo sem VPB.
+/// (`\Device\HarddiskVolume1` e `\EPROC.EXE`; a raiz `\` de um volume já
+/// montado por um file system real, como o `\??\C:\` que o smss abre):
+/// `None` sem nome restante ou num dispositivo sem VPB.
 fn mounted_file_target(device_path: &str, rest: &str) -> Option<(u64, String)> {
-    if rest.trim_matches('\\').is_empty() {
+    if rest.is_empty() {
         return None;
+    }
+    if rest.trim_matches('\\').is_empty() {
+        return crate::ntos::io::parse::volume_device_for_open(device_path).map(|device| (device, String::from("\\")));
     }
     crate::ntos::io::parse::split_volume_path(&alloc::format!("{device_path}{rest}"))
 }
@@ -580,8 +584,16 @@ fn open_device_name(handle_pointer: u64, device_path: Option<String>, object_fla
     // dispositivo, como `\Device\NamedPipe\ProtectedPrefix`), com o
     // IRP_MJ_CREATE completo: acesso, compartilhamento, disposição e opções.
     if let Some((device_path, rest)) = device_path.as_deref().and_then(io_manager::split_device_path) {
-        // Um arquivo num volume com VPB vai ao file system dono.
+        // Um arquivo num volume com VPB vai ao file system dono; sem nome
+        // restante e com acesso além do de uma abertura direta, o volume
+        // montado inteiro (a abertura do volume do IopParseDevice, como o
+        // `\??\C:` que o smss consulta).
         if special.is_none() {
+            if rest.is_empty() && crate::ntos::io::parse::is_volume_open(request.access) {
+                if let Some(device) = crate::ntos::io::parse::volume_device_for_open(&device_path) {
+                    return open_mounted_file(handle_pointer, iosb, device_path, device, "", disposition, request, object_flags);
+                }
+            }
             if let Some((device, remaining)) = mounted_file_target(&device_path, &rest) {
                 return open_mounted_file(handle_pointer, iosb, device_path, device, &remaining, disposition, request, object_flags);
             }

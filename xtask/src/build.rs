@@ -514,7 +514,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     }
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
-    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", setup_command.as_deref()) {
+    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", !options.system_volume.is_empty(), setup_command.as_deref()) {
         let path = format!("Windows/System32/config/{name}");
         origins.push((path.clone(), None));
         ntfs_files.push((path, image));

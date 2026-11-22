@@ -54,7 +54,7 @@ fn map_locale_table() -> Result<Result<(u64, u64), u32>, KernelError> {
     let section = match cached {
         Some(section) => section,
         None => {
-            let backing = match crate::ntos::mm::section::file::system_section_file("C:\\Windows\\System32\\locale.nls") {
+            let backing = match crate::ntos::mm::section::file::system_section_file("\\SystemRoot\\System32\\locale.nls") {
                 Ok(Some(file)) => file,
                 Ok(None) => return Ok(Err(STATUS_OBJECT_NAME_NOT_FOUND)),
                 Err(status) => return Ok(Err(status)),

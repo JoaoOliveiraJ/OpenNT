@@ -101,6 +101,42 @@ pub fn check() {
         }
         Err(error) => debug_print!("[system-volume] S1: {}", error),
     }
+    // O que o Explorer precisa para mostrar o C: em Este Computador: o
+    // devnode STORAGE\Volume do volume, que o volmgr.sys relata, com a
+    // interface GUID_DEVINTERFACE_VOLUME habilitada.
+    match volume_devnode() {
+        Ok(summary) => {
+            debug_print!("[system-volume] {}", summary);
+            debug_print!("SYSTEM_VOLUME_DEVNODE_OK");
+        }
+        Err(error) => debug_print!("[system-volume] devnode do C:: {}", error),
+    }
+}
+
+/// GUID_DEVINTERFACE_VOLUME {53F5630D-B6BF-11D0-94F2-00A0C91EFB8B}.
+const GUID_DEVINTERFACE_VOLUME: [u8; 16] = [0x0D, 0x63, 0xF5, 0x53, 0xBF, 0xB6, 0xD0, 0x11, 0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B];
+
+/// O devnode do volume do `\GLOBAL??\C:` (o PDO que o volmgr.sys criou é o
+/// `\Device\HarddiskVolumeN`): STORAGE\Volume, iniciado, com a interface de
+/// volume habilitada.
+fn volume_devnode() -> Result<String, String> {
+    use crate::ntos::io::pnp::devnode;
+    let volume = boot_volume().ok_or_else(|| String::from("nenhum volume com DO_SYSTEM_BOOT_PARTITION"))?;
+    let drive = object_manager::lookup("\\GLOBAL??\\C:");
+    if drive.is_none() || drive != object_manager::lookup(&volume) {
+        return Err(format!("\\GLOBAL??\\C: nao leva a {volume}"));
+    }
+    let device = object_manager::lookup(&volume).and_then(crate::ntos::io::io_manager::device).map(|entry| entry.native_device).unwrap_or(0);
+    let node = devnode::get(device).ok_or_else(|| format!("{volume} sem devnode"))?;
+    if !node.instance_path.to_uppercase().starts_with("STORAGE\\VOLUME\\") {
+        return Err(format!("{volume}: devnode {}", node.instance_path));
+    }
+    if node.state != devnode::State::Started {
+        return Err(format!("{}: estado {:?}, problema {:#x}", node.instance_path, node.state, node.problem));
+    }
+    let instance = node.instance_path.replace('\\', "#").to_uppercase();
+    let link = crate::ntos::io::device_interface::enabled_links(&GUID_DEVINTERFACE_VOLUME).into_iter().find(|link| link.to_uppercase().contains(&instance)).ok_or_else(|| format!("{}: sem interface de volume habilitada", node.instance_path))?;
+    Ok(format!("C: = {volume}: devnode {} ({}), interface {}", node.instance_path, node.service.as_deref().unwrap_or("-"), link))
 }
 
 /// O marco S1 depois da troca do `\SystemRoot`.

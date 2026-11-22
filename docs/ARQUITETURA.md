@@ -2645,8 +2645,10 @@ cadeia inteira passar com a opção. As decisões:
    OI/CI e ALL APPLICATION PACKAGES) antes de a cadeia rodar nele, senão os
    processos AppContainer não abrem nada.
 7. **O arquivo de paginação** no C: pelo ntfs.sys: o NtCreatePagingFile já
-   segue o MiCreatePagingFile; falta o PpPagePathAssign
-   (DEVICE_USAGE_NOTIFICATION à pilha do volume).
+   segue o MiCreatePagingFile, e com `--volume-sistema=ntfs.sys` o
+   PagingFiles da imagem é o C:\pagefile.sys (`hive_image::machine_hives`;
+   o boot comum continua com o D:), que o smss cria pelo ntfs.sys; falta o
+   PpPagePathAssign (DEVICE_USAGE_NOTIFICATION à pilha do volume).
 
 Os marcos, cada um com um teste:
 
@@ -2768,6 +2770,25 @@ Parameters.SetFile.FileObject, no IoSetInformation e no
 NtSetInformationFile. A abertura de usuário relativa a um arquivo de file
 system é o IopParseFile (`parse::open_related_file`: o VPB do arquivo
 relacionado e o FILE_OBJECT com RelatedFileObject).
+
+O que o S2 faz (teste `volume-sistema-smss`): o smss.exe, o KnownDlls (o
+diretório do C:\Windows\System32 aberto pelo smss e cada DLL aberta
+relativa a ele), o csrss, o wininit, o services, o lsass e o winlogon
+rodam dos arquivos do ntfs.sys. Para isso o locale.nls do
+NtInitializeNlsFiles é aberto pelo `\SystemRoot`, como no NT; o `\??\C:`
+com acesso além da abertura direta é a abertura do volume pelo file system
+(FO_VOLUME_OPEN) e o `\??\C:\` é a raiz do volume montado
+(`ps/user/files.rs`); o D: do volume do kernel sai depois da troca, e o
+smss faz o arquivo de paginação no C:, pelo ntfs.sys (item 7); e o
+SystemFile e o ZwCreateFile do CmpOpenHiveFile rodam em KernelMode, como
+os serviços Zw: a descarga de uma hive pedida por um NtFlushKey de modo
+usuário grava pelo handle de kernel da hive (sem isso o lsass não gravava a
+SECURITY e o services saía). O teste também confere o que o Explorer
+precisa para mostrar o C: em Este Computador: o devnode STORAGE\Volume do
+volume iniciado, com a interface GUID_DEVINTERFACE_VOLUME habilitada
+(`SYSTEM_VOLUME_DEVNODE_OK`). Do S3, a tela de logon já aparece com o C: no
+ntfs.sys (teste `volume-sistema-logon`), e a área de trabalho também
+(DESKTOP_OK), por volta dos 260 s.
 
 Os riscos conhecidos: o tempo de boot (cada leitura atravessa seis ou sete
 drivers e uma interrupção), o Cc e o ntfs.sys sob a carga da cadeia

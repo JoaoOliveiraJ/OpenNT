@@ -553,7 +553,7 @@ fn seed_of(key: crate::host_language::HostKey) -> cm::seed::SeedKey {
 /// arquivo: SYSTEM, SOFTWARE, SAM, SECURITY e DEFAULT. `smss_boot`: o boot
 /// do processo inicial real (`--initial-process=smss`). `setup_command`: o
 /// gancho de primeiro boot do `--conta-de-teste`.
-pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
+pub fn machine_hives(smss_boot: bool, system_volume: bool, setup_command: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
     let mut system = cm::seed::system_keys(smss_boot);
     let mut software = cm::seed::software_keys(smss_boot);
     let mut default = cm::seed::default_keys();
@@ -600,6 +600,15 @@ pub fn machine_hives(smss_boot: bool, setup_command: Option<&str>) -> Vec<(&'sta
         // depois do estado de setup: troca o `SetupType` e o `CmdLine`.
         if let Some(command) = setup_command {
             system.extend(crate::test_account::system_keys(command).into_iter().map(seed_of));
+        }
+    }
+    // `--volume-sistema=ntfs.sys` (`system_volume`): o arquivo de paginação
+    // no C:, servido pelo ntfs.sys, no lugar do D: do volume do kernel.
+    if system_volume {
+        for key in system.iter_mut().filter(|key| key.path.ends_with("Session Manager\\Memory Management")) {
+            for value in key.values.iter_mut().filter(|value| value.0 == "PagingFiles") {
+                value.2 = cm::seed::multi(cm::session_manager::SYSTEM_VOLUME_PAGING_FILES);
+            }
         }
     }
     // Os descritores: as raízes de uma instalação nova e, no boot do

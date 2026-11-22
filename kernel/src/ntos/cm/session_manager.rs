@@ -146,7 +146,9 @@ const ENVIRONMENT: &[(&str, Value)] = &[
 
 /// `Memory Management`. O `PagingFiles` segue o formato da instalação
 /// (`caminho mínimo máximo`, em MB), com o arquivo de paginação no volume de
-/// dados D:, que o smss cria pelo NtCreatePagingFile.
+/// dados D:, que o smss cria pelo NtCreatePagingFile; a imagem de
+/// `--volume-sistema=ntfs.sys` troca o valor por
+/// [`SYSTEM_VOLUME_PAGING_FILES`].
 const MEMORY_MANAGEMENT: &[(&str, Value)] = &[
     ("PagingFiles", Value::Strings(&["D:\\pagefile.sys 192 256"])),
     ("ClearPageFileAtShutdown", Value::Number(0)),
@@ -217,3 +219,9 @@ pub fn seed_keys() -> Vec<SeedKey> {
     }
     alloc::vec![key("", ROOT), key("SubSystems", SUBSYSTEMS), key("KnownDLLs", &known), key("DOS Devices", &devices), key("Environment", ENVIRONMENT), key("Memory Management", MEMORY_MANAGEMENT), crash_control]
 }
+
+/// O `PagingFiles` da imagem de `--volume-sistema=ntfs.sys`
+/// (`hive_image::machine_hives` do xtask): o arquivo de paginação no C:,
+/// servido pelo ntfs.sys (depois da troca do `\SystemRoot` o volume do
+/// kernel não recebe E/S nem tem letra).
+pub const SYSTEM_VOLUME_PAGING_FILES: &[&str] = &["C:\\pagefile.sys 192 256"];

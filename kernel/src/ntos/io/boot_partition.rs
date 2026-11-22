@@ -249,8 +249,17 @@ fn reassign_system_root(device_path: &str) {
     }
     crate::drivers::fs::volume_files::switch_system_volume();
     let hives = crate::ntos::cm::hive_list::reopen_system_root_hives();
+    // O D: do volume do kernel (o disco de onde o OpenNT carregou, o papel
+    // do volume do winload) sai: depois da troca ele não recebe mais E/S e
+    // não é uma unidade da instalação.
+    if crate::ntos::io::parse::kernel_volume_device(KERNEL_VOLUME_DRIVE).is_some() {
+        object_manager::unlink(KERNEL_VOLUME_DRIVE);
+    }
     debug_print!("[io] IopReassignSystemRoot: {} -> {}, {} hives reabertas no volume novo", BOOT_DEVICE, device_path, hives);
 }
+
+/// A letra que o boot dá ao volume do kernel (`init/phase1.rs`).
+const KERNEL_VOLUME_DRIVE: &str = "\\GLOBAL??\\D:";
 
 /// `--volume-sistema=ntfs.sys`: o IopAssignBootDriveLetter do volume de
 /// boot da pilha real (marcado em [`system_volume_boot_device_wait`]): o
