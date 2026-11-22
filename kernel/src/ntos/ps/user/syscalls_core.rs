@@ -983,6 +983,56 @@ fn nt_query_information_process(handle: u64, class: u64, buffer: u64, length: u6
             set_returned(length as u32)?;
             Ok(STATUS_SUCCESS)
         }
+        // ProcessWindowInformation (PROCESS_WINDOW_INFORMATION: o ULONG
+        // WindowFlags, o USHORT WindowTitleLength e o título), como o
+        // NtQueryInformationProcess do 19041 (0x623654): o handle com
+        // PROCESS_QUERY_LIMITED_INFORMATION, anexado ao processo, o
+        // WindowFlags (+0xA4) e o WindowTitle (+0xB0) do
+        // RTL_USER_PROCESS_PARAMETERS do PEB (num processo WOW64, os do
+        // PEB32: +0x68 e +0x70); o tamanho é o comprimento do título mais 6,
+        // gravado no ReturnLength mesmo quando o buffer é menor
+        // (STATUS_INFO_LENGTH_MISMATCH); o título chega ao buffer, logo
+        // depois do comprimento, pelo MmCopyVirtualMemory do processo dele.
+        // O CallerIdentity::GetWeakProcessAppId do twinui lê por ela o AppId
+        // do título (o STARTF_TITLEISAPPID, 0x1000, nas flags).
+        50 => {
+            let target = match queried_process(handle) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            let wow64_peb = crate::ntos::ps::process_accessors::wow64_process(target);
+            let native_peb = crate::ntos::ps::process_accessors::peb(target);
+            let read = crate::ntos::ps::process_context::with_process(target, || -> Result<(u32, u16, u64), KernelError> {
+                if wow64_peb != 0 {
+                    let parameters = guest::try_read::<u32>(wow64_peb + 0x10)? as u64;
+                    let flags = guest::try_read::<u32>(parameters + 0x68)?;
+                    let title_length = guest::try_read::<u16>(parameters + 0x70)?;
+                    let title_buffer = guest::try_read::<u32>(parameters + 0x74)? as u64;
+                    return Ok((flags, title_length, title_buffer));
+                }
+                let parameters = state::user_struct::<crate::ntos::inc::types::Peb>(native_peb)?.process_parameters.probe_get()?;
+                let parameters = state::user_struct::<crate::ntos::inc::types::RtlUserProcessParameters>(parameters)?;
+                Ok((parameters.window_flags.probe_get()?, parameters.window_title.length.probe_get()?, parameters.window_title.buffer.probe_get()?))
+            });
+            let (flags, title_length, title_buffer) = match read {
+                Ok(Ok(values)) => values,
+                Ok(Err(error)) => return Ok(error.status),
+                Err(_) => return Ok(0xC000_010A),
+            };
+            let required = title_length as u32 + 6;
+            set_returned(required)?;
+            if (length as u32) < required {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            guest::try_write::<u32>(buffer, flags)?;
+            guest::try_write::<u16>(buffer + 4, title_length)?;
+            if title_length == 0 {
+                return Ok(STATUS_SUCCESS);
+            }
+            let current = crate::ntos::ps::process::get_current_process();
+            let (status, _) = crate::ntos::mm::copy_virtual::copy_virtual_memory(target, title_buffer, current, buffer + 6, title_length as u64, 1)?;
+            Ok(status)
+        }
         // ProcessLUIDDeviceMapsEnabled (ULONG): o NtQueryInformationProcess
         // 19041 sonda o buffer (alinhamento 4) e responde a constante 1 sem
         // consultar o handle; comprimento diferente de 4 é
