@@ -146,5 +146,21 @@ pub fn map(section: &Arc<Section>, request: &Request, process: u64, regions: Reg
         section_views::unmap(&owned)?;
         return Err(error);
     }
+    if image_base != preferred_base {
+        OFF_BASE_VIEWS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        OFF_BASE_PAGES.fetch_add(size / 4096, core::sync::atomic::Ordering::Relaxed);
+    }
     Ok(Ok(Mapped { view, status: if image_base == preferred_base { 0 } else { 0x4000_0003 }, offset }))
+}
+
+/// As vistas de imagem mapeadas fora da ImageBase do cabeçalho
+/// (STATUS_IMAGE_NOT_AT_BASE) e as páginas delas, desde o boot: a ntdll de
+/// cada processo reloca essas vistas, e as páginas relocadas viram cópias
+/// privadas (o 19041 reloca no protótipo, MiRelocateImagePfn).
+static OFF_BASE_VIEWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OFF_BASE_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// (vistas, páginas) mapeadas fora da ImageBase desde o boot.
+pub fn off_base_views() -> (u64, u64) {
+    (OFF_BASE_VIEWS.load(core::sync::atomic::Ordering::Relaxed), OFF_BASE_PAGES.load(core::sync::atomic::Ordering::Relaxed))
 }

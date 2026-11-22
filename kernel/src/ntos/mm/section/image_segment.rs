@@ -346,8 +346,8 @@ impl ViewPages {
     }
 }
 
-fn private_copy(source: u64) -> Option<u64> {
-    let frame = pfn::alloc_page_for(pfn::FrameUse::ImageCopy);
+fn private_copy(source: u64, owner: pfn::FrameUse) -> Option<u64> {
+    let frame = pfn::alloc_page_for(owner);
     if frame == 0 {
         return None;
     }
@@ -368,7 +368,7 @@ pub fn map_view(segment: &ImageSegment, root: u64, base: u64, offset: u64, size:
         let protect = segment.protections[first + index];
         let master = segment.frames[first + index];
         let (frame, private) = if writable(protect) {
-            match private_copy(master) {
+            match private_copy(master, pfn::FrameUse::ImageCopy) {
                 Some(frame) => (frame, true),
                 None => {
                     unmap_pages(root, base, &mut pages);
@@ -411,7 +411,7 @@ pub fn write_copy(pages: &mut ViewPages, index: usize) -> Result<Option<u64>, u3
     if pages.private[index] {
         return Ok(None);
     }
-    let copy = private_copy(frame).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    let copy = private_copy(frame, pfn::FrameUse::ImageProtectCopy).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
     pages.frames[index] = copy;
     pages.private[index] = true;
     Ok(Some(copy))

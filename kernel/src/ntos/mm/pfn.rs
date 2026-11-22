@@ -47,8 +47,13 @@ pub enum FrameUse {
     UserImage,
     /// Páginas protótipo das control areas de imagem.
     ImagePrototype,
-    /// Cópias privadas de páginas graváveis das vistas de imagem.
+    /// Cópias privadas de páginas graváveis das vistas de imagem, feitas no
+    /// mapeamento.
     ImageCopy,
+    /// Cópias privadas de páginas divididas das vistas de imagem que o
+    /// NtProtectVirtualMemory tornou graváveis (a relocação da vista fora da
+    /// ImageBase, por exemplo).
+    ImageProtectCopy,
     /// Seções de arquivo de dados (as páginas lidas e as cópias originais).
     DataSection,
     /// Seções do arquivo de paginação.
@@ -68,7 +73,7 @@ pub enum FrameUse {
 }
 
 /// Donos de [`FrameUse`].
-pub const FRAME_USES: usize = 16;
+pub const FRAME_USES: usize = 17;
 
 impl FrameUse {
     /// Todos, na ordem da linha de diagnóstico.
@@ -80,6 +85,7 @@ impl FrameUse {
         FrameUse::UserImage,
         FrameUse::ImagePrototype,
         FrameUse::ImageCopy,
+        FrameUse::ImageProtectCopy,
         FrameUse::DataSection,
         FrameUse::PagefileSection,
         FrameUse::SectionCopy,
@@ -102,6 +108,7 @@ impl FrameUse {
             FrameUse::UserImage => "imagens-do-loader",
             FrameUse::ImagePrototype => "prototipos-de-imagem",
             FrameUse::ImageCopy => "copias-de-imagem",
+            FrameUse::ImageProtectCopy => "copias-de-imagem-na-protecao",
             FrameUse::DataSection => "secoes-de-arquivo",
             FrameUse::PagefileSection => "secoes-de-pagefile",
             FrameUse::SectionCopy => "copias-de-secao",

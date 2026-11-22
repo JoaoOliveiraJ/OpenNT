@@ -201,6 +201,8 @@ pub fn print_frame_owners() {
         line.push_str(&alloc::format!(", {} {}", owner.label(), usage[owner as usize]));
     }
     line.push_str(&alloc::format!("; faltas de zero sob demanda {} (recusadas {})", super::page_fault::demand_zero_faults(), super::page_fault::refused_faults()));
+    let (views, pages) = super::section::image_view::off_base_views();
+    line.push_str(&alloc::format!("; vistas de imagem fora da ImageBase {} ({} paginas)", views, pages));
     crate::debug_print!("{}", line);
 }
 
