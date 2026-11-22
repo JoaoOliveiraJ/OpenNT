@@ -726,7 +726,17 @@ fn check_server_security(pointer: u64, required_sid: bool, server_process: u64) 
 }
 
 fn nt_alpc_connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64) -> Result<u32, KernelError> {
-    state::guarded(|| connect_port(out, name, oa, port_attributes, rsp, true))
+    state::guarded(|| connect_entry(out, name, oa, port_attributes, rsp, true))
+}
+
+/// A conexão de um processo x86 (ALPC_MSGFLG_WOW64_CALL nas flags) passa a
+/// mensagem e os atributos de 32 bits pela forma nativa
+/// (`alpc::message::wow64`).
+fn connect_entry(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, required_sid: bool) -> Result<u32, KernelError> {
+    if state::probe_syscall_stack(rsp, 56) && crate::ntos::alpc::message::wow64::is_wow64_call(state::stack_arg32(rsp, 5)) {
+        return crate::ntos::alpc::message::wow64::connect(rsp, |native| connect_port(out, name, oa, port_attributes, native, required_sid));
+    }
+    connect_port(out, name, oa, port_attributes, rsp, required_sid)
 }
 
 /// NtAlpcConnectPortEx(PortHandle*, ConnectionPortObjectAttributes,
@@ -749,7 +759,7 @@ fn nt_alpc_connect_port_ex(out: u64, connection: u64, oa: u64, port_attributes: 
         if name == 0 {
             return Ok(0xC000_0033);
         }
-        connect_port(out, name, oa, port_attributes, rsp, false)
+        connect_entry(out, name, oa, port_attributes, rsp, false)
     })
 }
 
@@ -790,11 +800,11 @@ fn connect_port(out: u64, name: u64, oa: u64, port_attributes: u64, rsp: u64, re
     if flags & RELEASE_MESSAGE != 0 {
         return Ok(INVALID);
     }
-    // ALPC_MSGFLG_WOW64_CALL sem o bit 30: o PORT_MESSAGE e os atributos de
-    // 32 bits (AlpcpProbeAndCaptureMessageHeader, 0x5e0288), que o OpenNT não
-    // tem.
+    // ALPC_MSGFLG_WOW64_CALL sem o bit 30 chega aqui só fora de um processo
+    // WoW64 x86 (o de um processo x86 já veio na forma nativa por
+    // `connect_entry`): a forma de 32 bits não existe para ele.
     if flags & 0xC000_0000 == 0x8000_0000 {
-        crate::debug_print!("[alpc] conexao com mensagem de 32 bits (ALPC_MSGFLG_WOW64_CALL) sem suporte");
+        crate::debug_print!("[alpc] conexao com mensagem de 32 bits (ALPC_MSGFLG_WOW64_CALL) fora de um processo WoW64");
         return Ok(0xC000_00BB);
     }
     let mut status = check_server_security(state::stack_arg(rsp, 6), required_sid, listener.process);
@@ -1718,6 +1728,20 @@ fn nt_alpc_send_wait_receive_port(handle: u64, flags: u64, input: u64, attribute
             let hex: alloc::string::String = bytes.iter().map(|byte| alloc::format!("{byte:02x}")).collect();
             crate::debug_print!("[alpc] envio de usuario {:#x} flags {:#x}: {}", handle, flags as u32, hex);
         }
+    }
+    // ALPC_MSGFLG_WOW64_CALL sem o bit 30, que o wow64.dll liga em todo envio
+    // de um processo x86: o PORT_MESSAGE32 e os atributos de 32 bits passam
+    // pela forma nativa (`alpc::message::wow64`). Fora de um processo WoW64
+    // x86 a forma de 32 bits não existe.
+    if flags as u32 & 0xC000_0000 == 0x8000_0000 {
+        if !state::probe_syscall_stack(rsp, 32) {
+            return Ok(AV);
+        }
+        if crate::ntos::alpc::message::wow64::is_wow64_call(flags as u32) {
+            return crate::ntos::alpc::message::wow64::send_wait_receive(handle, flags as u32, input, attributes, rsp, send_receive);
+        }
+        crate::debug_print!("[alpc] envio com mensagem de 32 bits (ALPC_MSGFLG_WOW64_CALL) fora de um processo WoW64: porta {:#x}", handle);
+        return Ok(0xC000_00BB);
     }
     let status = send_receive(handle, flags, input, attributes, rsp)?;
     if status == INVALID {
