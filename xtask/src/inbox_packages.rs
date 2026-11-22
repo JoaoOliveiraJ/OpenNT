@@ -126,9 +126,14 @@ const APP_READINESS_APPID: &str = "{88283d7c-46f4-47d5-8fc2-db0b5cf0cb54}";
 /// Windows.Internal.CapabilityAccess.Management.CapabilityProvisioning, que
 /// o CapabilityAuthorizationHandler::Initialize das extensões de
 /// implantação ativa em cada registro de pacote (o servidor camsvc de
-/// `logon_screen`). O StateRepository vai com os de `user_services`.
+/// `logon_screen`). E o serviço EFS (o efssvc.dll no lsass.exe, início sob
+/// demanda), pela configuração dele: o `Parameters\EdpCredLibProxy`
+/// (feclient.dll) que a inicialização do efswrt.dll lê; sem o valor o
+/// CdplIsSupported volta E_NOTIMPL e o DEH::State::ExtensionHandler das
+/// extensões de implantação (SetDataProtectionLevel) falha o registro. O
+/// StateRepository vai com os de `user_services`.
 #[cfg_attr(not(windows), allow(dead_code))]
-const SERVICES: &[&str] = &["AppReadiness", "AppXSvc", "camsvc"];
+const SERVICES: &[&str] = &["AppReadiness", "AppXSvc", "camsvc", "EFS"];
 
 /// O provedor de confiança WINTRUST_ACTION_GENERIC_VERIFY_V2 (as funções do
 /// WINTRUST.DLL em `Cryptography\Providers\Trust\<etapa>\{guid}`).

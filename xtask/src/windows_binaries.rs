@@ -1045,6 +1045,8 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // O serviço camsvc (`inbox_packages`), servidor da CapabilityProvisioning
     // que o mesmo Initialize ativa logo depois.
     "CapabilityAccessManager.dll",
+    // O serviço EFS (`inbox_packages`), no lsass.exe.
+    "efssvc.dll",
     // A classe WinRT Windows.Networking.Connectivity.NetworkInformation, que
     // o AppReadiness ativa ao subir (sem ela, REGDB_E_CLASSNOTREG e o
     // serviço para), com a carga atrasada do uso de dados.
