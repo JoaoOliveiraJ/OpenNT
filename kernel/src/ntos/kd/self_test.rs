@@ -125,11 +125,16 @@ fn post_processor_job(_device: u64, _context: u64) {
     let count = AP_REQUEST.load(Ordering::Acquire);
     let slot = (0..smp::ap_slot_count()).find_map(|index| smp::ap_slot(index).filter(|&slot| smp::is_scheduling(slot)));
     match slot {
-        Some(slot) => match smp::start_job(slot, processor_job as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64, [count, 0, 0, 0]) {
-            Ok(true) => crate::debug_print!("[kd] kdtest ap: trabalho na caixa do AP slot {} ({} chamadas)", slot, count),
-            Ok(false) => crate::debug_print!("[kd] kdtest ap: a caixa do AP slot {} esta ocupada", slot),
-            Err(error) => crate::debug_print!("[kd] kdtest ap: {}", error),
-        },
+        Some(slot) => {
+            // A linha sai antes: o AP para a máquina logo depois do trabalho
+            // postado, com esta CPU no meio da serial.
+            crate::debug_print!("[kd] kdtest ap: trabalho para o AP slot {} ({} chamadas)", slot, count);
+            match smp::start_job(slot, processor_job as extern "win64" fn(u64, u64, u64, u64) -> u64 as usize as u64, [count, 0, 0, 0]) {
+                Ok(true) => {}
+                Ok(false) => crate::debug_print!("[kd] kdtest ap: a caixa do AP slot {} esta ocupada", slot),
+                Err(error) => crate::debug_print!("[kd] kdtest ap: {}", error),
+            }
+        }
         None => crate::debug_print!("[kd] kdtest ap: nenhum AP com o anel 3 armado (--user-smp)"),
     }
     AP_REQUEST.store(0, Ordering::Release);

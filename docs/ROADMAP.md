@@ -85,7 +85,7 @@ Carregador de PE, funções exportadas pelo kernel, Code Integrity real (ci.dll)
 
 | Componente | Estado | Teste automático |
 | --- | --- | --- |
-| Depurador do kernel | Funciona | kd, kd-parada, kd-usuario, reinicio-do-shell |
+| Depurador do kernel | Funciona | kd, kd-parada, kd-usuario, kd-smp2, kd-usuario-smp2, reinicio-do-shell |
 | Relógio e fuso horário | Funciona | relogio, selftest, fase6, fase7 |
 | Carregador de PE e exports do kernel | Parcial | fase6, boot |
 | hal.dll | Funciona | drivers |
