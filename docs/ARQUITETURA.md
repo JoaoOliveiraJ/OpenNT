@@ -6062,7 +6062,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   de `Hardware Profiles` (o `LogPixels` do DPI, `xtask/src/fonts.rs`), o
   tema que o uxinit do winlogon carrega sem o serviço Themes (o
   `aero.msstyles` com o `.mui` e as chaves `ThemeManager` da SOFTWARE e da
-  DEFAULT, `xtask/src/theme.rs`),
+  DEFAULT) e o `shellstyle.dll` dele, as folhas de estilo do quadro da vista
+  das janelas de pasta (`xtask/src/theme.rs`),
   o logon do usuário até a barra de tarefas e a área de trabalho (o
   userinit.exe com o userinitext.dll e o winlogonext.dll, o
   explorer.exe de `\Windows` com o `.mui`, na raiz do volume, o
