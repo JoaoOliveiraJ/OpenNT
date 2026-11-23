@@ -887,7 +887,7 @@ mod tests {
         }
         let directory = std::env::temp_dir().join(format!("opennt-perfis-{}", std::process::id()));
         let image = directory.join("ntfs.img");
-        let built = crate::ntfs_image::build(&image, &profiles.files, &profiles.nodes, None, 1, 0);
+        let built = crate::ntfs_image::build(&image, &profiles.files, &profiles.nodes, None, true, 1, 0);
         let _ = std::fs::remove_dir_all(&directory);
         assert!(built.is_ok(), "{built:?}");
     }

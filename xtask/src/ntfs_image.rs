@@ -13,8 +13,9 @@
 //!
 //! Registros: 0=$MFT 1=$MFTMirr 2=$LogFile 3=$Volume 4=$AttrDef 5='.' (raiz)
 //! 6=$Bitmap 7=$Boot 8=$BadClus 9=$Secure 10=$UpCase 11=$Extend, 12..15
-//! reservados (em uso, vazios), 16=HELLO.TXT, 17.. os arquivos extras, os
-//! diretórios intermediários e por fim os arquivos do $Extend ($Quota,
+//! reservados (em uso, vazios), 16=HELLO.TXT (só nos volumes dos
+//! autotestes; sem ele, o primeiro arquivo extra), depois os arquivos extras,
+//! os diretórios intermediários e por fim os arquivos do $Extend ($Quota,
 //! $ObjId, $Reparse): o NTFS só aceita uma entrada de índice que aponte um
 //! registro abaixo de 16 no diretório raiz. Os registros do sistema têm o
 //! número de sequência igual ao número do registro (o $MFT, 1), como o NTFS
@@ -714,10 +715,11 @@ fn attribute_definitions() -> Vec<u8> {
 
 /// Monta a imagem com os arquivos extras `(nome no volume, bytes)`, os
 /// metadados de `nodes` e o descritor da raiz `root` (com ele, um arquivo
-/// ou diretório sem descritor próprio herda do pai) e a grava em `output`;
-/// devolve o tamanho.
-pub fn build(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
-    let image = volume_image(extras, nodes, root, free_space_mib, extra_records, 0)?;
+/// ou diretório sem descritor próprio herda do pai), com o arquivo conhecido
+/// dos autotestes na raiz (`HELLO.TXT`) se `known_file`, e a grava em
+/// `output`; devolve o tamanho.
+pub fn build(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, known_file: bool, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let image = volume_image(extras, nodes, root, known_file, free_space_mib, extra_records, 0)?;
     write(output, &image)?;
     Ok(image.len())
 }
@@ -742,7 +744,7 @@ const DISK_SIGNATURE: u32 = 0x4F4E_5654;
 /// os arquivos extras. O setor de boot do volume leva o deslocamento da
 /// partição em HiddenSectors, como o formatador grava. Devolve o tamanho.
 pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
-    let volume = volume_image(extras, &[], None, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+    let volume = volume_image(extras, &[], None, true, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
     write_partitioned(output, &volume)
 }
 
@@ -750,8 +752,8 @@ pub fn build_partitioned(output: &Path, extras: &[(String, Vec<u8>)], free_space
 /// num disco particionado como o de [`build_partitioned`]: o
 /// `--volume-sistema=ntfs.sys`, em que a pilha de armazenamento real acha a
 /// partição e o ntfs.sys monta o volume dela.
-pub fn build_system_disk(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
-    let volume = volume_image(extras, nodes, root, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
+pub fn build_system_disk(output: &Path, extras: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, known_file: bool, free_space_mib: usize, extra_records: usize) -> Result<usize, String> {
+    let volume = volume_image(extras, nodes, root, known_file, free_space_mib, extra_records, PARTITION_START_LBA as u32)?;
     write_partitioned(output, &volume)
 }
 
@@ -784,7 +786,9 @@ fn parent_key(path: &str) -> String {
 /// volume, e nada herda) e `hidden_sectors` o LBA do início da partição que
 /// a contém (0 num disco sem partições). Um nome terminado em '/' é um
 /// diretório vazio: uma pasta da instalação sem arquivo da imagem dentro.
-fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
+/// Com `known_file`, a raiz tem o HELLO.TXT que os autotestes leem; o volume
+/// do sistema do boot do smss não o leva, como uma instalação nova.
+fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8]>, known_file: bool, free_space_mib: usize, extra_records: usize, hidden_sectors: u32) -> Result<Vec<u8>, String> {
     let extras: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(name, _)| !name.ends_with('/')).collect();
     // Diretórios intermediários dos nomes com '/' e os vazios, na ordem de
     // criação, e os diretórios dos nós (com os pais).
@@ -859,11 +863,13 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8
             let Some(parent) = (if parent.is_empty() { Some(&root) } else { folders.get(&parent) }) else { continue };
             inherited.insert(key, descriptors.id(&descriptor::inherited(parent, false).to_bytes())?);
         }
-        hello_id = descriptors.id(&descriptor::inherited(&root, false).to_bytes())?;
+        if known_file {
+            hello_id = descriptors.id(&descriptor::inherited(&root, false).to_bytes())?;
+        }
     }
     // O SecurityId de um caminho: o do nó, o herdado ou o comum.
     let security_id_of = |key: &str, node: Option<u32>| node.or_else(|| inherited.get(key).copied()).unwrap_or(SECURITY_ID);
-    let first_extra = HELLO_RECORD + 1;
+    let first_extra = HELLO_RECORD + u64::from(known_file);
     let directory_record = |path: &str| -> u64 {
         if path.is_empty() {
             ROOT
@@ -954,10 +960,12 @@ fn volume_image(entries: &[(String, Vec<u8>)], nodes: &[Node], root: Option<&[u8
     for number in 12..16 {
         records.push((number, IN_USE, vec![standard_information(HIDDEN_SYSTEM), resident(0x80, "", Vec::new())]));
     }
-    // HELLO.TXT e os arquivos extras.
-    let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, name_space(HELLO_NAME))?;
-    children.entry(ROOT).or_default().push((HELLO_RECORD, hello.clone()));
-    records.push((HELLO_RECORD, IN_USE, vec![standard_information_with(0, hello_id), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
+    // O HELLO.TXT e os arquivos extras.
+    if known_file {
+        let hello = file_name_value(ROOT, HELLO_NAME, FILE_ARCHIVE, 0, HELLO_DATA.len() as u64, name_space(HELLO_NAME))?;
+        children.entry(ROOT).or_default().push((HELLO_RECORD, hello.clone()));
+        records.push((HELLO_RECORD, IN_USE, vec![standard_information_with(0, hello_id), file_name_attribute(hello), resident(0x80, "", HELLO_DATA.to_vec())]));
+    }
     for (index, (name, blob)) in extras.iter().enumerate() {
         let number = first_extra + index as u64;
         let (parent_path, leaf) = split(name);
@@ -1224,7 +1232,7 @@ mod tests {
             Node { path: String::from("Users/Default/Desktop"), directory: true, attributes: 0x11, security: Some(first.clone()) },
             Node { path: String::from("Users/Default/AppData/Local"), directory: true, attributes: 0x2410, security: None },
         ];
-        let image = volume_image(&extras, &nodes, None, 1, 0, 0).unwrap();
+        let image = volume_image(&extras, &nodes, None, true, 1, 0, 0).unwrap();
         let tree = tree(&image);
         assert_eq!(tree["Users"], (DIRECTORY, 0x01, 0x101, 0x01 | DIRECTORY_DUPLICATE));
         assert_eq!(tree["Users/Default"], (DIRECTORY, 0x03, 0x102, 0x03 | DIRECTORY_DUPLICATE));
@@ -1272,7 +1280,7 @@ mod tests {
     /// Sem nós, o $Secure tem só o descritor comum, como antes.
     #[test]
     fn without_nodes_the_volume_has_one_descriptor() {
-        let image = volume_image(&[(String::from("A.TXT"), b"a".to_vec())], &[], None, 1, 0, 0).unwrap();
+        let image = volume_image(&[(String::from("A.TXT"), b"a".to_vec())], &[], None, true, 1, 0, 0).unwrap();
         let secure = attributes(&record(&image, 9));
         let (_, _, _, _, length) = secure.iter().find(|attribute| attribute.0 == 0x80).unwrap();
         assert_eq!(*length as usize, SDS_MIRROR + 20 + security_descriptor().len());
@@ -1282,10 +1290,10 @@ mod tests {
     fn nodes_must_match_the_files() {
         let extras = vec![(String::from("Users/A.TXT"), b"a".to_vec())];
         let node = |path: &str, directory: bool| Node { path: String::from(path), directory, attributes: 0, security: None };
-        assert!(volume_image(&extras, &[node("Users/B.TXT", false)], None, 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[node("Users/A.TXT", true)], None, 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[node("Users", true), node("USERS", true)], None, 1, 0, 0).is_err());
-        assert!(volume_image(&extras, &[Node { path: String::from("Users"), directory: true, attributes: 0, security: Some(vec![1, 0, 4]) }], None, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users/B.TXT", false)], None, true, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users/A.TXT", true)], None, true, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[node("Users", true), node("USERS", true)], None, true, 1, 0, 0).is_err());
+        assert!(volume_image(&extras, &[Node { path: String::from("Users"), directory: true, attributes: 0, security: Some(vec![1, 0, 4]) }], None, true, 1, 0, 0).is_err());
     }
 
     /// As chaves de um índice do registro `record`, em ordem: a raiz
@@ -1338,7 +1346,7 @@ mod tests {
     fn many_descriptors_spill_the_secure_indexes() {
         let extras: Vec<(String, Vec<u8>)> = (0..120).map(|index| (format!("F{index:03}.TXT"), b"x".to_vec())).collect();
         let nodes: Vec<Node> = (0..120u8).map(|index| Node { path: format!("F{index:03}.TXT"), directory: false, attributes: 0x20, security: Some(descriptor_with_owner(100 + index)) }).collect();
-        let image = volume_image(&extras, &nodes, None, 1, 0, 0).unwrap();
+        let image = volume_image(&extras, &nodes, None, true, 1, 0, 0).unwrap();
         let secure = attributes(&record(&image, 9));
         for name in ["$SII", "$SDH"] {
             assert!(secure.iter().any(|attribute| attribute.0 == 0xA0 && attribute.1 == name && attribute.3.is_some()), "{name} sem $INDEX_ALLOCATION");
@@ -1366,7 +1374,7 @@ mod tests {
         let system = descriptor::sid(5, &[18]);
         let root = Descriptor { control: 0x1404, owner: Some(system.clone()), group: Some(system.clone()), sacl: None, dacl: Some((2, vec![descriptor::Ace::new(0, descriptor::OBJECT_INHERIT | descriptor::CONTAINER_INHERIT, 0x001F_01FF, system)])) };
         let extras = vec![(String::from("A.TXT"), b"a".to_vec()), (String::from("Dir/B.TXT"), b"b".to_vec())];
-        let image = volume_image(&extras, &[], Some(root.to_bytes().as_slice()), 1, 0, 0).unwrap();
+        let image = volume_image(&extras, &[], Some(root.to_bytes().as_slice()), true, 1, 0, 0).unwrap();
         let standard = |number: u64| attributes(&record(&image, number)).into_iter().find(|attribute| attribute.0 == 0x10).map(|attribute| dword(&attribute.2, 52));
         assert_eq!(standard(ROOT), Some(SECURITY_ID + 1));
         assert_eq!(standard(9), Some(SECURITY_ID));

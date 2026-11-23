@@ -2709,10 +2709,12 @@ da instalação, e quem pede um arquivo de System32 pede pelo
 System32, o loader lê a ntdll, o apiset e as tabelas NLS por ele, o
 ImagePath dos serviços vira o caminho embaixo de `/Windows`; as imagens do
 bundle, guardadas com o nome achatado, são achadas pelo nome do arquivo de
-um caminho de System32 ou de System32/drivers, e as de um driver importado
-pelo nome, nessas duas pastas). As pastas vazias que a cadeia usa ficam nos caminhos
-da instalação (`host_security::EMPTY_DIRECTORIES`), e a raiz tem o descritor
-padrão da unidade do sistema do 19041 (`host_security::STOCK_ROOT`). O
+um caminho de System32 ou de System32\drivers, e as de um driver importado
+pelo nome, nessas duas pastas). As pastas que a cadeia usa ficam nos caminhos
+da instalação (`host_security::EMPTY_DIRECTORIES`), a raiz tem o descritor
+padrão da unidade do sistema do 19041 (`stock_folders::ROOT`), e no boot do
+smss a raiz e o `\Windows` têm as pastas de uma instalação nova, vazias
+quando nenhum arquivo do volume vai nelas (`stock_folders::FOLDERS`). O
 volume do boot comum, o dos autotestes, guarda o conteúdo de System32 (e de
 System32\drivers) e o de `\Windows` achatados na raiz, que o NTFS do kernel
 acha pelos aliases de instalação (`volume_files::install_alias`). Com
@@ -5091,15 +5093,19 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     diretório, que o NTFS marca no registro (e no
     DUP_FILE_NAME_INDEX_PRESENT). Os arquivos do Windows levam o
     descritor que têm nesta máquina, sem SID de conta
-    (`xtask/src/host_security.rs`): a raiz leva o de
+    (`xtask/src/host_security.rs`): na raiz achatada, a raiz leva o de
     `C:\Windows\System32` (ela responde também por `C:\` e `C:\Windows`),
     uma pasta casa com a pasta daqui pelos nomes, e um arquivo gerado (as
     hives, o PE do kernel, o HELLO.TXT) ou uma pasta sem par herda do pai
     com a herança do NTFS, com o dono Administradores e o grupo SYSTEM de
-    um criador SYSTEM. No boot do smss o volume leva também as pastas
-    vazias de uma instalação nova que a cadeia usa (ProgramData, o Temp, os
-    perfis de serviço, o perfil do SYSTEM, LogFiles e Logs). O kernel ainda
-    não lê esses descritores.
+    um criador SYSTEM. No leiaute real, a raiz leva o descritor padrão da
+    unidade do sistema do 19041, e no boot do smss o volume leva também as
+    pastas que os manifestos dos componentes do 19041 criam na raiz e no
+    `\Windows`, com os atributos e os descritores que eles declaram
+    (`xtask/src/stock_folders.rs`; a lista não depende desta máquina), e as
+    que a cadeia usa (o AppRepository, os perfis de serviço, o perfil do
+    SYSTEM, LogFiles e Logs). O volume do boot do smss não leva o HELLO.TXT,
+    o arquivo conhecido dos autotestes.
     O leitor do kernel lê o mesmo volume; a listagem dele esconde os
     registros abaixo de 16, como a enumeração do NTFS, e o stat soma o
     FILE_ATTRIBUTE_DIRECTORY aos atributos de um diretório.

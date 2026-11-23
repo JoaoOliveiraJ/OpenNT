@@ -548,8 +548,8 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     }
     // Os descritores de segurança dos arquivos do Windows desta máquina
     // (sem SID de conta), a raiz com o padrão da unidade do sistema (na
-    // achatada, com o de System32) e, no boot do smss, as pastas vazias de
-    // uma instalação nova que a cadeia usa. Os perfis ficam com os nós deles.
+    // achatada, com o de System32) e, no boot do smss, as pastas de uma
+    // instalação nova. Os perfis ficam com os nós deles.
     let security = crate::host_security::system_nodes(&origins, &nodes, options.real_layout(), options.initial_process == "smss");
     println!("descritores dos arquivos do Windows no volume NTFS: {} nos ({} pastas), raiz {}", security.nodes.len(), security.nodes.iter().filter(|node| node.directory).count(), match (security.root.is_some(), options.real_layout()) {
         (true, true) => "com o descritor padrao da unidade do sistema",
@@ -561,12 +561,14 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     // 256 MB em C:): o volume dele tem espaço livre para o arquivo crescer
     // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
+    // O HELLO.TXT que os autotestes leem só vai nos volumes deles.
+    let known_file = options.initial_process != "smss";
     // `--volume-sistema=ntfs.sys`: o mesmo volume numa partição do disco,
     // como o volume do sistema de uma instalação.
     let ntfs_bytes = if options.system_volume.is_empty() {
-        crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?
+        crate::ntfs_image::build(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), known_file, free_space_mib, 256)?
     } else {
-        crate::ntfs_image::build_system_disk(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), free_space_mib, 256)?
+        crate::ntfs_image::build_system_disk(&ntfs_path, &ntfs_files, &nodes, security.root.as_deref(), known_file, free_space_mib, 256)?
     };
     // O disco do controlador NVMe do QEMU, particionado, com um volume NTFS
     // próprio: montado em todo build (a opção de carga `--storage=nvme`

@@ -94,6 +94,7 @@ mod user_services;
 mod window_manager;
 mod windows_binaries;
 mod status;
+mod stock_folders;
 mod test_account;
 mod test_all;
 mod time_travel;
