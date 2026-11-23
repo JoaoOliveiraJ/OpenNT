@@ -117,6 +117,8 @@ pub struct DriverCreateContext {
     /// O byte baixo é o Flags do IRP_MJ_CREATE (os SL_* de mesmo valor),
     /// como o IopParseDevice copia o Options do OPEN_PACKET (0x64f263).
     pub options: u32,
+    /// O FileAttributes da abertura: os atributos do arquivo que ela criar.
+    pub file_attributes: u32,
 }
 
 /// Os parâmetros do ZwCreateFile que chegam ao file system.

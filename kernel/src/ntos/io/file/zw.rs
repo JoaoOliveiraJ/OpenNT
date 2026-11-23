@@ -309,13 +309,14 @@ fn follow_boot_volume_reparse(object_name: String, mut options: u32, object_flag
 /// NtfsCacheSharedSecurityForCreate (o explícito dos OBJECT_ATTRIBUTES, o
 /// AccessState->SecurityDescriptor do IopParseDevice, capturado em
 /// KernelMode; a herança do diretório pai; o token de quem abre, sem as
-/// checagens de dono e de privilégio do UserMode). Um volume sem segurança
+/// checagens de dono e de privilégio do UserMode) e os atributos da abertura
+/// (`file_attributes`) com o FILE_ATTRIBUTE_ARCHIVE. Um volume sem segurança
 /// cria pelo `truncate`.
-fn create_new_file(volume: &'static dyn FileSystem, path: &str, attributes_pointer: u64) -> Result<(), KernelError> {
+fn create_new_file(volume: &'static dyn FileSystem, path: &str, attributes_pointer: u64, file_attributes: u32) -> Result<(), KernelError> {
     let explicit_pointer = if attributes_pointer != 0 { object_attributes_at(attributes_pointer).security_descriptor.get() } else { 0 };
     let explicit = crate::ntos::ob::object_security::capture_descriptor(explicit_pointer, false).map_err(|status| KernelError::with_status("ZwCreateFile: descritor dos OBJECT_ATTRIBUTES", status))?;
     match crate::drivers::fs::ntfs_security::descriptor_for_create(volume, path, explicit.as_ref(), false, false) {
-        Some(Ok(descriptor)) => volume.create_secured(path, false, 0x20, &descriptor).unwrap_or_else(|| volume.truncate(path)),
+        Some(Ok(descriptor)) => volume.create_secured(path, false, file_attributes | 0x20, &descriptor).unwrap_or_else(|| volume.truncate(path)),
         Some(Err(status)) => Err(KernelError::with_status("ZwCreateFile: descritor do arquivo novo", status)),
         None => volume.truncate(path),
     }
@@ -335,7 +336,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
     let open_flags = if attributes_pointer != 0 { object_attributes_at(attributes_pointer).attributes.get() } else { 0 };
     let owner_process = if open_flags & 0x200 != 0 { process::get_system_process() } else { process::get_current_process() };
     let access = file_objects::access(desired_access);
-    let create = io_manager::CreateParameters { access: desired_access, share: share_access, disposition, options, file_attributes: 0, case_sensitive: open_flags & 0x40 == 0, ..Default::default() };
+    let create = io_manager::CreateParameters { access: desired_access, share: share_access, disposition, options, file_attributes: driver_context.file_attributes, case_sensitive: open_flags & 0x40 == 0, ..Default::default() };
     // Abertura relativa a um handle de arquivo de dispositivo (o IopParseFile):
     // o FILE_OBJECT novo aponta o da raiz e o nome vai como veio.
     if let Some((device_path, related)) = device_root(attributes_pointer) {
@@ -369,7 +370,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
     // volume do IopParseDevice).
     if device_node && crate::ntos::io::parse::is_volume_open(desired_access) {
         if let Some(device) = crate::ntos::io::parse::volume_device_for_open(&object_name) {
-            let request = crate::ntos::io::parse::OpenRequest { desired_access, file_attributes: 0, share_access, disposition, create_options: options, case_insensitive: open_flags & 0x40 != 0, driver_context };
+            let request = crate::ntos::io::parse::OpenRequest { desired_access, file_attributes: driver_context.file_attributes, share_access, disposition, create_options: options, case_insensitive: open_flags & 0x40 != 0, driver_context };
             let opened = crate::ntos::io::parse::open_file(device, "", &request)?;
             if opened.status & 0x8000_0000 != 0 {
                 write_io_status(io_status, opened.status, 0);
@@ -410,7 +411,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
         // Arquivo de um volume com VPB: o IopParseDevice monta e abre pelo
         // file system dono (`io/parse.rs`).
         if let Some((device, remaining)) = crate::ntos::io::parse::split_volume_path(&object_name) {
-            let request = crate::ntos::io::parse::OpenRequest { desired_access, file_attributes: 0, share_access, disposition, create_options: options, case_insensitive: open_flags & 0x40 != 0, driver_context };
+            let request = crate::ntos::io::parse::OpenRequest { desired_access, file_attributes: driver_context.file_attributes, share_access, disposition, create_options: options, case_insensitive: open_flags & 0x40 != 0, driver_context };
             let opened = crate::ntos::io::parse::open_file(device, &remaining, &request)?;
             if opened.status & 0x8000_0000 != 0 {
                 write_io_status(io_status, opened.status, 0);
@@ -459,7 +460,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 volume.truncate(&path)?;
                 FILE_SUPERSEDED
             } else {
-                create_new_file(volume, &path, attributes_pointer)?;
+                create_new_file(volume, &path, attributes_pointer, driver_context.file_attributes)?;
                 FILE_CREATED
             }
         }
@@ -476,7 +477,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 if !writable {
                     return Ok(STATUS_MEDIA_WRITE_PROTECTED);
                 }
-                create_new_file(volume, &path, attributes_pointer)?;
+                create_new_file(volume, &path, attributes_pointer, driver_context.file_attributes)?;
                 FILE_CREATED
             }
         }
@@ -487,7 +488,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 if !writable {
                     return Ok(STATUS_MEDIA_WRITE_PROTECTED);
                 }
-                create_new_file(volume, &path, attributes_pointer)?;
+                create_new_file(volume, &path, attributes_pointer, driver_context.file_attributes)?;
                 FILE_CREATED
             }
         }
@@ -502,7 +503,7 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
                 volume.truncate(&path)?;
                 FILE_OVERWRITTEN
             } else {
-                create_new_file(volume, &path, attributes_pointer)?;
+                create_new_file(volume, &path, attributes_pointer, driver_context.file_attributes)?;
                 FILE_CREATED
             }
         }
@@ -549,7 +550,8 @@ pub fn create_kernel_file_with_context(output: u64, desired_access: u32, attribu
 #[allow(clippy::too_many_arguments)]
 pub fn nt_create_file(handle: u64, desired_access: u32, attributes: u64, io_status: u64, allocation: u64, file_attributes: u32, share_access: u32, disposition: u32, options: u32, ea_buffer: u64, ea_length: u32) -> Result<u32, KernelError> {
     if crate::ntos::ps::previous_mode::get()? == 0 {
-        return create_kernel_file(handle, desired_access, attributes, io_status, share_access, disposition, options);
+        let context = crate::ntos::io::parse::DriverCreateContext { file_attributes, ..Default::default() };
+        return create_kernel_file_with_context(handle, desired_access, attributes, io_status, share_access, disposition, options, context);
     }
     let request = crate::ntos::ps::user::file_io::OpenRequest { access: desired_access, share: share_access, options, allocation_pointer: allocation, attributes: file_attributes, ea_buffer, ea_length, handle_attributes: 0, explicit: None };
     crate::ntos::ps::user::files::open_nt_file(handle, attributes, io_status, disposition, &request)

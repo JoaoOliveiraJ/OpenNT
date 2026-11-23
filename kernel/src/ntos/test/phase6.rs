@@ -2798,6 +2798,16 @@ fn zw_kernel_files(assert: Assert) {
     if let Some(volume) = ntfs::mounted() {
         let _ = FileSystem::remove(volume.as_ref(), "/opennt-zw.bin");
     }
+    // O FileAttributes da abertura é o do arquivo novo, com o ARCHIVE: o
+    // MiCreatePagingFile cria o pagefile.sys oculto e de sistema.
+    let context = crate::ntos::io::parse::DriverCreateContext { file_attributes: 6, ..Default::default() };
+    let created = zw_files::create_kernel_file_with_context(output, 0x12019F, attributes, io_status, 0, 3, 0x20, context);
+    let handle = guest::read64(output);
+    let stored = ntfs::mounted().and_then(|volume| volume.stat("/opennt-zw.bin").ok().flatten()).map(|stat| stat.attributes);
+    assert(created.is_ok_and(|status| status == 0) && stored == Some(0x26) && close::close(handle, Some(0)).is_ok_and(|status| status == 0), "zwfile: o arquivo novo leva o FileAttributes da abertura");
+    if let Some(volume) = ntfs::mounted() {
+        let _ = FileSystem::remove(volume.as_ref(), "/opennt-zw.bin");
+    }
     guest::free_bytes(block);
 }
 
