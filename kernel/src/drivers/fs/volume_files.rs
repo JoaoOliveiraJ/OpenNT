@@ -210,13 +210,14 @@ pub fn normalized_device_name(volume: &Ntfs, device_name: &str) -> String {
 
 /// O volume do kernel guarda os arquivos nos caminhos reais da instalação
 /// (`\Windows\System32\drivers\acpi.sys` em
-/// `/Windows/System32/drivers/acpi.sys`), como o xtask grava o volume do
-/// `--volume-sistema=ntfs.sys` (`windows_binaries::real_layout`), em vez da
-/// raiz achatada dos aliases de instalação. O xtask e o kernel decidem pela
-/// mesma opção; quando o leiaute real virar o padrão dos boots do NTFS do
-/// kernel, é esta decisão que muda.
+/// `/Windows/System32/drivers/acpi.sys`): o do boot do smss e o do
+/// `--volume-sistema=ntfs.sys`, como o xtask os grava
+/// (`windows_binaries::real_layout`). O do boot comum fica com a raiz
+/// achatada, com o conteúdo de `\Windows` e de System32 na raiz. O xtask e o
+/// kernel decidem pelas mesmas opções de carga.
 pub fn real_layout() -> bool {
-    crate::ntos::init::boot_config::system_volume_ntfs()
+    use crate::ntos::init::boot_config::{smss_boot, system_volume_ntfs};
+    smss_boot() || system_volume_ntfs()
 }
 
 /// O `\SystemRoot` já leva ao volume do sistema servido pelo ntfs.sys (o
@@ -292,7 +293,8 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
     if bytes.len() >= 2 && bytes[1] == b':' {
         let drive = bytes[0].to_ascii_lowercase();
         let kernel_drive = drive == b'c' || (drive == b'd' && !crate::ntos::init::boot_config::smss_boot());
-        if !kernel_drive || (real_layout() && !kernel_volume_letter(bytes[0])) {
+        // Só o volume do ntfs.sys troca a letra de dono durante o boot.
+        if !kernel_drive || (crate::ntos::init::boot_config::system_volume_ntfs() && !kernel_volume_letter(bytes[0])) {
             return None;
         }
         path = String::from(&path[2..]);
@@ -325,7 +327,7 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
     checked_volume_path(&path)
 }
 
-/// No leiaute real, a letra é do volume do kernel enquanto o
+/// Com `--volume-sistema=ntfs.sys`, a letra é do volume do kernel enquanto o
 /// `\GLOBAL??\X:` não existe (o começo do boot, antes das letras) ou leva
 /// ao dispositivo dele: depois do BOOT_DL_ASSIGNMENT o C: é o volume do
 /// ntfs.sys, mesmo antes da troca do `\SystemRoot`.
@@ -640,7 +642,7 @@ pub fn lookup_volume_file(nt_path: &str) -> Option<Arc<VolumeFile>> {
     let fs: &'static dyn super::volume::FileSystem = fixed;
     let file = Arc::new(VolumeFile {
         id: NEXT_FILE.fetch_add(1, Ordering::Relaxed),
-        paths: SpinLock::new(Paths { nt_path: native_file_name::from_volume(fs, &volume_path).unwrap_or_else(|| String::from(nt_path)), base_name: String::from(&volume_path[1..]), volume_path }),
+        paths: SpinLock::new(Paths { nt_path: native_file_name::from_volume(fs, &volume_path).unwrap_or_else(|| String::from(nt_path)), base_name: String::from(&volume_path[volume_path.rfind('/').map_or(0, |index| index + 1)..]), volume_path }),
         state: SpinLock::new(FileState { size: stat.size, directory: stat.directory, generation, stat, references, bytes: None }),
         volume,
         marks: Arc::new(FileMarks::default()),

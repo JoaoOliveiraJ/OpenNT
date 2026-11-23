@@ -2298,8 +2298,8 @@ dentro dele) que não é compartilhado entre as raízes:
   (`io/driver_load.rs` → `io/lifecycle.rs`) aninhado no DriverEntry do
   cliente: `lifecycle::load_driver` guarda e devolve o driver corrente. O
   ImagePath de um serviço pode ser relativo, e então é relativo ao
-  \SystemRoot (`system32\drivers\Wdf01000.sys`); System32\Drivers fica na
-  raiz do volume.
+  \SystemRoot (`system32\drivers\Wdf01000.sys`); no volume do boot
+  comum, System32\Drivers fica na raiz.
 - **O nome do DRIVER_OBJECT** (`io/driver_load.rs`, o
   IopGetDriverNameFromKeyNode): o ObjectName REG_SZ da chave do serviço,
   quando existe; senão `\FileSystem\<chave>` para os tipos 2 (file system) e
@@ -2699,26 +2699,25 @@ reinicializa o ERESOURCE de um FCB que ele libera ainda adquirido e o
 reaproveita no FCB seguinte, e sem isso a primeira abertura no volume do
 sistema esperava para sempre.
 
-O leiaute do volume. A imagem do NTFS do xtask guarda o conteúdo de
-System32 (e de System32\drivers) e o de `\Windows` achatados na raiz, e o
-NTFS do kernel os acha pelos aliases de instalação
-(`volume_files::install_alias`): um desvio de fidelidade (o `\Windows` e o
-`\Windows\System32` caem na mesma raiz, e um programa pode carregar a
-mesma DLL duas vezes). O ntfs.sys não conhece esses aliases, então o
-volume do `--volume-sistema=ntfs.sys` grava cada arquivo no caminho real
-da instalação (`windows_binaries::real_layout`, pelo caminho de origem
-embaixo do `\Windows` daqui), e o kernel decide pela mesma opção
-(`volume_files::real_layout`): o `nt_path_to_volume_path` devolve o
-caminho da instalação, sem aliases, e quem pedia um arquivo de System32
-pela raiz achatada pede pelo `volume_files::system32_path` (o sysload
-procura em System32\drivers e em System32, o loader lê a ntdll, o apiset e
-as tabelas NLS por ele, o ImagePath dos serviços vira o caminho embaixo de
-`/Windows`; as imagens do bundle, guardadas com o nome achatado, são
-achadas pelo nome do arquivo do caminho da instalação). Os consumidores já
-não dependem do leiaute: quando o leiaute real virar o padrão dos boots do
-NTFS do kernel, só o `real_layout` muda. No leiaute real, o C: (e o D:, que
-só o boot sem o smss tem) só traduz para o volume do kernel enquanto o
-`\GLOBAL??\X:` não existe ou leva ao dispositivo dele.
+O leiaute do volume. No boot do smss e no `--volume-sistema=ntfs.sys`, a
+imagem do NTFS do xtask grava cada arquivo no caminho real da instalação
+(`windows_binaries::real_layout`, pelo caminho de origem embaixo do
+`\Windows` daqui), e o kernel decide pelas mesmas opções de carga
+(`volume_files::real_layout`): o `nt_path_to_volume_path` devolve o caminho
+da instalação, e quem pede um arquivo de System32 pede pelo
+`volume_files::system32_path` (o sysload procura em System32\drivers e em
+System32, o loader lê a ntdll, o apiset e as tabelas NLS por ele, o
+ImagePath dos serviços vira o caminho embaixo de `/Windows`; as imagens do
+bundle, guardadas com o nome achatado, são achadas pelo nome do arquivo do
+caminho da instalação). As pastas vazias que a cadeia usa ficam nos caminhos
+da instalação (`host_security::EMPTY_DIRECTORIES`), e a raiz tem o descritor
+padrão da unidade do sistema do 19041 (`host_security::STOCK_ROOT`). O
+volume do boot comum, o dos autotestes, guarda o conteúdo de System32 (e de
+System32\drivers) e o de `\Windows` achatados na raiz, que o NTFS do kernel
+acha pelos aliases de instalação (`volume_files::install_alias`). Com
+`--volume-sistema=ntfs.sys`, o C: (e o D: do boot comum) só traduz para o
+volume do kernel enquanto o `\GLOBAL??\X:` não existe ou leva ao dispositivo
+dele.
 
 O que o S1 faz (teste `volume-sistema`, `SYSTEM_VOLUME_SWITCHED_OK`):
 antes de o atapi.sys assumir a controladora, o NTFS do kernel deixa na
@@ -5993,8 +5992,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   do EventService::SecondPhaseInit o abre e, sem ele, o serviço para com
   ERROR_FILE_NOT_FOUND), as sessões de autologger EventLog-System,
   EventLog-Application e EventLog-Security com os provedores do Windows, e
-  o `System32\winevt\Logs` vazio na raiz do volume, onde o modo usuário
-  cria os `.evtx` (`xtask/src/event_log.rs`). Dos provedores, canais e
+  o `System32\winevt\Logs` vazio, onde o modo usuário cria os `.evtx`
+  (`xtask/src/event_log.rs`). Dos provedores, canais e
   fontes clássicas só entram os cujos arquivos de recursos e de mensagens o
   boot põe no volume (`windows_binaries::staged_image_names`): um provedor
   sem o binário no convidado não grava eventos, e a hive inteira fica no
