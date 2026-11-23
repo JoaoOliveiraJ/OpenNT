@@ -1283,6 +1283,7 @@ fn user_file_io(assert: Assert) {
     assert(query(5, 24) == 0 && { let standard = unsafe { nt::FileStandardInformation::at(buffer) }; standard.end_of_file.quad_part.get() == expected.len() as i64 && standard.directory.get() == 0 }, "userfiles: FILE_STANDARD_INFORMATION com o tamanho");
     assert(query(14, 8) == 0 && unsafe { nt::FilePositionInformation::at(buffer) }.current_byte_offset.quad_part.get() == expected.len() as i64, "userfiles: FILE_POSITION_INFORMATION depois da leitura");
     assert(query(9, 64) == 0 && { let name_info = unsafe { nt::FileNameInformation::at(buffer) }; name_info.file_name_length.get() == 20 && name_info.file_name[0].get() == b'\\' as u16 } && query(99, 64) == 0xC000_0003 && query(5, 8) == 0xC000_0004, "userfiles: nome, classe e tamanho invalidos");
+    assert(query(55, 0x74) == 0xC000_000D && query(55, 0x73) == 0xC000_0004, "userfiles: FileRemoteProtocolInformation num arquivo do NTFS e STATUS_INVALID_PARAMETER");
     assert(state::close_user_handle(handle, true, false).is_ok_and(|status| status == 0), "userfiles: handle fechado");
     // FILE_NAME_INFORMATION é o caminho da abertura a partir da raiz do
     // volume (`\Windows\...`), não a posição interna do conteúdo de

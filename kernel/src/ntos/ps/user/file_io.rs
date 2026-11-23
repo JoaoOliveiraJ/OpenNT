@@ -650,6 +650,13 @@ pub fn nt_query_information_file(handle: u64, iosb: u64, out: u64, length: u64, 
             34 => 56,
             35 => 8,
             59 => 24,
+            // FileRemoteProtocolInformation, com que o windows.storage pergunta
+            // se o arquivo é de um compartilhamento: o NtQueryInformationFile
+            // só confere o tamanho (IopQueryOperationLength 0x74) e a manda
+            // ao file system, e o NtfsCommonQueryInformation do ntfs.sys 19041
+            // (0x1045f0) não a trata: o caso padrão da tabela 0x6bc4a.
+            55 if length < 0x74 => return fail(0xC000_0004),
+            55 => return fail(0xC000_000D),
             _ => return fail(0xC000_0003),
         };
         let variable = matches!(class, 9 | 18 | 48);
