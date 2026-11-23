@@ -1457,8 +1457,14 @@ impl Tx<'_> {
             for offset in [0, 8, 16, 24] {
                 put64(&mut standard, offset, time);
             }
-            // FILE_ATTRIBUTE_REPARSE_POINT só vem do FSCTL_SET_REPARSE_POINT.
-            let flags = (file_attributes & !0x490) | if directory { 0x10 } else { 0x20 };
+            // Do FileAttributes da abertura só valem estes bits, como no
+            // NtfsInitializeFcbAndStdInfo (ntfs.sys 19041 0x138fe4: a máscara
+            // 0x1A3127, ou 0x5A3127 no KernelMode, sobre o USHORT do
+            // IO_STACK_LOCATION): READONLY, HIDDEN, SYSTEM, ARCHIVE, TEMPORARY,
+            // OFFLINE e NOT_CONTENT_INDEXED. O SPARSE, o COMPRESSED, o
+            // ENCRYPTED, o NORMAL e o REPARSE_POINT não vêm da abertura (o
+            // NTFS os põe ele mesmo, pelos FSCTLs, pela compressão do pai).
+            let flags = (file_attributes & 0x3127) | if directory { 0x10 } else { 0x20 };
             put32(&mut standard, 32, flags as u64);
             put32(&mut standard, 52, security_id as u64);
             let file_name = tx.filename(parent.reference, &name, directory, 0, 0, Some(&standard), flags)?;
