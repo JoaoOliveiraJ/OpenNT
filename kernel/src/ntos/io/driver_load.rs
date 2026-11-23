@@ -431,11 +431,17 @@ fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// O caminho de uma imagem de driver no volume de boot do convidado: o
-/// System32\Drivers da instalação fica na raiz do volume e o resto do
+/// O caminho de uma imagem de driver no volume de boot do convidado: no
+/// leiaute real (`volume_files::real_layout`), o da instalação, e na raiz
+/// achatada o System32\Drivers fica na raiz do volume e o resto do
 /// `\SystemRoot` sob `\Windows`. Recusa unidades indisponíveis (3),
 /// componentes vazios, travessia e caracteres não admitidos (123).
 pub fn image_volume_path(image_path: &str) -> Result<String, (u32, &'static str)> {
+    image_path_in_layout(image_path, crate::drivers::fs::volume_files::real_layout())
+}
+
+/// [`image_volume_path`] no leiaute real (`real`) ou na raiz achatada.
+pub fn image_path_in_layout(image_path: &str, real: bool) -> Result<String, (u32, &'static str)> {
     let mut path = image_path;
     if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
         path = &path[1..path.len() - 1];
@@ -454,10 +460,8 @@ pub fn image_volume_path(image_path: &str) -> Result<String, (u32, &'static str)
     if strip_prefix_ci(&path, "System32\\").is_some() {
         path = format!("\\SystemRoot\\{path}");
     }
-    // No leiaute real (`volume_files::real_layout`), o caminho da
-    // instalação: o `\SystemRoot` é o `\Windows` do volume.
-    let real = crate::drivers::fs::volume_files::real_layout();
-    // Drivers de System32\Drivers ficam na raiz do volume do convidado.
+    // No leiaute real, o `\SystemRoot` é o `\Windows` do volume; na raiz
+    // achatada, os drivers de System32\Drivers ficam na raiz.
     let relative = if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\").filter(|_| real) {
         format!("Windows\\{rest}")
     } else if let Some(rest) = strip_prefix_ci(&path, "\\SystemRoot\\System32\\Drivers\\") {
@@ -472,6 +476,9 @@ pub fn image_volume_path(image_path: &str) -> Result<String, (u32, &'static str)
         String::from(rest)
     } else if (path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':') || path.starts_with('\\') {
         return Err((3, "driver volume/path unavailable"));
+    } else if real {
+        // Relativo ao \SystemRoot.
+        format!("Windows\\{path}")
     } else {
         path
     };

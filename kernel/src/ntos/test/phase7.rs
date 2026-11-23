@@ -1148,6 +1148,26 @@ fn volume_file_lookup(assert: Assert) {
         "volumefiles: no leiaute real C:\\x, C:\\Windows\\x e C:\\Windows\\System32\\x sao tres arquivos",
     );
     assert(volume_files::real_layout() || volume_files::install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll") == volume_files::flat_install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll"), "volumefiles: o alias de instalacao e o da raiz achatada no boot comum");
+    // Uma imagem de driver pelo caminho, no leiaute real: o bundle responde
+    // por System32 e System32\drivers, não por um arquivo de mesmo nome em
+    // outra pasta, e o ImagePath fica onde a instalação o guarda.
+    let bundled = crate::ntos::mm::sysload::kernel_image_source::installed_image_name;
+    let image = |path: &str| crate::ntos::io::driver_load::image_path_in_layout(path, true).ok();
+    assert(
+        bundled("/Windows/System32/drivers/atapi.sys").as_deref() == Some("/atapi.sys")
+            && bundled("/WINDOWS/system32/atapi.sys").as_deref() == Some("/atapi.sys")
+            && ["/atapi.sys", "/Windows/atapi.sys", "/Temp/atapi.sys", "/Windows/System32/drivers/x/atapi.sys", "/Windows/System32/"].iter().all(|path| bundled(path).is_none()),
+        "volumefiles: no leiaute real o bundle so responde por imagens de System32 e System32\\drivers",
+    );
+    assert(
+        image("\\SystemRoot\\System32\\drivers\\x.sys").as_deref() == Some("/Windows/System32/drivers/x.sys")
+            && image("system32\\drivers\\x.sys").as_deref() == Some("/Windows/system32/drivers/x.sys")
+            && image("\\??\\C:\\x.sys").as_deref() == Some("/x.sys")
+            && image("C:\\Windows\\System32\\Drivers\\x.sys").as_deref() == Some("/Windows/System32/Drivers/x.sys")
+            && image("x.sys").as_deref() == Some("/Windows/x.sys")
+            && image("D:\\x.sys").is_none(),
+        "volumefiles: no leiaute real o ImagePath fica no caminho da instalacao",
+    );
     let Some(file) = volume_files::lookup_volume_file("C:\\Windows\\System32\\HELLO.TXT") else {
         assert(false, "volumefiles: HELLO.TXT do volume de teste");
         return;

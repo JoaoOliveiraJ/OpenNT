@@ -2708,8 +2708,9 @@ da instalação, e quem pede um arquivo de System32 pede pelo
 `volume_files::system32_path` (o sysload procura em System32\drivers e em
 System32, o loader lê a ntdll, o apiset e as tabelas NLS por ele, o
 ImagePath dos serviços vira o caminho embaixo de `/Windows`; as imagens do
-bundle, guardadas com o nome achatado, são achadas pelo nome do arquivo do
-caminho da instalação). As pastas vazias que a cadeia usa ficam nos caminhos
+bundle, guardadas com o nome achatado, são achadas pelo nome do arquivo de
+um caminho de System32 ou de System32/drivers, e as de um driver importado
+pelo nome, nessas duas pastas). As pastas vazias que a cadeia usa ficam nos caminhos
 da instalação (`host_security::EMPTY_DIRECTORIES`), e a raiz tem o descritor
 padrão da unidade do sistema do 19041 (`host_security::STOCK_ROOT`). O
 volume do boot comum, o dos autotestes, guarda o conteúdo de System32 (e de

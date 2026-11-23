@@ -62,8 +62,9 @@ pub fn initialize() -> Result<Option<NodeId>, KernelError> {
 /// Sem a raiz ACPI: carrega os drivers e monta as pilhas dos PDOs da
 /// placa-mãe pelo orquestrador do PnP.
 fn motherboard_keyboard_stack() -> Result<Option<NodeId>, KernelError> {
-    let _ = lifecycle::load_driver("/kbdclass.sys", &DriverOptions::default());
-    let _ = lifecycle::load_driver("/i8042prt.sys", &DriverOptions::default());
+    for driver in ["drivers/kbdclass.sys", "drivers/i8042prt.sys"] {
+        let _ = lifecycle::load_driver(&crate::drivers::fs::volume_files::system32_path(driver), &DriverOptions::default());
+    }
     if object_manager::lookup("\\Driver\\kbdclass").is_none() || object_manager::lookup("\\Driver\\i8042prt").is_none() {
         return Err(KernelError::new("drivers de teclado nao publicaram seus objetos"));
     }
