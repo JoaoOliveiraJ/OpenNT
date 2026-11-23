@@ -8379,6 +8379,14 @@ pixels ou mais, o resto da barra em até 1/20 e a tela acima em até 1/32
 (`screen_check::clock_ticked`: o relógio passou de minuto, o caminho do
 SetTimer, da repintura e do dwm, não um quadro congelado), e a leitura
 seguinte é igual; a tela vai para `<build>/barra-de-tarefas.png`.
+O instante do `TASKBAR_OK` depende da virada do minuto do relógio do
+convidado, não da velocidade do boot: ele sai poucos segundos depois do
+primeiro :00 que vem depois da barra desenhada. Medido (seis boots do
+barra-de-tarefas iniciados em segundos diferentes do minuto, com o
+`DESKTOP_OK` em 48,7 e 48,8 s em todos): cinco deram 54,7 ou 54,8 s e o outro
+82,9 s, cada um logo depois do minuto virar. Para comparar tempos de boot use
+o `DESKTOP_OK` e os marcadores anteriores; uma diferença de até um minuto no
+`TASKBAR_OK` não diz nada.
 
 Num teste que espera o `SHELL_RESTARTED` (o explorer.exe recriado pelo
 winlogon.exe criou a barra de tarefas), a vigia segue depois da área de
