@@ -1203,8 +1203,13 @@ const USER_LOGON_PROGRAMS: &[&str] = &[
     // WinlogonHotkeyCallback do win32kfull manda o PostWinlogonMessage(0x404,
     // 4), e o WLGeneric_AppLauncher_Enter do winlogon cria o `launchtm.exe`
     // na sessão do usuário, que abre o `%WINDIR%\System32\Taskmgr.exe` pelo
-    // ShellExecuteExW.
+    // ShellExecuteExW. O comdlg32.dll é a carga atrasada do notepad.exe que
+    // dá o nome do arquivo no título da janela (GetFileTitleW) e as caixas de
+    // abrir e salvar: sem ele, o DelayLoadFailureHook do kernelbase troca a
+    // função por uma que devolve 0 sem escrever nada, e o título fica com o
+    // nome vazio.
     "notepad.exe",
+    "comdlg32.dll",
     "LaunchTM.exe",
     "Taskmgr.exe",
     "comctl32.dll",
