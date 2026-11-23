@@ -7118,7 +7118,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     com e sem entrada dividem a pasta de imagens e o gerador.
   - Sobem do volume do primeiro logon feito: barra-de-tarefas,
     reinicio-do-shell, menu-de-contexto, pasta-este-computador,
-    prompt-de-comando, bloco-de-notas e gerenciador-de-tarefas. O primeiro
+    conteudo-este-computador, prompt-de-comando, bloco-de-notas e
+    gerenciador-de-tarefas. O primeiro
     logon continua conferido do volume novo nos testes logon-do-usuario,
     perfil-do-usuario, sihost, userinit, explorer, area-de-trabalho e
     area-de-trabalho-smp2, barra-de-tarefas-smp2, menu-iniciar e
@@ -8476,7 +8477,15 @@ dele a tela muda em até 1/8 (o ícone que ficou
 selecionado). O log ganha o `WINDOW_OPENED_OK`. O `--double-click=...:X,Y`
 leva o ponteiro a (X, Y) como o `--context-menu` e aperta duas vezes o botão
 esquerdo, dentro do tempo do clique duplo do Windows (os quatro
-`mouse_button` a 40 ms um do outro). O `--run=...:COMANDO` aperta Win+R,
+`mouse_button` a 40 ms um do outro). O `--folder-view=...:UNIDADES` espera, por
+até 60 s e em duas leituras seguidas iguais, o conteúdo da janela de Este
+Computador (`screen_check::folder_drives`): a maior janela clara acima da
+barra de tarefas, com as medidas da janela de pasta do 19041 a 96 DPI, tem 60
+colunas de tinta ou mais na caixa do endereço (o ícone e o nome da pasta),
+duas linhas ou mais no painel de navegação, duas ou mais na pasta, uma barra
+de capacidade por unidade, com a parte usada e a livre (nem vazia nem cheia),
+e 20 colunas de tinta ou mais na barra de status; o log ganha o
+`FOLDER_SHOWN_OK`. O `--run=...:COMANDO` aperta Win+R,
 confere a caixa Executar (uma janela nova), digita o comando, espera a
 tela parada com ele e, depois do Enter, confere a janela do programa contra
 a tela de antes do Win+R, numa tela diferente da do comando digitado (a

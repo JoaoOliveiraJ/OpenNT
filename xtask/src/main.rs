@@ -233,6 +233,9 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    menu de contexto aberto no ponto e que o Esc o fecha: CONTEXT_MENU_OK na serial)
                    --double-click=MARCADOR[+MS]:X,Y (repetivel: leva o ponteiro ao ponto X,Y, aperta
                    duas vezes o botao esquerdo e confere a janela nova na tela: WINDOW_OPENED_OK)
+                   --folder-view=MARCADOR[+MS]:UNIDADES (repetivel: espera a janela de Este
+                   Computador parada com o endereco, o painel de navegacao, UNIDADES unidades com
+                   a barra de capacidade e a barra de status: FOLDER_SHOWN_OK)
                    --run=MARCADOR[+MS]:COMANDO (repetivel: Win+R, a caixa Executar, o comando e o
                    Enter; confere a janela do programa na tela: WINDOW_OPENED_OK)
                    --open=MARCADOR[+MS]:TECLAS (repetivel: digita as teclas, um atalho que abre um
@@ -468,6 +471,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--start-click" => parsed.inputs.push(qemu::InputSend::start_click(&required()?)?),
             "--context-menu" => parsed.inputs.push(qemu::InputSend::context_menu(&required()?)?),
             "--double-click" => parsed.inputs.push(qemu::InputSend::double_click(&required()?)?),
+            "--folder-view" => parsed.inputs.push(qemu::InputSend::folder_view(&required()?)?),
             "--run" => parsed.inputs.push(qemu::InputSend::run(&required()?)?),
             "--open" => parsed.inputs.push(qemu::InputSend::open(&required()?)?),
             "--type" => parsed.inputs.push(qemu::InputSend::type_text(&required()?)?),
@@ -565,7 +569,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss, --mouse, --start-menu, --start-click, --context-menu, --double-click, --run, --open, --type e --command sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse, --start-menu, --start-click, --context-menu, --double-click, --folder-view, --run, --open, --type e --command sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -934,7 +938,10 @@ mod tests {
                 InputSend { after: "CONSOLE_WINDOW_CREATED".into(), delay: Duration::from_millis(2000), action: InputAction::Command("ver".into()) },
             ]
         );
-        for bad in ["--double-click=X:1024,1", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}", "--command=X:", "--command=X:dir /w"] {
+        let parsed = parse_words(&["test-boot", "--folder-view=WINDOW_OPENED_OK+1000:1"]).unwrap();
+        assert_eq!(parsed.inputs, vec![InputSend { after: "WINDOW_OPENED_OK".into(), delay: Duration::from_millis(1000), action: InputAction::FolderView { drives: 1 } }]);
+        assert!(parse_words(&["run", "--folder-view=X:1"]).is_err());
+        for bad in ["--double-click=X:1024,1", "--folder-view=X", "--folder-view=X:0", "--folder-view=X:27", "--folder-view=X:C:", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}", "--command=X:", "--command=X:dir /w"] {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }
         // Os nomes do QEMU passam, também nos combos e no --keys.

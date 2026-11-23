@@ -1563,6 +1563,261 @@ pub fn command_output(typed: &Image, after: &Image, command: usize, below: usize
     Ok(format!("{} linhas de texto em {}x{} em ({left},{top}), a mais larga com {widest} colunas; {changed} pixels mudaram acima da barra", text.len(), right + 1 - left, bottom + 1 - top))
 }
 
+// ---- conteúdo de uma janela de pasta -----------------------------------------
+//
+// O `--folder-view` do test-boot confere o conteúdo da janela de Este
+// Computador ([`folder_drives`]): o endereço, o painel de navegação, as
+// unidades com a barra de capacidade e a barra de status.
+
+/// O marcador do conteúdo da janela de pasta na tela.
+pub const FOLDER_SHOWN_MARKER: &str = "FOLDER_SHOWN_OK";
+/// A parte usada e a livre da barra de capacidade de uma unidade com espaço
+/// (a TileCapacity do shellstyle.dll do tema aero; a de uma unidade quase
+/// cheia é vermelha).
+const CAPACITY_USED: [u8; 3] = [0x26, 0xA0, 0xDA];
+const CAPACITY_FREE: [u8; 3] = [0xE6, 0xE6, 0xE6];
+/// Quanto um canal pode fugir da cor da barra.
+const CAPACITY_TOLERANCE: u8 = 8;
+/// A janela de pasta do 19041 a 96 DPI, com a barra de comandos, em linhas
+/// a partir do topo: a caixa do endereço e o começo do corpo.
+const FOLDER_ADDRESS_ROWS: (usize, usize) = (34, 58);
+const FOLDER_BODY: usize = 100;
+/// As linhas da barra de status, embaixo.
+const FOLDER_STATUS_ROWS: usize = 24;
+/// As colunas da caixa do endereço, da esquerda da janela: do ícone da pasta
+/// (depois das setas de navegação e da borda) até antes da seta da lista.
+const FOLDER_ADDRESS_LEFT: usize = 112;
+/// As colunas do painel de navegação, na largura padrão.
+const FOLDER_NAVIGATION: usize = 154;
+/// As colunas mínimas do texto do endereço (o ícone e o nome da pasta).
+const FOLDER_ADDRESS_MINIMUM: usize = 60;
+
+/// O que a [`folder_view`] mediu numa janela de pasta.
+#[derive(Clone, Debug)]
+pub struct FolderView {
+    window: Change,
+    /// As colunas com tinta na caixa do endereço (o ícone e o nome da pasta).
+    pub address: usize,
+    /// As linhas de texto do painel de navegação e as da pasta.
+    pub navigation: usize,
+    pub lines: usize,
+    /// (as colunas usadas, as colunas) de cada barra de capacidade.
+    pub drives: Vec<(usize, usize)>,
+    /// As colunas com tinta na barra de status.
+    pub status: usize,
+}
+
+impl FolderView {
+    pub fn describe(&self) -> String {
+        let drives: Vec<String> = self.drives.iter().map(|(used, total)| format!("{}%", used * 100 / total)).collect();
+        format!(
+            "janela {}: endereco de {} colunas, {} linha(s) no painel de navegacao, {} na pasta, {} unidade(s) com a barra de capacidade [{}], status de {} colunas",
+            self.window.describe(),
+            self.address,
+            self.navigation,
+            self.lines,
+            self.drives.len(),
+            drives.join(" "),
+            self.status
+        )
+    }
+}
+
+/// As linhas de texto (ou de ícones) de `image` dentro de `area`: as faixas
+/// de linhas com algum pixel a [`TEXT_CONTRAST`] ou mais da luminância
+/// mediana da área, separadas por pelo menos duas linhas sem nenhum, de 6 a
+/// 48 linhas de altura, com a caixa da tinta de cada uma.
+fn ink_lines(image: &Image, area: &Change) -> Vec<Change> {
+    let median = median_luma(image, area.left..area.right + 1, area.top..area.bottom + 1);
+    let mut lines: Vec<Change> = Vec::new();
+    for y in area.top..=area.bottom {
+        let ink = |x: usize| {
+            let at = (y * image.width + x) * 3;
+            luma(&image.rgb[at..at + 3]).abs_diff(median) >= TEXT_CONTRAST
+        };
+        let (Some(first), Some(last)) = ((area.left..=area.right).find(|&x| ink(x)), (area.left..=area.right).rev().find(|&x| ink(x))) else { continue };
+        match lines.last_mut() {
+            Some(line) if y - line.bottom <= 2 => {
+                line.bottom = y;
+                line.left = line.left.min(first);
+                line.right = line.right.max(last);
+            }
+            _ => lines.push(Change { left: first, top: y, right: last, bottom: y }),
+        }
+    }
+    lines.retain(|line| (6..=48).contains(&line.height()));
+    lines
+}
+
+/// A janela clara de `image`: o maior grupo de células de [`CURSOR_CELL`]
+/// pixels, acima da barra de tarefas, com metade ou mais dos pixels claros
+/// ([`LIGHT_LUMA`]), ligadas pelos lados, de 400x300 pixels ou mais; as
+/// bordas vão até a última coluna e a última linha com metade ou mais dos
+/// pixels claros.
+fn light_window(image: &Image) -> Option<Change> {
+    let light = |x: usize, y: usize| {
+        let at = (y * image.width + x) * 3;
+        luma(&image.rgb[at..at + 3]) >= LIGHT_LUMA
+    };
+    let area = above_taskbar(image);
+    let (columns, rows) = (image.width / CURSOR_CELL, area / CURSOR_CELL);
+    let cell = |column: usize, row: usize| {
+        let count = (0..CURSOR_CELL * CURSOR_CELL).filter(|index| light(column * CURSOR_CELL + index % CURSOR_CELL, row * CURSOR_CELL + index / CURSOR_CELL)).count();
+        count * 2 >= CURSOR_CELL * CURSOR_CELL
+    };
+    let mut open: Vec<bool> = (0..rows * columns).map(|index| cell(index % columns, index / columns)).collect();
+    let mut best: Option<(usize, Change)> = None;
+    for start in 0..open.len() {
+        if !std::mem::replace(&mut open[start], false) {
+            continue;
+        }
+        let (mut count, mut pending) = (0usize, vec![start]);
+        let mut group = Change { left: usize::MAX, top: usize::MAX, right: 0, bottom: 0 };
+        while let Some(index) = pending.pop() {
+            count += 1;
+            let (column, row) = (index % columns, index / columns);
+            (group.left, group.right) = (group.left.min(column * CURSOR_CELL), group.right.max((column + 1) * CURSOR_CELL - 1));
+            (group.top, group.bottom) = (group.top.min(row * CURSOR_CELL), group.bottom.max((row + 1) * CURSOR_CELL - 1));
+            let beside = [(column > 0, index.wrapping_sub(1)), (column + 1 < columns, index + 1), (row > 0, index.wrapping_sub(columns)), (row + 1 < rows, index + columns)];
+            for (_, next) in beside.into_iter().filter(|&(inside, _)| inside) {
+                if std::mem::replace(&mut open[next], false) {
+                    pending.push(next);
+                }
+            }
+        }
+        if best.as_ref().is_none_or(|(size, _)| count > *size) {
+            best = Some((count, group));
+        }
+    }
+    let (_, mut window) = best?;
+    let column = |x: usize, window: &Change| (window.top..=window.bottom).filter(|&y| light(x, y)).count() * 2 >= window.height();
+    let row = |y: usize, window: &Change| (window.left..=window.right).filter(|&x| light(x, y)).count() * 2 >= window.width();
+    while window.left < window.right && !column(window.left, &window) {
+        window.left += 1;
+    }
+    while window.left > 0 && column(window.left - 1, &window) {
+        window.left -= 1;
+    }
+    while window.right > window.left && !column(window.right, &window) {
+        window.right -= 1;
+    }
+    while window.right + 1 < image.width && column(window.right + 1, &window) {
+        window.right += 1;
+    }
+    while window.top < window.bottom && !row(window.top, &window) {
+        window.top += 1;
+    }
+    while window.top > 0 && row(window.top - 1, &window) {
+        window.top -= 1;
+    }
+    while window.bottom > window.top && !row(window.bottom, &window) {
+        window.bottom -= 1;
+    }
+    while window.bottom + 1 < area && row(window.bottom + 1, &window) {
+        window.bottom += 1;
+    }
+    (window.width() >= 400 && window.height() >= 300).then_some(window)
+}
+
+/// As barras de capacidade de `image` dentro de `area`: as faixas de 6
+/// linhas ou mais em que uma corrida de [`CAPACITY_USED`] de 4 colunas ou
+/// mais é seguida por uma de [`CAPACITY_FREE`] de 4 colunas ou mais, nas
+/// mesmas colunas. Devolve (as colunas usadas, as colunas) de cada uma.
+fn capacity_bars(image: &Image, area: &Change) -> Vec<(usize, usize)> {
+    let is = |x: usize, y: usize, color: [u8; 3]| {
+        let at = (y * image.width + x) * 3;
+        image.rgb[at..at + 3].iter().zip(color).all(|(&channel, wanted)| channel.abs_diff(wanted) <= CAPACITY_TOLERANCE)
+    };
+    // (a primeira coluna, a primeira livre, a depois da última, a primeira
+    // linha, a última) de cada barra.
+    let mut bars: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+    for y in area.top..=area.bottom {
+        let mut x = area.left;
+        while x <= area.right {
+            if !is(x, y, CAPACITY_USED) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x <= area.right && is(x, y, CAPACITY_USED) {
+                x += 1;
+            }
+            let free = x;
+            while x <= area.right && is(x, y, CAPACITY_FREE) {
+                x += 1;
+            }
+            if free - start < 4 || x - free < 4 {
+                continue;
+            }
+            match bars.iter_mut().find(|bar| (bar.0, bar.1, bar.2) == (start, free, x) && bar.4 + 1 == y) {
+                Some(bar) => bar.4 = y,
+                None => bars.push((start, free, x, y, y)),
+            }
+        }
+    }
+    bars.into_iter().filter(|bar| bar.4 + 1 - bar.3 >= 6).map(|(start, free, end, _, _)| (free - start, end - start)).collect()
+}
+
+/// As medidas da janela de pasta de `image` (a janela clara,
+/// [`light_window`]): as colunas com tinta da caixa do endereço e da barra de
+/// status, as linhas de texto do painel de navegação e as da pasta e as
+/// barras de capacidade.
+pub fn folder_view(image: &Image) -> Result<FolderView, String> {
+    let window = light_window(image).ok_or("sem uma janela clara de 400x300 pixels ou mais acima da barra de tarefas")?;
+    let columns = |lines: &[Change]| match (lines.iter().map(|line| line.left).min(), lines.iter().map(|line| line.right).max()) {
+        (Some(left), Some(right)) => right + 1 - left,
+        _ => 0,
+    };
+    let address = Change { left: window.left + FOLDER_ADDRESS_LEFT, top: window.top + FOLDER_ADDRESS_ROWS.0, right: window.left + window.width() * 5 / 8, bottom: window.top + FOLDER_ADDRESS_ROWS.1 };
+    let body_bottom = window.bottom - FOLDER_STATUS_ROWS;
+    let navigation = Change { left: window.left + 2, top: window.top + FOLDER_BODY, right: window.left + FOLDER_NAVIGATION, bottom: body_bottom };
+    let content = Change { left: window.left + FOLDER_NAVIGATION + 8, top: window.top + FOLDER_BODY, right: window.right - 2, bottom: body_bottom };
+    let status = Change { left: window.left + 2, top: body_bottom + 1, right: window.left + window.width() / 2, bottom: window.bottom - 1 };
+    Ok(FolderView {
+        window,
+        address: columns(&ink_lines(image, &address)),
+        navigation: ink_lines(image, &navigation).len(),
+        lines: ink_lines(image, &content).len(),
+        drives: capacity_bars(image, &content),
+        status: columns(&ink_lines(image, &status)),
+    })
+}
+
+/// O conteúdo de Este Computador em `image`, com `drives` unidades: o
+/// endereço com [`FOLDER_ADDRESS_MINIMUM`] colunas de tinta ou mais (o ícone
+/// e o nome da pasta), duas linhas ou mais no painel de navegação (Acesso
+/// rápido e Este Computador), `drives` barras de capacidade, nem vazias nem
+/// cheias, duas linhas de texto ou mais na pasta e a contagem dos itens na
+/// barra de status. A janela que abre com o endereço, o painel e a pasta em
+/// branco não passa.
+pub fn folder_drives(image: &Image, drives: usize) -> Result<String, String> {
+    let view = folder_view(image)?;
+    let mut missing = Vec::new();
+    if view.address < FOLDER_ADDRESS_MINIMUM {
+        missing.push(format!("endereco com {} colunas de texto (minimo {FOLDER_ADDRESS_MINIMUM})", view.address));
+    }
+    if view.navigation < 2 {
+        missing.push(format!("{} linha(s) no painel de navegacao (minimo 2)", view.navigation));
+    }
+    if view.drives.len() != drives {
+        missing.push(format!("{} barra(s) de capacidade (esperada(s) {drives})", view.drives.len()));
+    }
+    if let Some((used, total)) = view.drives.iter().find(|(used, total)| used * 100 < total * 2 || used * 100 > total * 98) {
+        missing.push(format!("uma barra de capacidade com {used} de {total} colunas usadas (de 2% a 98%)"));
+    }
+    if view.lines < 2 {
+        missing.push(format!("{} linha(s) na pasta (minimo 2)", view.lines));
+    }
+    if view.status < 20 {
+        missing.push(format!("barra de status com {} colunas de texto (minimo 20)", view.status));
+    }
+    if missing.is_empty() {
+        Ok(view.describe())
+    } else {
+        Err(format!("{} ({})", missing.join("; "), view.describe()))
+    }
+}
+
 /// Telas sintéticas para os testes da vigia.
 #[cfg(test)]
 pub mod samples {
@@ -2313,5 +2568,84 @@ mod tests {
         assert!(command_output(&typed, &caret, 3, 131).unwrap_err().contains("nada mudou abaixo"));
         assert!(command_output(&typed, &typed, 3, 131).unwrap_err().contains("nao mudou"));
         assert!(command_output(&typed, &window(&desk, 100, 60, 800, 500, [0xFF, 0xFF, 0xFF]), 3, 131).unwrap_err().contains("nao e so a saida"));
+    }
+
+    /// A janela de Este Computador do 19041 em (130,75), 784x592, com o
+    /// endereço, duas linhas no painel, o grupo e uma unidade por fração de
+    /// `drives` e a contagem dos itens; cada `false` deixa a parte em branco.
+    fn folder_window(desk: &Image, address: bool, navigation: bool, drives: &[usize], status: bool) -> Image {
+        let glyphs = |x: usize, y: usize| if (x * 7 + y * 3) % 5 < 2 { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] };
+        let mut out = window(desk, 129, 74, 786, 593, [0xFF, 0xFF, 0xFF]);
+        // A caixa do endereço e a da pesquisa, a barra de comandos e a
+        // divisória do painel.
+        for (left, right) in [(236, 688), (700, 902)] {
+            paint(&mut out, left..right, 111..134, |x, y| if x == left || x + 1 == right || y == 111 || y == 133 { [0xD9, 0xD9, 0xD9] } else { [0xFF, 0xFF, 0xFF] });
+        }
+        paint(&mut out, 658..666, 121..125, |_, _| [0x50, 0x50, 0x50]);
+        paint(&mut out, 130..914, 140..171, |_, _| [0xF5, 0xF6, 0xF7]);
+        paint(&mut out, 288..289, 171..643, |_, _| [0xF7, 0xF7, 0xF7]);
+        if address {
+            paint(&mut out, 239..255, 114..130, |_, _| [0x36, 0xB3, 0xFF]);
+            paint(&mut out, 276..368, 117..128, glyphs);
+        }
+        if navigation {
+            paint(&mut out, 130..286, 219..243, |_, _| [0xD9, 0xD9, 0xD9]);
+            paint(&mut out, 175..250, 193..204, glyphs);
+            paint(&mut out, 175..268, 226..237, glyphs);
+        }
+        for (index, &used) in drives.iter().enumerate() {
+            let left = 360 + index * 254;
+            paint(&mut out, 311..489, 184..197, glyphs);
+            paint(&mut out, left..left + 70, 209..220, glyphs);
+            paint(&mut out, left..left + 190, 224..237, |x, y| {
+                if x == left || x + 1 == left + 190 || y == 224 || y == 236 {
+                    [0xBC, 0xBC, 0xBC]
+                } else if x - left <= used * 188 / 100 {
+                    [0x26, 0xA0, 0xDA]
+                } else {
+                    [0xE6, 0xE6, 0xE6]
+                }
+            });
+            paint(&mut out, left..left + 145, 241..252, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0x6D, 0x6D, 0x6D] } else { [0xFF, 0xFF, 0xFF] });
+        }
+        if status {
+            paint(&mut out, 144..178, 650..661, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0x1E, 0x39, 0x5B] } else { [0xFF, 0xFF, 0xFF] });
+        }
+        out
+    }
+
+    /// O conteúdo de Este Computador com uma unidade passa; a janela em
+    /// branco (o endereço, o painel e a pasta vazios, como ela abre sem o
+    /// shellstyle.dll), cada parte que falta, a contagem de unidades errada, a
+    /// barra vazia, a área de trabalho e lixo não.
+    #[test]
+    fn folder_drives_needs_the_whole_content() {
+        let desk = desktop(40, 218, true);
+        let shown = folder_drives(&folder_window(&desk, true, true, &[74], true), 1).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(shown.contains("2 linha(s) no painel de navegacao") && shown.contains("1 unidade(s) com a barra de capacidade [73%]"), "{shown}");
+        let view = folder_view(&folder_window(&desk, true, true, &[74], true)).unwrap();
+        assert!((view.window.left, view.window.right) == (130, 913) && view.window.top == 75 && view.window.bottom == 665, "{}", view.describe());
+        // A janela em branco, com a caixa do endereço e a da pesquisa.
+        let blank = folder_drives(&folder_window(&desk, false, false, &[], false), 1).unwrap_err();
+        for part in ["endereco com 0 colunas", "0 linha(s) no painel", "0 barra(s) de capacidade", "0 linha(s) na pasta", "status com 0 colunas"] {
+            assert!(blank.contains(part), "{part}: {blank}");
+        }
+        // Cada parte que falta reprova.
+        for (image, part) in [
+            (folder_window(&desk, false, true, &[74], true), "endereco"),
+            (folder_window(&desk, true, false, &[74], true), "painel"),
+            (folder_window(&desk, true, true, &[], true), "barra(s) de capacidade"),
+            (folder_window(&desk, true, true, &[74], false), "status"),
+            // Outra letra para o mesmo volume.
+            (folder_window(&desk, true, true, &[74, 74], true), "2 barra(s) de capacidade (esperada(s) 1)"),
+        ] {
+            assert!(folder_drives(&image, 1).unwrap_err().contains(part), "{part}: {:?}", folder_drives(&image, 1));
+        }
+        assert!(folder_drives(&folder_window(&desk, true, true, &[74, 30], true), 2).is_ok());
+        assert!(folder_drives(&folder_window(&desk, true, true, &[99], true), 1).is_err());
+        assert!(folder_drives(&desk, 1).unwrap_err().contains("sem uma janela clara"));
+        for garbage in [memory_as_pixels(), noise(), filled(WIDTH, HEIGHT, [0xFF, 0xFF, 0xFF]), filled(WIDTH, HEIGHT, [0x00, 0x00, 0x00])] {
+            assert!(folder_drives(&garbage, 1).is_err());
+        }
     }
 }

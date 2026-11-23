@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, COMMAND_OUTPUT_MARKER, CONTEXT_MENU_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, COMMAND_OUTPUT_MARKER, CONTEXT_MENU_MARKER, FOLDER_SHOWN_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -635,6 +635,10 @@ pub enum InputAction {
     /// botão esquerdo e confere a janela nova ([`screen_check::window_opened`],
     /// o `WINDOW_OPENED_OK`).
     DoubleClick { x: usize, y: usize },
+    /// Espera a janela de Este Computador parada com o conteúdo dela, com
+    /// `drives` unidades ([`screen_check::folder_drives`], o
+    /// `FOLDER_SHOWN_OK`).
+    FolderView { drives: usize },
     /// Aperta Win+R, espera a caixa Executar, digita o comando e o Enter e
     /// confere a janela do programa sobre a tela de antes do Win+R (o
     /// `WINDOW_OPENED_OK`).
@@ -730,6 +734,16 @@ impl InputSend {
         match screen_point(point) {
             Some((x, y)) => Ok(InputSend { after, delay, action: InputAction::DoubleClick { x, y } }),
             None => Err(format!("--double-click={text}: o ponto e X,Y inteiros dentro da tela de 1024x768")),
+        }
+    }
+
+    /// `--folder-view=MARCADOR[+MS]:UNIDADES`, quantas unidades Este
+    /// Computador mostra (de 1 a 26).
+    pub fn folder_view(text: &str) -> Result<InputSend, String> {
+        let (after, delay, drives) = Self::when("--folder-view", text)?;
+        match drives.trim().parse::<usize>() {
+            Ok(drives) if (1..=26).contains(&drives) => Ok(InputSend { after, delay, action: InputAction::FolderView { drives } }),
+            _ => Err(format!("--folder-view={text}: as unidades sao um numero de 1 a 26")),
         }
     }
 
@@ -1909,6 +1923,18 @@ fn double_click(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, sent: &
     new_window(monitor, ppm, &before, &format!("com o clique duplo em ({px},{py})"))
 }
 
+/// Quanto o `--folder-view` espera o conteúdo da janela de pasta.
+const FOLDER_WAIT: Duration = Duration::from_secs(60);
+
+/// O `--folder-view`: espera a janela de Este Computador com `drives`
+/// unidades ([`screen_check::folder_drives`]) em duas leituras seguidas
+/// iguais, por até [`FOLDER_WAIT`]. Devolve o conteúdo achado, ou o que
+/// faltou na última leitura.
+fn folder_view(monitor: &mut TcpStream, ppm: &Path, drives: usize) -> Result<String, String> {
+    let shown = still_screen(monitor, ppm, FOLDER_WAIT, |image| screen_check::folder_drives(image, drives))?;
+    screen_check::folder_drives(&shown, drives)
+}
+
 /// O `--run`: espera a tela desenhada parada, aperta Win+R (a hora vai para
 /// `sent`), espera a caixa Executar ([`new_window`]), digita o comando,
 /// espera a tela parada com ele e, depois do Enter, a janela do programa
@@ -2600,6 +2626,16 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] clique duplo em ({x},{y}) pelo monitor (aos {at:.1} s), sem janela nova: {missing}"));
                             return Err(format!("o clique duplo em ({x},{y}) nao abriu janela: {missing}"));
+                        }
+                    }
+                }
+                InputAction::FolderView { drives } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    match with_monitor(&mut |monitor| folder_view(monitor, &ppm, *drives)) {
+                        Ok(description) => note(format!("[xtask] conteudo da pasta (aos {:.1} s): {description}\n{FOLDER_SHOWN_MARKER}", launched.elapsed().as_secs_f64())),
+                        Err(missing) => {
+                            note(format!("[xtask] a pasta nao mostrou o conteudo (aos {:.1} s): {missing}", launched.elapsed().as_secs_f64()));
+                            return Err(format!("a janela de pasta nao mostrou o conteudo: {missing}"));
                         }
                     }
                 }
