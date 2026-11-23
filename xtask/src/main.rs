@@ -237,6 +237,17 @@ test-boot:         --keys=TEXTO (\\n = Enter) --expect=TEXTO (repetivel)
                    --folder-view=MARCADOR[+MS]:UNIDADES (repetivel: espera a janela de Este
                    Computador parada com o endereco, o painel de navegacao, UNIDADES unidades com
                    a barra de capacidade e a barra de status: FOLDER_SHOWN_OK)
+                   --folder-open=MARCADOR[+MS]:X,Y[,ITENS] (repetivel: clique duplo no item da
+                   janela de pasta em X,Y e confere a pasta aberta na mesma janela, com exatamente
+                   ITENS itens: FOLDER_OPENED_OK)
+                   --folder-item=MARCADOR[+MS]:NOME[,ITENS] (repetivel: digita o nome, que seleciona
+                   o item da pasta, clique duplo nele e confere a pasta aberta, com exatamente
+                   ITENS itens: FOLDER_ENTERED_OK)
+                   --folder-back=MARCADOR[+MS]:TECLAS (repetivel: digita as teclas, {alt-left}, e
+                   confere a janela de volta a pasta de antes: FOLDER_BACK_OK)
+                   --file-item=MARCADOR[+MS]:NOME,N (repetivel: digita o nome, que seleciona o
+                   arquivo, clique duplo nele e confere a janela do programa com o nome do
+                   arquivo no titulo e uma linha de texto de N caracteres ou mais: FILE_OPENED_OK)
                    --run=MARCADOR[+MS]:COMANDO (repetivel: Win+R, a caixa Executar, o comando e o
                    Enter; confere a janela do programa na tela: WINDOW_OPENED_OK)
                    --open=MARCADOR[+MS]:TECLAS (repetivel: digita as teclas, um atalho que abre um
@@ -473,6 +484,10 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
             "--context-menu" => parsed.inputs.push(qemu::InputSend::context_menu(&required()?)?),
             "--double-click" => parsed.inputs.push(qemu::InputSend::double_click(&required()?)?),
             "--folder-view" => parsed.inputs.push(qemu::InputSend::folder_view(&required()?)?),
+            "--folder-open" => parsed.inputs.push(qemu::InputSend::folder_open(&required()?)?),
+            "--folder-item" => parsed.inputs.push(qemu::InputSend::folder_item(&required()?)?),
+            "--folder-back" => parsed.inputs.push(qemu::InputSend::folder_back(&required()?)?),
+            "--file-item" => parsed.inputs.push(qemu::InputSend::file_item(&required()?)?),
             "--run" => parsed.inputs.push(qemu::InputSend::run(&required()?)?),
             "--open" => parsed.inputs.push(qemu::InputSend::open(&required()?)?),
             "--type" => parsed.inputs.push(qemu::InputSend::type_text(&required()?)?),
@@ -570,7 +585,7 @@ fn parse(arguments: Vec<String>) -> Result<Arguments, String> {
         return Err("--capture-every e opcao do test-boot".into());
     }
     if !parsed.inputs.is_empty() && parsed.command != "test-boot" {
-        return Err("--send, --dismiss, --mouse, --start-menu, --start-click, --context-menu, --double-click, --folder-view, --run, --open, --type e --command sao opcoes do test-boot".into());
+        return Err("--send, --dismiss, --mouse, --start-menu, --start-click, --context-menu, --double-click, --folder-view, --folder-open, --folder-item, --folder-back, --file-item, --run, --open, --type e --command sao opcoes do test-boot".into());
     }
     if parsed.manual_crash && parsed.command != "test-boot" {
         return Err("--manual-crash e opcao do test-boot".into());
@@ -942,6 +957,20 @@ mod tests {
         let parsed = parse_words(&["test-boot", "--folder-view=WINDOW_OPENED_OK+1000:1"]).unwrap();
         assert_eq!(parsed.inputs, vec![InputSend { after: "WINDOW_OPENED_OK".into(), delay: Duration::from_millis(1000), action: InputAction::FolderView { drives: 1 } }]);
         assert!(parse_words(&["run", "--folder-view=X:1"]).is_err());
+        let parsed = parse_words(&["test-boot", "--folder-open=FOLDER_SHOWN_OK+2000:430,230,6", "--folder-item=FOLDER_OPENED_OK:users", "--folder-item=FOLDER_OPENED_OK:textos,1", "--folder-back=FOLDER_ENTERED_OK:{alt-left}", "--file-item=FOLDER_BACK_OK+3000:hello,22"]).unwrap();
+        assert_eq!(
+            parsed.inputs,
+            vec![
+                InputSend { after: "FOLDER_SHOWN_OK".into(), delay: Duration::from_millis(2000), action: InputAction::FolderOpen { x: 430, y: 230, items: Some(6) } },
+                InputSend { after: "FOLDER_OPENED_OK".into(), delay: Duration::ZERO, action: InputAction::FolderItem { name: "users".into(), items: None } },
+                InputSend { after: "FOLDER_OPENED_OK".into(), delay: Duration::ZERO, action: InputAction::FolderItem { name: "textos".into(), items: Some(1) } },
+                InputSend { after: "FOLDER_ENTERED_OK".into(), delay: Duration::ZERO, action: InputAction::FolderBack("{alt-left}".into()) },
+                InputSend { after: "FOLDER_BACK_OK".into(), delay: Duration::from_millis(3000), action: InputAction::FileItem { name: "hello".into(), characters: 22 } },
+            ]
+        );
+        for bad in ["--folder-open=X:430", "--folder-open=X:1024,0", "--folder-open=X:1,2,0", "--folder-open=X:1,2,3,4", "--folder-item=X:a,0", "--folder-item=X:a.b", "--folder-item=X:", "--folder-back=X:{esquerda}", "--file-item=X:hello", "--file-item=X:hello,0", "--file-item=X:a.b,3"] {
+            assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
+        }
         for bad in ["--double-click=X:1024,1", "--folder-view=X", "--folder-view=X:0", "--folder-view=X:27", "--folder-view=X:C:", "--run=X", "--run=X:{win}", "--open=X:", "--type=X:a.b", "--type=X:{ret}", "--command=X:", "--command=X:dir /w"] {
             assert!(parse_words(&["test-boot", bad]).is_err(), "{bad}");
         }

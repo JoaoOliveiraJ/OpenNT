@@ -7124,8 +7124,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     com e sem entrada dividem a pasta de imagens e o gerador.
   - Sobem do volume do primeiro logon feito: barra-de-tarefas,
     reinicio-do-shell, menu-de-contexto, pasta-este-computador,
-    conteudo-este-computador, prompt-de-comando, bloco-de-notas e
-    gerenciador-de-tarefas. O primeiro
+    conteudo-este-computador, arquivo-de-texto, prompt-de-comando,
+    bloco-de-notas e gerenciador-de-tarefas. O primeiro
     logon continua conferido do volume novo nos testes logon-do-usuario,
     perfil-do-usuario, sihost, userinit, explorer, area-de-trabalho e
     area-de-trabalho-smp2, barra-de-tarefas-smp2, menu-iniciar e
@@ -8499,7 +8499,26 @@ colunas de tinta ou mais na caixa do endereço (o ícone e o nome da pasta),
 duas linhas ou mais no painel de navegação, duas ou mais na pasta, uma barra
 de capacidade por unidade, com a parte usada e a livre (nem vazia nem cheia),
 e 20 colunas de tinta ou mais na barra de status; o log ganha o
-`FOLDER_SHOWN_OK`. O `--run=...:COMANDO` aperta Win+R,
+`FOLDER_SHOWN_OK`. Na janela de pasta, o `--folder-open=...:X,Y[,ITENS]` leva o
+ponteiro ao ponto e dá o clique duplo; em duas leituras seguidas iguais, por
+até 120 s, a mesma janela (`screen_check::folder_opened`) tem outro endereço
+(40 pixels ou mais da caixa dele mudaram), o endereço e a contagem dos itens
+preenchidos e, com `ITENS`, exatamente essa contagem de itens, contados pelos
+nomes em preto da área da pasta (`item_names`: linhas de texto de 6 a 16
+linhas de altura e 18 colunas ou mais, sem a barra de rolagem), e o log ganha
+o `FOLDER_OPENED_OK`. O `--folder-item=...:NOME[,ITENS]` digita o nome, que
+seleciona o item da pasta que tem o foco, acha a caixa de seleção do tema
+aero (`selected_item`), leva o ponteiro ao centro dela e abre a pasta com o
+clique duplo e a mesma conferência (`FOLDER_ENTERED_OK`). O
+`--folder-back=...:TECLAS` digita as teclas e confere a janela com a caixa do
+endereço igual à da tela de antes de entrar na última pasta, com itens e a
+contagem deles (`FOLDER_BACK_OK`). O `--file-item=...:NOME,N` seleciona o
+arquivo pelo nome, dá o clique duplo e confere a janela do programa por
+cima da de pasta (`file_text`): uma linha de texto escuro nova de 6 colunas
+ou mais por caractere (`N`), com duas outras linhas novas nas 70 linhas
+acima dela (o título e o menu), e a primeira palavra do título, à direita
+do ícone, com 4 colunas ou mais por caractere do nome
+(`FILE_OPENED_OK`). O `--run=...:COMANDO` aperta Win+R,
 confere a caixa Executar (uma janela nova), digita o comando, espera a
 tela parada com ele e, depois do Enter, confere a janela do programa contra
 a tela de antes do Win+R, numa tela diferente da do comando digitado (a

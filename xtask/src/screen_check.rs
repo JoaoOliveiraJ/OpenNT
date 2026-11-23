@@ -1571,6 +1571,12 @@ pub fn command_output(typed: &Image, after: &Image, command: usize, below: usize
 
 /// O marcador do conteúdo da janela de pasta na tela.
 pub const FOLDER_SHOWN_MARKER: &str = "FOLDER_SHOWN_OK";
+/// Os marcadores da navegação: a pasta aberta pelo clique duplo num ponto e
+/// pelo nome, a volta à pasta de antes e o arquivo aberto.
+pub const FOLDER_OPENED_MARKER: &str = "FOLDER_OPENED_OK";
+pub const FOLDER_ENTERED_MARKER: &str = "FOLDER_ENTERED_OK";
+pub const FOLDER_BACK_MARKER: &str = "FOLDER_BACK_OK";
+pub const FILE_OPENED_MARKER: &str = "FILE_OPENED_OK";
 /// A parte usada e a livre da barra de capacidade de uma unidade com espaço
 /// (a TileCapacity do shellstyle.dll do tema aero; a de uma unidade quase
 /// cheia é vermelha).
@@ -1758,6 +1764,214 @@ fn capacity_bars(image: &Image, area: &Change) -> Vec<(usize, usize)> {
     bars.into_iter().filter(|bar| bar.4 + 1 - bar.3 >= 6).map(|(start, free, end, _, _)| (free - start, end - start)).collect()
 }
 
+/// A caixa do endereço da janela de pasta `window`.
+fn address_box(window: &Change) -> Change {
+    Change { left: window.left + FOLDER_ADDRESS_LEFT, top: window.top + FOLDER_ADDRESS_ROWS.0, right: window.left + window.width() * 5 / 8, bottom: window.top + FOLDER_ADDRESS_ROWS.1 }
+}
+
+/// Quantos pixels de `area` diferem entre `a` e `b` (mesmo tamanho).
+fn differing(a: &Image, b: &Image, area: &Change) -> usize {
+    let at = |x: usize, y: usize| (y * a.width + x) * 3;
+    (area.top..=area.bottom).map(|y| (area.left..=area.right).filter(|&x| a.rgb[at(x, y)..at(x, y) + 3] != b.rgb[at(x, y)..at(x, y) + 3]).count()).sum()
+}
+
+/// Os pixels de `image` mais escuros que [`DARK_LUMA`] dentro de `area`, em
+/// preto sobre branco.
+fn dark_ink(image: &Image, area: &Change) -> Image {
+    let mut ink = Image { width: image.width, height: image.height, rgb: vec![0xFF; image.rgb.len()] };
+    for y in area.top..=area.bottom {
+        for x in area.left..=area.right {
+            let at = (y * image.width + x) * 3;
+            if luma(&image.rgb[at..at + 3]) < DARK_LUMA {
+                ink.rgb[at..at + 3].fill(0);
+            }
+        }
+    }
+    ink
+}
+
+/// As linhas de texto de `ink` ([`dark_ink`]): os grupos de pixels pretos,
+/// com os que ficam na mesma faixa de linhas e a até 24 colunas um do outro
+/// juntos (as palavras), separados em linhas de texto ([`ink_lines`]).
+fn joined_lines(ink: &Image) -> Vec<Change> {
+    let blank = Image { width: ink.width, height: ink.height, rgb: vec![0xFF; ink.rgb.len()] };
+    // Um grupo pode juntar linhas vizinhas (o menu e o texto logo abaixo).
+    let mut words: Vec<Change> = changes(&blank, ink).iter().flat_map(|group| ink_lines(ink, group)).collect();
+    words.sort_by_key(|word| word.left);
+    let mut lines: Vec<Change> = Vec::new();
+    for word in words {
+        let beside = lines.iter_mut().find(|line| {
+            let overlap = (line.bottom.min(word.bottom) + 1).saturating_sub(line.top.max(word.top));
+            overlap * 2 >= line.height().min(word.height()) && word.left <= line.right + 24
+        });
+        match beside {
+            Some(line) => *line = Change { left: line.left.min(word.left), top: line.top.min(word.top), right: line.right.max(word.right), bottom: line.bottom.max(word.bottom) },
+            None => lines.push(word),
+        }
+    }
+    lines
+}
+
+/// Os nomes dos itens que a pasta da janela `window` de `image` mostra nos
+/// blocos do 19041 (a vista de uma pasta sem modelo próprio): as linhas de
+/// texto preto da área da pasta, sem a barra de rolagem, de 6 a 16 linhas de
+/// altura e 18 colunas ou mais (a seta do ponteiro é mais alta e mais
+/// estreita; o tipo e o tamanho de um arquivo são cinza).
+fn item_names(image: &Image, window: &Change) -> Vec<Change> {
+    let content = Change { left: window.left + FOLDER_NAVIGATION + 8, top: window.top + FOLDER_BODY, right: window.right - 22, bottom: window.bottom - FOLDER_STATUS_ROWS };
+    let mut names = joined_lines(&dark_ink(image, &content));
+    names.retain(|name| (6..=16).contains(&name.height()) && name.width() >= 18);
+    names
+}
+
+/// A janela de pasta de `before` navegou em `after`: a mesma janela clara
+/// ([`light_window`]), com outro endereço (40 pixels ou mais da caixa dele
+/// mudaram), o endereço e a barra de status preenchidos, como no
+/// [`folder_drives`], e, com `items`, exatamente essa contagem de itens
+/// ([`item_names`]).
+pub fn folder_opened(before: &Image, after: &Image, items: Option<usize>) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let window = light_window(before).ok_or("sem a janela de pasta antes")?;
+    let view = folder_view(after)?;
+    if !view.window.same_box(&window) {
+        return Err(format!("a janela {} de antes virou {}", window.describe(), view.window.describe()));
+    }
+    let moved = differing(before, after, &address_box(&window));
+    if moved < 40 {
+        return Err(format!("o endereco nao mudou ({moved} pixels, minimo 40; {})", view.describe()));
+    }
+    if view.address < FOLDER_ADDRESS_MINIMUM || view.status < 20 {
+        return Err(format!("a pasta nao mostrou o endereco ou a contagem dos itens ({})", view.describe()));
+    }
+    let names = item_names(after, &window);
+    if let Some(items) = items.filter(|&items| items != names.len()) {
+        return Err(format!("a pasta mostra {} item(ns), esperado(s) {items}: {} ({})", names.len(), names.iter().take(24).map(Change::describe).collect::<Vec<_>>().join(", "), view.describe()));
+    }
+    Ok(format!("{}; {} item(ns); {moved} pixels do endereco mudaram", view.describe(), names.len()))
+}
+
+/// A janela de pasta voltou em `after` à pasta de `first`, a tela dela antes
+/// de entrar em outra: a mesma janela, com a caixa do endereço igual à de
+/// antes e a pasta com itens e a contagem deles.
+pub fn folder_returned(first: &Image, after: &Image) -> Result<String, String> {
+    if (first.width, first.height) != (after.width, after.height) || first.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", first.width, first.height, after.width, after.height));
+    }
+    let window = light_window(first).ok_or("sem a janela de pasta antes")?;
+    let view = folder_view(after)?;
+    if !view.window.same_box(&window) {
+        return Err(format!("a janela {} de antes virou {}", window.describe(), view.window.describe()));
+    }
+    let moved = differing(first, after, &address_box(&window));
+    if moved != 0 {
+        return Err(format!("o endereco nao e o de antes ({moved} pixels diferentes; {})", view.describe()));
+    }
+    if view.lines == 0 || view.status < 20 {
+        return Err(format!("a pasta voltou sem itens ou sem a contagem deles ({})", view.describe()));
+    }
+    Ok(view.describe())
+}
+
+/// O preenchimento do item selecionado da pasta com o foco (o tema aero).
+const SELECTED_ITEM: [u8; 3] = [0xCC, 0xE8, 0xFF];
+
+/// O centro do item selecionado da janela de pasta de `image`: a caixa dos
+/// pixels de [`SELECTED_ITEM`] da área da pasta, de 60x14 pixels ou mais e
+/// com 2/5 ou mais deles.
+pub fn selected_item(image: &Image) -> Result<(usize, usize), String> {
+    let window = light_window(image).ok_or("sem a janela de pasta")?;
+    let content = Change { left: window.left + FOLDER_NAVIGATION + 8, top: window.top + FOLDER_BODY, right: window.right - 2, bottom: window.bottom - FOLDER_STATUS_ROWS };
+    let mut area: Option<(Change, usize)> = None;
+    for y in content.top..=content.bottom {
+        for x in content.left..=content.right {
+            let at = (y * image.width + x) * 3;
+            if image.rgb[at..at + 3] != SELECTED_ITEM {
+                continue;
+            }
+            match area.as_mut() {
+                Some((area, count)) => {
+                    (area.left, area.right, area.bottom) = (area.left.min(x), area.right.max(x), y);
+                    *count += 1;
+                }
+                None => area = Some((Change { left: x, top: y, right: x, bottom: y }, 1)),
+            }
+        }
+    }
+    let Some((area, count)) = area else { return Err("nenhum item selecionado na pasta".into()) };
+    if area.width() < 60 || area.height() < 14 || count * 5 < area.width() * area.height() * 2 {
+        return Err(format!("a selecao da pasta {} com {count} pixels nao e um item (60x14, 2/5 preenchidos)", area.describe()));
+    }
+    Ok(((area.left + area.right) / 2, (area.top + area.bottom) / 2))
+}
+
+/// As linhas de texto escuro que `after` ganhou sobre `before` acima da
+/// barra de tarefas: os pixels escuros ([`DARK_LUMA`]) que não eram escuros,
+/// em linhas de texto ([`joined_lines`]) de 6 a 32 linhas de altura.
+fn new_text_lines(before: &Image, after: &Image) -> Vec<Change> {
+    let (before, after) = (top_rows(before, above_taskbar(before)), top_rows(after, above_taskbar(before)));
+    let mut ink = Image { width: before.width, height: before.height, rgb: vec![0xFF; before.rgb.len()] };
+    for ((old, new), pixel) in before.rgb.chunks_exact(3).zip(after.rgb.chunks_exact(3)).zip(ink.rgb.chunks_exact_mut(3)) {
+        if luma(new) < DARK_LUMA && luma(old) >= DARK_LUMA {
+            pixel.fill(0);
+        }
+    }
+    let mut lines = joined_lines(&ink);
+    lines.retain(|line| (6..=32).contains(&line.height()));
+    lines
+}
+
+/// As palavras de `image` nas linhas de `rows`, a partir da coluna `left`: as
+/// corridas de colunas com algum pixel escuro ([`DARK_LUMA`]), separadas por
+/// 4 colunas ou mais sem nenhum, até `right`.
+fn dark_words(image: &Image, rows: &Change, left: usize, right: usize) -> Vec<(usize, usize)> {
+    let dark = |x: usize| {
+        (rows.top..=rows.bottom).any(|y| {
+            let at = (y * image.width + x) * 3;
+            luma(&image.rgb[at..at + 3]) < DARK_LUMA
+        })
+    };
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    for x in (left..=right.min(image.width - 1)).filter(|&x| dark(x)) {
+        match words.last_mut() {
+            Some(word) if x - word.1 <= 4 => word.1 = x,
+            _ => words.push((x, x)),
+        }
+    }
+    words
+}
+
+/// O texto do arquivo aberto em `after` sobre `before` por um programa (o
+/// Bloco de Notas) cuja janela abre por cima da de pasta, branco sobre
+/// branco: uma linha de texto escuro nova ([`new_text_lines`]) de 6 colunas
+/// ou mais por caractere (`characters`), com duas outras linhas novas nas 70
+/// linhas acima dela e nas colunas dela ou a até 64 à direita: a barra de
+/// título e o menu da janela do programa. A primeira palavra do título, à
+/// direita do ícone da janela (16 colunas depois do começo do menu), é o nome
+/// do arquivo: 4 colunas ou mais por caractere de `name` (o Bloco de Notas
+/// sem o nome começa o título pelo traço, de 3 colunas). O texto sem a janela
+/// em volta, a janela com o texto curto demais e o título sem o nome não
+/// passam.
+pub fn file_text(before: &Image, after: &Image, name: &str, characters: usize) -> Result<String, String> {
+    if (before.width, before.height) != (after.width, after.height) || before.rgb.len() != after.rgb.len() {
+        return Err(format!("a tela mudou de tamanho ({}x{} para {}x{})", before.width, before.height, after.width, after.height));
+    }
+    let lines = new_text_lines(before, after);
+    let header_of = |line: &Change| -> Vec<&Change> { lines.iter().filter(|other| other.bottom < line.top && other.bottom + 70 >= line.top && other.left <= line.right + 64 && other.right + 64 >= line.left).collect() };
+    let Some(line) = lines.iter().find(|line| line.width() >= 6 * characters && header_of(line).len() >= 2) else {
+        return Err(format!("sem uma linha de texto nova de {} colunas ou mais abaixo de duas outras ({})", 6 * characters, lines.iter().take(12).map(Change::describe).collect::<Vec<_>>().join(", ")));
+    };
+    let header = header_of(line);
+    let (Some(title), Some(menu)) = (header.iter().min_by_key(|other| other.top), header.iter().max_by_key(|other| other.bottom)) else { return Err("sem a barra de titulo e o menu acima do texto".into()) };
+    let words = dark_words(after, title, menu.left + 16, title.right.max(menu.right));
+    let first = words.first().map_or(0, |word| word.1 + 1 - word.0);
+    if first < 4 * name.chars().count() {
+        return Err(format!("o titulo da janela comeca com uma palavra de {first} colunas (minimo {} para o nome {name}); titulo {}, palavras {words:?}", 4 * name.chars().count(), title.describe()));
+    }
+    Ok(format!("texto {} abaixo da barra de titulo (palavras {words:?}) e do menu", line.describe()))
+}
+
 /// As medidas da janela de pasta de `image` (a janela clara,
 /// [`light_window`]): as colunas com tinta da caixa do endereço e da barra de
 /// status, as linhas de texto do painel de navegação e as da pasta e as
@@ -1768,7 +1982,7 @@ pub fn folder_view(image: &Image) -> Result<FolderView, String> {
         (Some(left), Some(right)) => right + 1 - left,
         _ => 0,
     };
-    let address = Change { left: window.left + FOLDER_ADDRESS_LEFT, top: window.top + FOLDER_ADDRESS_ROWS.0, right: window.left + window.width() * 5 / 8, bottom: window.top + FOLDER_ADDRESS_ROWS.1 };
+    let address = address_box(&window);
     let body_bottom = window.bottom - FOLDER_STATUS_ROWS;
     let navigation = Change { left: window.left + 2, top: window.top + FOLDER_BODY, right: window.left + FOLDER_NAVIGATION, bottom: body_bottom };
     let content = Change { left: window.left + FOLDER_NAVIGATION + 8, top: window.top + FOLDER_BODY, right: window.right - 2, bottom: body_bottom };
@@ -2647,5 +2861,115 @@ mod tests {
         for garbage in [memory_as_pixels(), noise(), filled(WIDTH, HEIGHT, [0xFF, 0xFF, 0xFF]), filled(WIDTH, HEIGHT, [0x00, 0x00, 0x00])] {
             assert!(folder_drives(&garbage, 1).is_err());
         }
+    }
+
+    /// A janela de pasta em (130,75) com outro endereço (o `address` é a
+    /// largura dele) e os nomes dos itens em `names`, dois por linha, nos
+    /// blocos de 254x56 do 19041, com o ícone da pasta de cada um.
+    fn listing(desk: &Image, address: usize, names: usize) -> Image {
+        let glyphs = |x: usize, y: usize| if (x * 7 + y * 3) % 5 < 2 { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] };
+        let mut out = folder_window(desk, true, true, &[], true);
+        paint(&mut out, 276..276 + address, 117..128, glyphs);
+        for index in 0..names {
+            let (left, top) = (316 + (index % 2) * 254, 183 + (index / 2) * 56);
+            if top + 40 > 640 {
+                break;
+            }
+            paint(&mut out, left..left + 28, top..top + 40, |_, _| [0xFF, 0xE7, 0x9E]);
+            paint(&mut out, left + 45..left + 45 + 46, top + 5..top + 15, glyphs);
+        }
+        out
+    }
+
+    /// A pasta aberta por um item de Este Computador: a mesma janela com
+    /// outro endereço e a contagem certa de itens passa; a contagem errada, o
+    /// endereço igual, a janela em branco, outra janela e a pasta que não
+    /// abriu não.
+    #[test]
+    fn folder_opened_needs_the_new_address_and_the_item_count() {
+        let desk = desktop(40, 218, true);
+        let before = folder_window(&desk, true, true, &[74], true);
+        let opened = folder_opened(&before, &listing(&desk, 180, 6), Some(6)).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(opened.contains("6 item(ns)"), "{opened}");
+        assert!(folder_opened(&before, &listing(&desk, 180, 6), None).is_ok());
+        // O leiaute achatado da raiz mostrava os arquivos de System32.
+        assert!(folder_opened(&before, &listing(&desk, 180, 16), Some(6)).unwrap_err().contains("16 item(ns), esperado(s) 6"));
+        assert!(folder_opened(&before, &listing(&desk, 180, 0), Some(6)).unwrap_err().contains("0 item(ns), esperado(s) 6"));
+        // O ponteiro sobre a área da pasta não conta como item.
+        let mut pointed = listing(&desk, 180, 6);
+        pointer(&mut pointed, 480, 300);
+        assert!(folder_opened(&before, &pointed, Some(6)).is_ok(), "{:?}", folder_opened(&before, &pointed, Some(6)));
+        assert!(folder_opened(&before, &before, Some(0)).unwrap_err().contains("endereco nao mudou"));
+        assert!(folder_opened(&before, &folder_window(&desk, false, false, &[], false), None).unwrap_err().contains("endereco"));
+        assert!(folder_opened(&before, &desk, None).is_err());
+        assert!(folder_opened(&desk, &before, None).unwrap_err().contains("sem a janela de pasta"));
+        for garbage in [memory_as_pixels(), noise(), filled(WIDTH, HEIGHT, [0xFF, 0xFF, 0xFF])] {
+            assert!(folder_opened(&before, &garbage, None).is_err());
+        }
+    }
+
+    /// A volta à pasta: a mesma janela com o endereço de antes passa; outro
+    /// endereço, sem itens, sem a contagem e outra janela não.
+    #[test]
+    fn folder_returned_needs_the_same_address() {
+        let desk = desktop(40, 218, true);
+        let first = listing(&desk, 92, 6);
+        assert!(folder_returned(&first, &first).is_ok(), "{:?}", folder_returned(&first, &first));
+        assert!(folder_returned(&first, &listing(&desk, 180, 6)).unwrap_err().contains("endereco nao e o de antes"));
+        assert!(folder_returned(&first, &folder_window(&desk, true, true, &[], true)).is_err());
+        assert!(folder_returned(&first, &desk).is_err());
+    }
+
+    /// O item selecionado pelo teclado: a caixa de seleção do tema aero, o
+    /// centro dela. Sem seleção, com a seleção pequena e com a tela cheia da
+    /// cor não passa.
+    #[test]
+    fn selected_item_finds_the_box() {
+        let desk = desktop(40, 218, true);
+        let mut selected = listing(&desk, 180, 6);
+        paint(&mut selected, 558..808, 289..341, |x, y| if x == 558 || y == 289 { [0x99, 0xD1, 0xFF] } else { [0xCC, 0xE8, 0xFF] });
+        assert_eq!(selected_item(&selected).unwrap_or_else(|missing| panic!("{missing}")), (683, 315));
+        assert!(selected_item(&listing(&desk, 180, 6)).unwrap_err().contains("nenhum item selecionado"));
+        let mut small = listing(&desk, 180, 6);
+        paint(&mut small, 400..430, 300..306, |_, _| [0xCC, 0xE8, 0xFF]);
+        assert!(selected_item(&small).unwrap_err().contains("nao e um item"));
+        assert!(selected_item(&desk).is_err());
+    }
+
+    /// O Bloco de Notas branco sobre a janela de pasta, com a palavra do nome
+    /// no título, o menu e uma linha de texto, passa; o título sem o nome
+    /// (começa pelo traço), o texto sem a janela, o texto curto, a janela sem o
+    /// menu e a tela parada não.
+    #[test]
+    fn file_text_needs_the_name_in_the_title() {
+        let desk = desktop(40, 218, true);
+        let before = listing(&desk, 180, 1);
+        // (os trechos escuros do título a partir da coluna 193).
+        let notepad = |title: &[(usize, usize)], menu: bool, text: usize| {
+            let mut out = before.clone();
+            paint(&mut out, 163..916, 156..674, |x, y| if x == 163 || y == 156 || x == 915 || y == 673 { [0x00, 0x78, 0xD7] } else { [0xFF, 0xFF, 0xFF] });
+            let ink = |x: usize, y: usize| if (x * 7 + y * 3) % 5 < 2 { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] };
+            paint(&mut out, 173..189, 164..180, |_, _| [0xB0, 0xD8, 0xE8]);
+            for &(left, right) in title {
+                paint(&mut out, left..right, 167..177, |_, _| [0x10, 0x10, 0x10]);
+            }
+            if menu {
+                paint(&mut out, 171..407, 192..202, ink);
+            }
+            paint(&mut out, 164..164 + text, 207..220, ink);
+            out
+        };
+        let named = [(194, 218), (223, 226), (231, 259), (264, 276), (280, 309)];
+        let nameless = [(194, 197), (202, 230), (235, 247), (251, 280)];
+        let opened = file_text(&before, &notepad(&named, true, 222), "nota", 26).unwrap_or_else(|missing| panic!("{missing}"));
+        assert!(opened.contains("abaixo da barra de titulo"), "{opened}");
+        let refused = file_text(&before, &notepad(&nameless, true, 222), "nota", 26).unwrap_err();
+        assert!(refused.contains("comeca com uma palavra de 3 colunas"), "{refused}");
+        assert!(file_text(&before, &notepad(&named, true, 60), "nota", 26).unwrap_err().contains("sem uma linha de texto"));
+        assert!(file_text(&before, &notepad(&[], false, 222), "nota", 26).unwrap_err().contains("sem uma linha de texto"));
+        let mut bare = before.clone();
+        paint(&mut bare, 171..393, 207..220, |x, y| if (x * 7 + y * 3) % 5 < 2 { [0x00, 0x00, 0x00] } else { [0xFF, 0xFF, 0xFF] });
+        assert!(file_text(&before, &bare, "nota", 26).unwrap_err().contains("sem uma linha de texto"));
+        assert!(file_text(&before, &before, "nota", 26).is_err());
     }
 }

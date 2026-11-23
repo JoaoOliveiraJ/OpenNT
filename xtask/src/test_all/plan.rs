@@ -133,7 +133,7 @@ impl Test {
         );
         let own_qemu = [
             ("--keys", parsed.keys.is_some()),
-            ("--send/--dismiss/--mouse/--start-menu/--context-menu/--double-click/--folder-view/--run/--open/--type/--command", !parsed.inputs.is_empty()),
+            ("--send/--dismiss/--mouse/--start-menu/--context-menu/--double-click/--folder-view/--folder-open/--folder-item/--folder-back/--file-item/--run/--open/--type/--command", !parsed.inputs.is_empty()),
             ("--hold", parsed.hold_ms > 0),
             ("--kd", !options.kd.is_empty()),
             ("--script", parsed.script.is_some()),
@@ -389,6 +389,10 @@ const PRODUCER_DROPS: &[&str] = &[
     "--context-menu",
     "--double-click",
     "--folder-view",
+    "--folder-open",
+    "--folder-item",
+    "--folder-back",
+    "--file-item",
     "--run",
     "--open",
     "--type",

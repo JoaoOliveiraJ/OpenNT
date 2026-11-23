@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::screen_check::{self, COMMAND_OUTPUT_MARKER, CONTEXT_MENU_MARKER, FOLDER_SHOWN_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
+use crate::screen_check::{self, COMMAND_OUTPUT_MARKER, CONTEXT_MENU_MARKER, FILE_OPENED_MARKER, FOLDER_BACK_MARKER, FOLDER_ENTERED_MARKER, FOLDER_OPENED_MARKER, FOLDER_SHOWN_MARKER, TEXT_TYPED_MARKER, WINDOW_OPENED_MARKER, CURSOR_MOVED_MARKER, DESKTOP_AFTER, DESKTOP_MARKER, FIRST_PIXEL_MARKER, LOGON_DISMISS_MARKER, LOGON_SCREEN_MARKER, RESTART_AFTER, START_MENU_MARKER, TASKBAR_AFTER, TASKBAR_MARKER};
 
 #[derive(Clone, Debug)]
 pub struct MachineOptions {
@@ -639,6 +639,23 @@ pub enum InputAction {
     /// `drives` unidades ([`screen_check::folder_drives`], o
     /// `FOLDER_SHOWN_OK`).
     FolderView { drives: usize },
+    /// Clique duplo no item da janela de pasta em (`x`, `y`) e a pasta dele
+    /// aberta na mesma janela, com exatamente `items` itens
+    /// ([`screen_check::folder_opened`], o `FOLDER_OPENED_OK`).
+    FolderOpen { x: usize, y: usize, items: Option<usize> },
+    /// Digita o nome, que seleciona o item na pasta, clique duplo nele
+    /// ([`screen_check::selected_item`]) e a pasta dele aberta na mesma
+    /// janela, com exatamente `items` itens (o `FOLDER_ENTERED_OK`).
+    FolderItem { name: String, items: Option<usize> },
+    /// Digita as teclas (o Alt+seta para a esquerda) e confere a janela de
+    /// volta à pasta de antes do último clique duplo
+    /// ([`screen_check::folder_returned`], o `FOLDER_BACK_OK`).
+    FolderBack(String),
+    /// Digita o nome, que seleciona o arquivo na pasta, clique duplo nele e a
+    /// janela do programa dele com o nome do arquivo no título e uma linha de
+    /// texto de `characters` caracteres ou mais ([`screen_check::file_text`],
+    /// o `FILE_OPENED_OK`).
+    FileItem { name: String, characters: usize },
     /// Aperta Win+R, espera a caixa Executar, digita o comando e o Enter e
     /// confere a janela do programa sobre a tela de antes do Win+R (o
     /// `WINDOW_OPENED_OK`).
@@ -744,6 +761,61 @@ impl InputSend {
         match drives.trim().parse::<usize>() {
             Ok(drives) if (1..=26).contains(&drives) => Ok(InputSend { after, delay, action: InputAction::FolderView { drives } }),
             _ => Err(format!("--folder-view={text}: as unidades sao um numero de 1 a 26")),
+        }
+    }
+
+    /// A contagem de itens depois da última vírgula de `text` (`a,N`), ou
+    /// `None` sem ela: de 1 a 200.
+    fn item_count(option: &str, text: &str, part: Option<&str>) -> Result<Option<usize>, String> {
+        part.map(|count| match count.trim().parse::<usize>() {
+            Ok(count) if (1..=200).contains(&count) => Ok(count),
+            _ => Err(format!("{option}={text}: a contagem de itens vai de 1 a 200")),
+        })
+        .transpose()
+    }
+
+    /// `--folder-open=MARCADOR[+MS]:X,Y[,ITENS]`, um ponto da tela de 1024x768
+    /// e a contagem exata dos itens da pasta.
+    pub fn folder_open(text: &str) -> Result<InputSend, String> {
+        let (after, delay, rest) = Self::when("--folder-open", text)?;
+        let parts: Vec<&str> = rest.split(',').collect();
+        let point = parts.get(0..2).map(|point| point.join(",")).and_then(|point| screen_point(&point));
+        match point {
+            Some((x, y)) if parts.len() <= 3 => Ok(InputSend { after, delay, action: InputAction::FolderOpen { x, y, items: Self::item_count("--folder-open", text, parts.get(2).copied())? } }),
+            _ => Err(format!("--folder-open={text}: o ponto e X,Y inteiros dentro da tela de 1024x768, e a contagem de itens depois")),
+        }
+    }
+
+    /// O nome de um item que a pasta seleciona pelo teclado: letras,
+    /// algarismos e espaço.
+    fn item_name(option: &str, text: &str, name: &str) -> Result<String, String> {
+        if name.is_empty() || !name.chars().all(|character| character.is_ascii_alphanumeric() || character == ' ') {
+            return Err(format!("{option}={text}: o nome e de letras, algarismos e espacos"));
+        }
+        Ok(name.to_string())
+    }
+
+    /// `--folder-item=MARCADOR[+MS]:NOME[,ITENS]`.
+    pub fn folder_item(text: &str) -> Result<InputSend, String> {
+        let (after, delay, rest) = Self::when("--folder-item", text)?;
+        let (name, count) = rest.split_once(',').map_or((rest, None), |(name, count)| (name, Some(count)));
+        Ok(InputSend { after, delay, action: InputAction::FolderItem { name: Self::item_name("--folder-item", text, name)?, items: Self::item_count("--folder-item", text, count)? } })
+    }
+
+    /// `--folder-back=MARCADOR[+MS]:TECLAS`.
+    pub fn folder_back(text: &str) -> Result<InputSend, String> {
+        let (after, delay, keys) = Self::when("--folder-back", text)?;
+        key_names(keys)?;
+        Ok(InputSend { after, delay, action: InputAction::FolderBack(keys.to_string()) })
+    }
+
+    /// `--file-item=MARCADOR[+MS]:NOME,N`, com N caracteres ou mais na linha
+    /// de texto do arquivo.
+    pub fn file_item(text: &str) -> Result<InputSend, String> {
+        let (after, delay, item) = Self::when("--file-item", text)?;
+        match item.split_once(',').and_then(|(name, count)| Some((name, count.trim().parse::<usize>().ok()?))) {
+            Some((name, characters)) if (1..=120).contains(&characters) => Ok(InputSend { after, delay, action: InputAction::FileItem { name: Self::item_name("--file-item", text, name)?, characters } }),
+            _ => Err(format!("--file-item={text}: o nome do arquivo, uma virgula e quantos caracteres tem o texto (de 1 a 120)")),
         }
     }
 
@@ -1935,6 +2007,112 @@ fn folder_view(monitor: &mut TcpStream, ppm: &Path, drives: usize) -> Result<Str
     screen_check::folder_drives(&shown, drives)
 }
 
+/// Quanto uma pasta pode levar para abrir, e o intervalo das leituras.
+const BROWSE_WAIT: Duration = Duration::from_secs(120);
+const BROWSE_POLL: Duration = Duration::from_millis(700);
+
+/// Aperta duas vezes o botão esquerdo onde o ponteiro está, dentro do tempo
+/// do clique duplo do Windows (500 ms).
+fn press_twice(monitor: &mut TcpStream) -> Result<(), String> {
+    for press in ["mouse_button 1\n", "mouse_button 0\n", "mouse_button 1\n", "mouse_button 0\n"] {
+        monitor.write_all(press.as_bytes()).map_err(|error| format!("monitor HMP: {error}"))?;
+        thread::sleep(Duration::from_millis(40));
+    }
+    Ok(())
+}
+
+/// Espera `check` passar em duas leituras seguidas iguais, a
+/// [`BROWSE_POLL`] uma da outra, por até [`BROWSE_WAIT`] desde `since`.
+/// Devolve a segunda tela, quando `check` passou a primeira vez e quando a
+/// tela parou, contados de `since`.
+fn settled(monitor: &mut TcpStream, ppm: &Path, since: Instant, check: impl Fn(&crate::png::Image) -> Result<String, String>) -> Result<(crate::png::Image, Duration, Duration), String> {
+    let mut first = None;
+    let mut previous: Option<crate::png::Image> = None;
+    loop {
+        let image = hmp_screen(monitor, ppm)?;
+        let verdict = check(&image);
+        match &verdict {
+            Ok(_) => {
+                let first = *first.get_or_insert(since.elapsed());
+                if previous.as_ref().is_some_and(|previous| previous.rgb == image.rgb) {
+                    return Ok((image, first, since.elapsed()));
+                }
+            }
+            Err(missing) if since.elapsed() > BROWSE_WAIT => return Err(missing.clone()),
+            Err(_) => first = None,
+        }
+        if since.elapsed() > BROWSE_WAIT {
+            return Err("a tela nao parou em duas leituras seguidas iguais".into());
+        }
+        previous = verdict.is_ok().then_some(image);
+        thread::sleep(BROWSE_POLL);
+    }
+}
+
+/// O clique duplo onde o ponteiro está, sobre a janela de pasta `before`, e a
+/// pasta aberta ([`screen_check::folder_opened`]), com os tempos desde o
+/// clique.
+fn open_folder_at(monitor: &mut TcpStream, ppm: &Path, before: &crate::png::Image, what: &str, items: Option<usize>) -> Result<String, String> {
+    let clicked = Instant::now();
+    press_twice(monitor)?;
+    let (shown, first, still) = settled(monitor, ppm, clicked, |image| screen_check::folder_opened(before, image, items)).map_err(|missing| format!("a pasta nao abriu {what}: {missing}"))?;
+    Ok(format!("{}; aberta aos {:.1} s, parada aos {:.1} s do clique", screen_check::folder_opened(before, &shown, items)?, first.as_secs_f64(), still.as_secs_f64()))
+}
+
+/// O `--folder-open`: leva o ponteiro a (`x`, `y`), espera a tela parada (a
+/// tela de antes vai para `visited`) e abre a pasta com o clique duplo.
+fn folder_open(monitor: &mut TcpStream, ppm: &Path, x: usize, y: usize, items: Option<usize>, visited: &mut Vec<crate::png::Image>) -> Result<String, String> {
+    still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    let (px, py) = point_at(monitor, ppm, x, y)?;
+    let before = still_screen(monitor, ppm, WINDOW_WAIT, screen_check::drawn_screen)?;
+    let opened = open_folder_at(monitor, ppm, &before, &format!("com o clique duplo em ({px},{py})"), items)?;
+    visited.push(before);
+    Ok(format!("clique duplo em ({px},{py}): {opened}"))
+}
+
+/// Digita `name`, que seleciona o item da pasta que tem o foco, e leva o
+/// ponteiro ao item selecionado, em duas leituras seguidas no mesmo lugar.
+/// Devolve onde o ponteiro ficou e a tela parada com ele lá.
+fn point_at_item(monitor: &mut TcpStream, ppm: &Path, name: &str) -> Result<((usize, usize), crate::png::Image), String> {
+    still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    let typed = Instant::now();
+    type_keys(monitor, name)?;
+    let (selected, _, _) = settled(monitor, ppm, typed, |image| screen_check::selected_item(image).map(|_| String::new())).map_err(|missing| format!("o nome {name} nao selecionou um item: {missing}"))?;
+    let (x, y) = screen_check::selected_item(&selected)?;
+    let point = point_at(monitor, ppm, x, y)?;
+    Ok((point, still_screen(monitor, ppm, WINDOW_WAIT, screen_check::drawn_screen)?))
+}
+
+/// O `--folder-item`: seleciona o item pelo nome e abre a pasta dele com o
+/// clique duplo (a tela de antes vai para `visited`).
+fn folder_item(monitor: &mut TcpStream, ppm: &Path, name: &str, items: Option<usize>, visited: &mut Vec<crate::png::Image>) -> Result<String, String> {
+    let (point, before) = point_at_item(monitor, ppm, name)?;
+    let opened = open_folder_at(monitor, ppm, &before, &format!("com o clique duplo em {name} ({},{})", point.0, point.1), items)?;
+    visited.push(before);
+    Ok(format!("clique duplo em {name} ({},{}): {opened}", point.0, point.1))
+}
+
+/// O `--folder-back`: digita as teclas e espera a janela de volta à pasta da
+/// última tela de `visited`.
+fn folder_back(monitor: &mut TcpStream, ppm: &Path, keys: &str, visited: &mut Vec<crate::png::Image>) -> Result<String, String> {
+    let first = visited.pop().ok_or("nenhuma pasta aberta antes do --folder-back")?;
+    still_screen(monitor, ppm, STILL_WAIT, screen_check::drawn_screen)?;
+    let typed = Instant::now();
+    type_keys(monitor, keys)?;
+    let (shown, back, still) = settled(monitor, ppm, typed, |image| screen_check::folder_returned(&first, image)).map_err(|missing| format!("a pasta nao voltou: {missing}"))?;
+    Ok(format!("{}; de volta aos {:.1} s, parada aos {:.1} s das teclas", screen_check::folder_returned(&first, &shown)?, back.as_secs_f64(), still.as_secs_f64()))
+}
+
+/// O `--file-item`: seleciona o arquivo pelo nome, abre com o clique duplo e
+/// espera a janela do programa com o texto ([`screen_check::file_text`]).
+fn file_item(monitor: &mut TcpStream, ppm: &Path, name: &str, characters: usize) -> Result<String, String> {
+    let (point, before) = point_at_item(monitor, ppm, name)?;
+    let clicked = Instant::now();
+    press_twice(monitor)?;
+    let opened = still_screen(monitor, ppm, BROWSE_WAIT, |image| screen_check::file_text(&before, image, name, characters)).map_err(|missing| format!("o arquivo {name} nao abriu com o clique duplo em ({},{}): {missing}", point.0, point.1))?;
+    Ok(format!("clique duplo em {name} ({},{}): {}; parada aos {:.1} s do clique", point.0, point.1, screen_check::file_text(&before, &opened, name, characters)?, clicked.elapsed().as_secs_f64()))
+}
+
 /// O `--run`: espera a tela desenhada parada, aperta Win+R (a hora vai para
 /// `sent`), espera a caixa Executar ([`new_window`]), digita o comando,
 /// espera a tela parada com ele e, depois do Enter, a janela do programa
@@ -2552,6 +2730,9 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
     // `--expect` seguinte não pode casar). O `--dismiss` ou o `--mouse` que
     // não vê a tela mudar encerra o teste.
     let sent = std::cell::RefCell::new(vec![false; test.inputs.len()]);
+    // As telas da janela de pasta de antes de cada pasta aberta, para o
+    // `--folder-back`.
+    let visited = std::cell::RefCell::new(Vec::new());
     let send_after = |marker: &str| -> Result<(), String> {
         for (index, input) in test.inputs.iter().enumerate() {
             if input.after != marker || std::mem::replace(&mut sent.borrow_mut()[index], true) {
@@ -2636,6 +2817,34 @@ pub fn test_boot(disks: &Disks, machine: &MachineOptions, test: &TestOptions, lo
                         Err(missing) => {
                             note(format!("[xtask] a pasta nao mostrou o conteudo (aos {:.1} s): {missing}", launched.elapsed().as_secs_f64()));
                             return Err(format!("a janela de pasta nao mostrou o conteudo: {missing}"));
+                        }
+                    }
+                }
+                InputAction::FolderOpen { .. } | InputAction::FolderItem { .. } | InputAction::FolderBack(_) | InputAction::FileItem { .. } => {
+                    let ppm = log.with_file_name("tela-monitor.ppm");
+                    let (what, marker) = match &input.action {
+                        InputAction::FolderOpen { x, y, .. } => (format!("abrir a pasta em ({x},{y})"), FOLDER_OPENED_MARKER),
+                        InputAction::FolderItem { name, .. } => (format!("abrir a pasta {name}"), FOLDER_ENTERED_MARKER),
+                        InputAction::FolderBack(keys) => (format!("voltar com {keys}"), FOLDER_BACK_MARKER),
+                        InputAction::FileItem { name, .. } => (format!("abrir o arquivo {name}"), FILE_OPENED_MARKER),
+                        _ => unreachable!(),
+                    };
+                    let outcome = with_monitor(&mut |monitor| {
+                        let mut visited = visited.borrow_mut();
+                        match &input.action {
+                            InputAction::FolderOpen { x, y, items } => folder_open(monitor, &ppm, *x, *y, *items, &mut visited),
+                            InputAction::FolderItem { name, items } => folder_item(monitor, &ppm, name, *items, &mut visited),
+                            InputAction::FolderBack(keys) => folder_back(monitor, &ppm, keys, &mut visited),
+                            InputAction::FileItem { name, characters } => file_item(monitor, &ppm, name, *characters),
+                            _ => unreachable!(),
+                        }
+                    });
+                    let at = launched.elapsed().as_secs_f64();
+                    match outcome {
+                        Ok(description) => note(format!("[xtask] {what} (aos {at:.1} s): {description}\n{marker}")),
+                        Err(missing) => {
+                            note(format!("[xtask] {what} (aos {at:.1} s), sem efeito: {missing}"));
+                            return Err(format!("{what}: {missing}"));
                         }
                     }
                 }
