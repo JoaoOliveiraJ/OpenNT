@@ -546,11 +546,15 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
         nodes = profiles.nodes;
     }
     // Os descritores de segurança dos arquivos do Windows desta máquina
-    // (sem SID de conta), a raiz com o de System32 e, no boot do smss, as
-    // pastas vazias de uma instalação nova que a cadeia usa. Os perfis
-    // ficam com os nós deles.
-    let security = crate::host_security::system_nodes(&origins, &nodes, options.initial_process == "smss");
-    println!("descritores dos arquivos do Windows no volume NTFS: {} nos ({} pastas), raiz {}", security.nodes.len(), security.nodes.iter().filter(|node| node.directory).count(), if security.root.is_some() { "com o descritor de System32" } else { "com o descritor comum" });
+    // (sem SID de conta), a raiz com o padrão da unidade do sistema (na
+    // achatada, com o de System32) e, no boot do smss, as pastas vazias de
+    // uma instalação nova que a cadeia usa. Os perfis ficam com os nós deles.
+    let security = crate::host_security::system_nodes(&origins, &nodes, options.real_layout(), options.initial_process == "smss");
+    println!("descritores dos arquivos do Windows no volume NTFS: {} nos ({} pastas), raiz {}", security.nodes.len(), security.nodes.iter().filter(|node| node.directory).count(), match (security.root.is_some(), options.real_layout()) {
+        (true, true) => "com o descritor padrao da unidade do sistema",
+        (true, false) => "com o descritor de System32",
+        (false, _) => "com o descritor comum",
+    });
     nodes.extend(security.nodes);
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
     // 256 MB em C:): o volume dele tem espaço livre para o arquivo crescer

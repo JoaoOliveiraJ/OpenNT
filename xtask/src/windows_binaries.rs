@@ -1859,18 +1859,6 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
             Ok(bytes) => files.push(Staged::copied(String::from("AppPatch/sysmain.sdb"), bytes, &sysmain)),
             Err(_) => println!("AVISO: {} ausente no Windows desta maquina", sysmain.display()),
         }
-        // O diretório dos logs do serviço do log de eventos, vazio como numa
-        // instalação nova: o wevtsvc.dll cria nele os `.evtx` dos canais
-        // (`%SystemRoot%\System32\winevt\Logs`). Um nome terminado em '/' é
-        // um diretório vazio (`ntfs_image`), com o descritor da pasta daqui.
-        // O conteúdo de `\Windows\System32` fica na raiz do volume: o modo
-        // usuário abre `C:\Windows\System32\winevt\Logs\X` como
-        // `/winevt/Logs/X` (`volume_files::nt_path_to_volume_path`), e o
-        // NtCreateFile de um arquivo novo confere o pai por esse caminho; em
-        // `Windows/System32/winevt/Logs` o File::OpenFile do wevtsvc recebe
-        // STATUS_OBJECT_PATH_NOT_FOUND.
-        let event_logs = system32.join("winevt/Logs");
-        files.push(Staged { path: String::from("winevt/Logs/"), bytes: Vec::new(), host: event_logs.is_dir().then_some(event_logs) });
     }
     files.push(Staged::generated(String::from("NTOSKRNL.EXE"), kernel_pe.to_vec()));
     files.push(Staged::generated(String::from("Windows/System32/ntoskrnl.exe"), kernel_pe.to_vec()));
@@ -1884,8 +1872,9 @@ pub fn ntfs_files(root: &Path, kernel_pe: &[u8], initial_process: &str) -> Resul
 /// NTFS do kernel resolve pelos aliases de instalação
 /// (`volume_files::install_alias`). Os gerados e os que não vêm do
 /// `\Windows` ficam onde estão, menos a cópia achatada do `NTOSKRNL.EXE`,
-/// que já tem o caminho canônico. Um caminho que dois arquivos dariam fica
-/// com o primeiro.
+/// que já tem o caminho canônico, e o `VGK.SYS`, que vai para o System32\drivers
+/// do ImagePath dele. Um caminho que dois arquivos dariam fica com o
+/// primeiro.
 pub fn real_layout(files: Vec<Staged>) -> Vec<Staged> {
     let windows = windows_directory();
     let mut seen = std::collections::BTreeSet::new();
@@ -1893,6 +1882,9 @@ pub fn real_layout(files: Vec<Staged>) -> Vec<Staged> {
     for mut file in files {
         if file.host.is_none() && file.path.eq_ignore_ascii_case("NTOSKRNL.EXE") {
             continue;
+        }
+        if file.host.is_none() && file.path.eq_ignore_ascii_case("VGK.SYS") {
+            file.path = String::from("Windows/System32/drivers/vgk.sys");
         }
         if let Some(relative) = file.host.as_deref().and_then(|host| host.strip_prefix(&windows).ok()) {
             let relative = relative.to_string_lossy().replace('\\', "/");
@@ -1948,7 +1940,7 @@ mod tests {
             Staged { path: String::from("winevt/Logs/"), bytes: Vec::new(), host: Some(windows.join("System32/winevt/Logs")) },
         ];
         let paths: Vec<String> = real_layout(files).into_iter().map(|file| file.path).collect();
-        assert_eq!(paths, ["Windows/System32/drivers/acpi.sys", "Windows/explorer.exe", "Windows/System32/ntoskrnl.exe", "VGK.SYS", "Windows/System32/winevt/Logs/"]);
+        assert_eq!(paths, ["Windows/System32/drivers/acpi.sys", "Windows/explorer.exe", "Windows/System32/ntoskrnl.exe", "Windows/System32/drivers/vgk.sys", "Windows/System32/winevt/Logs/"]);
     }
 
     #[test]

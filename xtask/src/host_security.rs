@@ -546,40 +546,65 @@ pub struct SystemSecurity {
     pub root: Option<Vec<u8>>,
 }
 
-/// A pasta daqui de uma pasta vazia do volume: relativa ao `%SystemRoot%`,
-/// ao `%ProgramData%` ou ao `%ProgramFiles%` (vazia: a própria pasta).
+/// De onde vem o descritor de uma pasta vazia do volume: da pasta daqui,
+/// relativa ao `%SystemRoot%`, ao `%ProgramData%` ou ao `%ProgramFiles%`
+/// (vazia: a própria pasta), ou o padrão do 19041, em SDDL (a pasta existe
+/// numa instalação nova, e não depende de esta máquina a ter).
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy)]
-enum HostFolder {
+enum Folder {
     Windows(&'static str),
     ProgramData(&'static str),
     ProgramFiles(&'static str),
+    Stock(&'static str),
 }
 
-/// As pastas vazias de uma instalação nova que a cadeia usa: o caminho no
-/// volume (achatado como o `nt_path_to_volume_path`) e o daqui. O
-/// ProgramData, o AppRepository dele (os bancos do StateRepository, que o
-/// serviço cria só dentro de uma pasta que já existe; o conteúdo daqui não
-/// vai) com o `Packages` vazio (o AppXSvc cria nele a pasta de metadados de
-/// cada pacote que registra, e não cria o `Packages`), o Temp do Windows, os perfis do LocalService e do NetworkService, o
-/// perfil do SYSTEM, o LogFiles de System32, o Logs do Windows e o
-/// `Program Files\WindowsApps` do volume de pacotes padrão (o `SISPath` de
-/// `Appx\PackageVolumes`, que o AppXSvc confere em cada registro pelo
-/// sistema de arquivos dele; os pacotes desta máquina não vão). A lista
+/// O descritor da raiz da unidade do sistema numa instalação nova do
+/// Windows 10: a DACL e o rótulo obrigatório são os da regra
+/// WN10-00-000095 do STIG do Windows 10 da DISA, que os dá como os padrão
+/// (o `icacls c:\`): Administradores e SYSTEM com tudo, Usuários com leitura
+/// e execução, Usuários autenticados com a alteração só nas subpastas e nos
+/// arquivos e com a criação de pastas só na raiz, e o nível alto nos
+/// arquivos. O dono é o TrustedInstaller, o mesmo da `\Windows` da imagem.
+/// As quatro identidades são as do ClientRootAcl que o
+/// CANNED_SECURITY::GenerateCannedClientRootAcl do ifsutil.dll 19041 (0x70a4)
+/// põe na raiz de um volume novo formatado; a instalação troca a ACE de
+/// Usuários autenticados da raiz.
+#[cfg_attr(not(windows), allow(dead_code))]
+const STOCK_ROOT: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)(A;OICIIO;0x1301bf;;;AU)(A;;LC;;;AU)S:(ML;OINPIO;NW;;;HI)";
+
+/// O descritor de `System32\winevt\Logs` numa instalação nova: SYSTEM,
+/// Administradores e o serviço EventLog (NT SERVICE\EventLog) com tudo e
+/// Usuários autenticados com a leitura das pastas.
+#[cfg_attr(not(windows), allow(dead_code))]
+const STOCK_EVENT_LOGS: &str = "O:SYG:SYD:PAI(A;CI;FR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-80-880578595-1860270145-482643319-2788375705-1540778122)";
+
+/// As pastas vazias de uma instalação nova que a cadeia usa: o caminho da
+/// instalação e de onde vem o descritor. O ProgramData, o AppRepository dele
+/// (os bancos do StateRepository, que o serviço cria só dentro de uma pasta
+/// que já existe; o conteúdo daqui não vai) com o `Packages` vazio (o AppXSvc
+/// cria nele a pasta de metadados de cada pacote que registra, e não cria o
+/// `Packages`), o Temp do Windows, os perfis do LocalService e do
+/// NetworkService, o perfil do SYSTEM, o LogFiles e o `winevt\Logs` de
+/// System32 (o wevtsvc.dll cria nele os `.evtx` dos canais), o Logs do
+/// Windows e o `Program Files\WindowsApps` do volume de pacotes padrão (o
+/// `SISPath` de `Appx\PackageVolumes`, que o AppXSvc confere em cada registro
+/// pelo sistema de arquivos dele; os pacotes desta máquina não vão). A lista
 /// certa sai do log de auditoria do passo 2 (as negações de pasta que falta).
 #[cfg_attr(not(windows), allow(dead_code))]
-const EMPTY_DIRECTORIES: &[(&str, HostFolder)] = &[
-    ("ProgramData", HostFolder::ProgramData("")),
-    ("ProgramData/Microsoft/Windows/AppRepository", HostFolder::ProgramData("Microsoft/Windows/AppRepository")),
-    ("ProgramData/Microsoft/Windows/AppRepository/Packages", HostFolder::ProgramData("Microsoft/Windows/AppRepository/Packages")),
-    ("Temp", HostFolder::Windows("Temp")),
-    ("ServiceProfiles/LocalService", HostFolder::Windows("ServiceProfiles/LocalService")),
-    ("ServiceProfiles/NetworkService", HostFolder::Windows("ServiceProfiles/NetworkService")),
-    ("config/systemprofile", HostFolder::Windows("System32/config/systemprofile")),
-    ("LogFiles", HostFolder::Windows("System32/LogFiles")),
-    ("Logs", HostFolder::Windows("Logs")),
-    ("Program Files", HostFolder::ProgramFiles("")),
-    ("Program Files/WindowsApps", HostFolder::ProgramFiles("WindowsApps")),
+const EMPTY_DIRECTORIES: &[(&str, Folder)] = &[
+    ("ProgramData", Folder::ProgramData("")),
+    ("ProgramData/Microsoft/Windows/AppRepository", Folder::ProgramData("Microsoft/Windows/AppRepository")),
+    ("ProgramData/Microsoft/Windows/AppRepository/Packages", Folder::ProgramData("Microsoft/Windows/AppRepository/Packages")),
+    ("Windows/Temp", Folder::Windows("Temp")),
+    ("Windows/ServiceProfiles/LocalService", Folder::Windows("ServiceProfiles/LocalService")),
+    ("Windows/ServiceProfiles/NetworkService", Folder::Windows("ServiceProfiles/NetworkService")),
+    ("Windows/System32/config/systemprofile", Folder::Windows("System32/config/systemprofile")),
+    ("Windows/System32/LogFiles", Folder::Windows("System32/LogFiles")),
+    ("Windows/System32/winevt/Logs", Folder::Stock(STOCK_EVENT_LOGS)),
+    ("Windows/Logs", Folder::Windows("Logs")),
+    ("Program Files", Folder::ProgramFiles("")),
+    ("Program Files/WindowsApps", Folder::ProgramFiles("WindowsApps")),
 ];
 
 /// FILE_ATTRIBUTE_DIRECTORY e FILE_ATTRIBUTE_ARCHIVE: os atributos que o
@@ -596,20 +621,30 @@ fn parent_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
+/// O caminho de uma pasta da instalação na raiz achatada do volume (o
+/// conteúdo de System32 e o de `\Windows` na raiz).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn flat_path(path: &str) -> &str {
+    path.strip_prefix("Windows/System32/").or_else(|| path.strip_prefix("Windows/")).unwrap_or(path)
+}
+
 /// Os descritores dos arquivos que o volume leva: `files` são os caminhos
 /// no volume com a origem daqui (`None` para um arquivo gerado; um caminho
 /// terminado em '/' é uma pasta vazia, com a pasta daqui), `existing`
 /// os nós que já têm descritor (os perfis de usuário, que ficam como
-/// estão) e `empty_directories` põe no volume as pastas vazias de
+/// estão), `real` diz que o volume guarda cada arquivo no caminho da
+/// instalação (a raiz com o descritor de [`STOCK_ROOT`]; na achatada, a raiz
+/// faz o papel de System32 e fica com o descritor dele) e
+/// `empty_directories` põe no volume as pastas vazias de
 /// [`EMPTY_DIRECTORIES`] (o boot do smss).
-pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], empty_directories: bool) -> SystemSecurity {
+pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], real: bool, empty_directories: bool) -> SystemSecurity {
     #[cfg(windows)]
     {
-        host::system_nodes(files, existing, empty_directories)
+        host::system_nodes(files, existing, real, empty_directories)
     }
     #[cfg(not(windows))]
     {
-        let _ = (files, existing, empty_directories);
+        let _ = (files, existing, real, empty_directories);
         SystemSecurity::default()
     }
 }
@@ -617,7 +652,7 @@ pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], empt
 #[cfg(windows)]
 mod host {
     use super::descriptor::{self, Descriptor};
-    use super::{parent_of, security_of, settle, HostFolder, Node, SystemSecurity, DIRECTORY_ATTRIBUTES, EMPTY_DIRECTORIES, FILE_ATTRIBUTES};
+    use super::{flat_path, from_sddl, parent_of, security_of, settle, Folder, Node, SystemSecurity, DIRECTORY_ATTRIBUTES, EMPTY_DIRECTORIES, FILE_ATTRIBUTES, STOCK_ROOT};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
@@ -631,30 +666,40 @@ mod host {
         settle(&raw, None, Some((volume_parent, changed)), directory).map(|(settled, _)| settled)
     }
 
-    pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], empty_directories: bool) -> SystemSecurity {
+    pub fn system_nodes(files: &[(String, Option<PathBuf>)], existing: &[Node], real: bool, empty_directories: bool) -> SystemSecurity {
         let windows = crate::windows_binaries::windows_directory();
+        let stock = |sddl: &str| from_sddl(sddl).as_deref().and_then(Descriptor::parse);
         let system32 = windows.join("System32");
-        let Some((root, _)) = security_of(&system32).and_then(|raw| settle(&raw, None, None, true)) else {
-            println!("AVISO: descritor de {} ilegivel; o volume fica com o descritor comum", system32.display());
+        let root = if real { stock(STOCK_ROOT) } else { security_of(&system32).and_then(|raw| settle(&raw, None, None, true)).map(|(settled, _)| settled) };
+        let Some(root) = root else {
+            println!("AVISO: descritor de {} ilegivel; o volume fica com o descritor comum", if real { String::from("raiz da unidade do sistema") } else { system32.display().to_string() });
             return SystemSecurity::default();
         };
         // As entradas: (caminho no volume, se é pasta, origem daqui); um nome
         // terminado em '/' é uma pasta vazia do volume.
         let mut entries: Vec<(String, bool, Option<PathBuf>)> = files.iter().map(|(path, host)| (String::from(path.trim_end_matches('/')), path.ends_with('/'), host.clone())).collect();
+        // O descritor padrão do 19041 das pastas que o têm, pelo caminho em
+        // maiúsculas.
+        let mut stocked: BTreeMap<String, Descriptor> = BTreeMap::new();
         if empty_directories {
             let program_data = std::env::var("ProgramData").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/ProgramData"));
             let program_files = std::env::var("ProgramW6432").or_else(|_| std::env::var("ProgramFiles")).map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:/Program Files"));
-            for (volume, origin) in EMPTY_DIRECTORIES {
+            for (installed, origin) in EMPTY_DIRECTORIES {
+                let path = if real { *installed } else { flat_path(installed) };
                 let host = match *origin {
-                    HostFolder::Windows(relative) => windows.join(relative),
-                    HostFolder::ProgramData("") => program_data.clone(),
-                    HostFolder::ProgramData(relative) => program_data.join(relative),
-                    HostFolder::ProgramFiles("") => program_files.clone(),
-                    HostFolder::ProgramFiles(relative) => program_files.join(relative),
+                    Folder::Windows(relative) => Some(windows.join(relative)),
+                    Folder::ProgramData("") => Some(program_data.clone()),
+                    Folder::ProgramData(relative) => Some(program_data.join(relative)),
+                    Folder::ProgramFiles("") => Some(program_files.clone()),
+                    Folder::ProgramFiles(relative) => Some(program_files.join(relative)),
+                    Folder::Stock(sddl) => {
+                        stocked.extend(stock(sddl).map(|descriptor| (path.to_uppercase(), descriptor)));
+                        None
+                    }
                 };
                 // Uma pasta que esta máquina não deixa ver vai com o
                 // descritor herdado do pai no volume.
-                entries.push((String::from(*volume), true, host.is_dir().then_some(host)));
+                entries.push((String::from(path), true, host.filter(|host| host.is_dir())));
             }
         }
         let taken = |path: &str| existing.iter().any(|node| node.path.eq_ignore_ascii_case(path));
@@ -701,7 +746,7 @@ mod host {
             }
             let Some(parent) = settled.get(&parent_of(folder).to_uppercase()).cloned() else { continue };
             let upper = folder.to_uppercase();
-            let own = pairs.get(&upper).and_then(|host| host_descriptor(host, &parent, true, &mut parents));
+            let own = stocked.get(&upper).cloned().or_else(|| pairs.get(&upper).and_then(|host| host_descriptor(host, &parent, true, &mut parents)));
             let security = own.unwrap_or_else(|| descriptor::inherited(&parent, true));
             nodes.push(Node { path: folder.clone(), directory: true, attributes: DIRECTORY_ATTRIBUTES, security: Some(security.to_bytes()) });
             settled.insert(upper, security);
@@ -782,7 +827,7 @@ mod tests {
             (String::from("Windows/System32/kernel32.dll"), Some(windows.join("System32/kernel32.dll"))),
             (String::from("Windows/System32/config/SYSTEM"), None),
         ];
-        let security = super::system_nodes(&files, &[], false);
+        let security = super::system_nodes(&files, &[], false, false);
         let root = security.root.as_deref().and_then(Descriptor::parse).expect("raiz com o descritor de System32");
         assert!(root.sids().all(|sid| !descriptor::is_account(sid)));
         for node in &security.nodes {
@@ -793,5 +838,34 @@ mod tests {
         assert_eq!(hive.owner, Some(sid(5, &[32, 544])));
         assert!(hive.dacl.as_ref().is_some_and(|(_, aces)| !aces.is_empty() && aces.iter().all(|ace| ace.flags & ID != 0)));
         assert!(security.nodes.iter().any(|node| node.directory && node.path == "Windows/System32/config"));
+    }
+
+    /// No leiaute real a raiz tem o descritor padrão da unidade do sistema e
+    /// as pastas vazias ficam nos caminhos da instalação, o `winevt\Logs` com
+    /// o padrão do 19041 (o serviço EventLog), sem depender desta máquina; na
+    /// raiz achatada, sem o `\Windows` e o System32 na frente.
+    #[cfg(windows)]
+    #[test]
+    fn real_layout_folders_have_the_stock_descriptors() {
+        let security = super::system_nodes(&[], &[], true, true);
+        let root = security.root.as_deref().and_then(Descriptor::parse).expect("raiz padrao");
+        let (authenticated, users) = (sid(5, &[11]), sid(5, &[32, 545]));
+        let aces = &root.dacl.as_ref().expect("DACL da raiz").1;
+        assert!(root.dacl_protected() && aces.len() == 5 && root.sids().all(|sid| !descriptor::is_account(sid)));
+        assert!(aces.iter().any(|ace| ace.sid.as_ref() == Some(&authenticated) && ace.flags == 0 && ace.mask == 4));
+        assert!(aces.iter().any(|ace| ace.sid.as_ref() == Some(&users) && ace.flags == OI | CI && ace.mask == 0x0012_00A9));
+        let node = |path: &str| security.nodes.iter().find(|node| node.directory && node.path == path).unwrap_or_else(|| panic!("{path} fora do volume"));
+        for path in ["Windows", "Windows/Temp", "Windows/System32", "Windows/System32/LogFiles", "Windows/System32/config/systemprofile", "Windows/ServiceProfiles/LocalService", "ProgramData", "Program Files/WindowsApps"] {
+            let parsed = node(path).security.as_deref().and_then(Descriptor::parse).expect("descritor legivel");
+            assert!(parsed.sids().all(|sid| !descriptor::is_account(sid)), "{path}: SID de conta");
+        }
+        let logs = node("Windows/System32/winevt/Logs").security.as_deref().and_then(Descriptor::parse).expect("winevt/Logs");
+        let event_log = descriptor::sid_from_text("S-1-5-80-880578595-1860270145-482643319-2788375705-1540778122");
+        assert!(logs.dacl_protected() && logs.dacl.as_ref().is_some_and(|(_, aces)| aces.len() == 4 && aces.iter().any(|ace| ace.sid == event_log)));
+        let flat = super::system_nodes(&[], &[], false, true);
+        for path in ["Temp", "config/systemprofile", "LogFiles", "Logs", "winevt/Logs", "ServiceProfiles/LocalService"] {
+            assert!(flat.nodes.iter().any(|node| node.directory && node.path == path), "{path} fora da raiz achatada");
+        }
+        assert!(flat.nodes.iter().all(|node| !node.path.starts_with("Windows")));
     }
 }
