@@ -129,9 +129,9 @@ impl ReadCache {
     }
 }
 
-/// Os diretórios de instalação cujo conteúdo o volume de boot guarda na
-/// raiz, do mais longo ao mais curto: os mesmos aliases de
-/// [`nt_path_to_volume_path`], já relativos ao volume.
+/// Os diretórios de instalação cujo conteúdo o volume do boot comum guarda
+/// na raiz achatada, do mais longo ao mais curto: os mesmos aliases de
+/// [`flat_volume_path`], já relativos ao volume.
 const INSTALL_ALIASES: [&str; 3] = ["/windows/globalization/sorting/", "/windows/system32/", "/windows/"];
 
 /// O alias de instalação para um caminho já relativo ao volume de boot (a
@@ -143,8 +143,17 @@ const INSTALL_ALIASES: [&str; 3] = ["/windows/globalization/sorting/", "/windows
 /// `/Windows/Fonts/X` que não existe vira `/X` ou `/Fonts/X` quando este
 /// existe, e o kernel e o modo usuário abrem o mesmo arquivo. O caminho
 /// literal que existe (os drivers e catálogos de `/Windows/System32`) fica
-/// como está; fora de `\Windows`, `None`.
+/// como está; fora de `\Windows`, `None`. No leiaute real não há alias: cada
+/// caminho é um arquivo, e o que não existe não existe.
 pub fn install_alias(volume_path: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    if real_layout() {
+        return None;
+    }
+    flat_install_alias(volume_path, exists)
+}
+
+/// [`install_alias`] da raiz achatada.
+pub fn flat_install_alias(volume_path: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
     let lower = volume_path.replace('\\', "/").to_lowercase();
     let prefix = INSTALL_ALIASES.iter().find(|prefix| lower.starts_with(*prefix))?;
     let rest = &volume_path[prefix.len()..];
@@ -299,20 +308,38 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
         }
         path = String::from(&path[2..]);
     }
-    let mut path = String::from(path.trim_matches('\\'));
+    let path = String::from(path.trim_matches('\\'));
     if real_layout() {
         let lower = path.to_lowercase();
-        if lower == "device\\kernelvolume1" || lower.starts_with("device\\kernelvolume1\\") {
-            path = String::from(path["device\\kernelvolume1".len()..].trim_start_matches('\\'));
-        } else if system_volume_switched() {
+        if system_volume_switched() && lower != "device\\kernelvolume1" && !lower.starts_with("device\\kernelvolume1\\") {
             // Depois da troca do `\SystemRoot`, as unidades e o `\SystemRoot`
             // são do volume do sistema (o ntfs.sys), não do volume do kernel.
             return None;
-        } else if lower == "systemroot" || lower.starts_with("systemroot\\") {
-            path = alloc::format!("Windows{}", &path["systemroot".len()..]);
         }
-        return checked_volume_path(&path);
+        return installed_volume_path(&path);
     }
+    flat_volume_path(&path)
+}
+
+/// O caminho no volume de um caminho relativo à unidade, com o `\SystemRoot`
+/// (o `\Windows`) e o `\Device\KernelVolume1` tirados da frente, no leiaute
+/// real: o caminho da instalação, sem aliases (`C:\x`, `C:\Windows\x` e
+/// `C:\Windows\System32\x` são três arquivos).
+pub fn installed_volume_path(path: &str) -> Option<String> {
+    let lower = path.to_lowercase();
+    if lower == "device\\kernelvolume1" || lower.starts_with("device\\kernelvolume1\\") {
+        checked_volume_path(path["device\\kernelvolume1".len()..].trim_start_matches('\\'))
+    } else if lower == "systemroot" || lower.starts_with("systemroot\\") {
+        checked_volume_path(&alloc::format!("Windows{}", &path["systemroot".len()..]))
+    } else {
+        checked_volume_path(path)
+    }
+}
+
+/// O mesmo na raiz achatada do boot comum: o `\Windows`, o System32 e a pasta
+/// de ordenação da globalização são a raiz.
+fn flat_volume_path(path: &str) -> Option<String> {
+    let mut path = String::from(path);
     for prefix in ["device\\kernelvolume1", "windows\\globalization\\sorting", "systemroot\\globalization\\sorting", "windows\\system32", "systemroot\\system32", "windows", "systemroot"] {
         let lower = path.to_lowercase();
         if lower == prefix {

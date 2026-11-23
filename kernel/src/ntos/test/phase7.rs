@@ -1133,6 +1133,21 @@ fn volume_file_lookup(assert: Assert) {
     use crate::drivers::fs::volume_files::{self, nt_path_to_volume_path};
     assert(nt_path_to_volume_path("\\??\\C:\\Windows\\System32\\ntdll.dll").as_deref() == Some("/ntdll.dll") && nt_path_to_volume_path("C:\\Windows\\Globalization\\Sorting\\SortDefault.nls").as_deref() == Some("/SortDefault.nls") && nt_path_to_volume_path("D:\\dir\\sub\\file.txt").as_deref() == Some("/dir/sub/file.txt") && nt_path_to_volume_path("/Device/KernelVolume1/x.bin").as_deref() == Some("/x.bin"), "volumefiles: prefixos NT/DOS e aliases de instalacao");
     assert(nt_path_to_volume_path("E:\\x").is_none() && nt_path_to_volume_path("C:\\a\\..\\b").is_none() && nt_path_to_volume_path("C:\\a?b").is_none() && nt_path_to_volume_path("C:\\Windows").as_deref() == Some("/"), "volumefiles: unidade, travessia e caracteres proibidos recusados");
+    // O leiaute real do boot do smss: o caminho da instalação, sem aliases
+    // (os mesmos nomes da raiz achatada dão três arquivos diferentes).
+    let installed = volume_files::installed_volume_path;
+    assert(
+        installed("Windows\\System32\\ntdll.dll").as_deref() == Some("/Windows/System32/ntdll.dll")
+            && installed("Windows\\ntdll.dll").as_deref() == Some("/Windows/ntdll.dll")
+            && installed("ntdll.dll").as_deref() == Some("/ntdll.dll")
+            && installed("SystemRoot\\System32\\ntdll.dll").as_deref() == Some("/Windows/System32/ntdll.dll")
+            && installed("Device\\KernelVolume1\\Windows\\Fonts\\x.ttf").as_deref() == Some("/Windows/Fonts/x.ttf")
+            && installed("Windows").as_deref() == Some("/Windows")
+            && installed("SystemRootX\\a").as_deref() == Some("/SystemRootX/a")
+            && installed("Windows\\..\\a").is_none(),
+        "volumefiles: no leiaute real C:\\x, C:\\Windows\\x e C:\\Windows\\System32\\x sao tres arquivos",
+    );
+    assert(volume_files::real_layout() || volume_files::install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll") == volume_files::flat_install_alias("/Windows/System32/kbdus.dll", |path| path == "/kbdus.dll"), "volumefiles: o alias de instalacao e o da raiz achatada no boot comum");
     let Some(file) = volume_files::lookup_volume_file("C:\\Windows\\System32\\HELLO.TXT") else {
         assert(false, "volumefiles: HELLO.TXT do volume de teste");
         return;
