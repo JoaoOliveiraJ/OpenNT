@@ -1,8 +1,9 @@
 //! FASE 1 do boot (estilo NT).
 //!
 //! Sobe o I/O Manager e os exports do kernel, monta o NTFS do segundo disco
-//! IDE em `D:` (driver ata-pio), carrega a hive SYSTEM do arquivo desse
-//! volume (ou semeia as chaves estáticas dela), enumera o PCI, carrega os drivers de
+//! IDE (driver ata-pio; o `C:` do boot do smss, o `D:` do boot comum),
+//! carrega a hive SYSTEM do arquivo desse volume (ou semeia as chaves
+//! estáticas dela), enumera o PCI, carrega os drivers de
 //! serviço de boot lidos do Registry com IRP_MJ_PNP/START_DEVICE, publica o
 //! catálogo CNG e executa as rotinas de reinicialização dos drivers. Os
 //! binários da Microsoft (hal.dll, atapi, disk, mountmgr, i8042prt,
@@ -45,25 +46,24 @@ pub fn init() {
     }
     // NTFS no segundo disco IDE (ata-pio): o carregador de imagens e o
     // ZwCreateFile resolvem o mesmo volume, montado no dispositivo
-    // \Device\KernelVolume1 (o D:). No boot do smss ele é também o C:, o
-    // volume do sistema (o \Windows do \SystemRoot): os caminhos C:\ que o
-    // modo usuário passa ao kernel (o \??\C:\WINDOWS\FONTS\X.TTF do
-    // AddFontResource que o win32k abre) chegam ao mesmo volume que o modo
-    // usuário abre por C:.
+    // \Device\KernelVolume1. No boot do smss ele é o C:, o volume do sistema
+    // (o \Windows do \SystemRoot): os caminhos C:\ que o modo usuário passa
+    // ao kernel (o \??\C:\WINDOWS\FONTS\X.TTF do AddFontResource que o win32k
+    // abre) chegam ao mesmo volume que o modo usuário abre por C:. Uma
+    // instalação tem uma letra por volume, e o Explorador mostra cada letra
+    // como uma unidade. No boot comum, em que o C: é o disco em memória, ele
+    // é o D:.
     if matches!(crate::drivers::storage::ata_pio::present(1), Ok(true)) {
         match crate::drivers::fs::ntfs::mount(1) {
             Ok(volume) => {
                 crate::drivers::fs::ntfs::set_mounted(Some(volume));
-                let link_drives = |device: alloc::string::String| -> Result<(), crate::rtl::KernelError> {
-                    crate::ntos::ob::object_manager::create_symlink("\\GLOBAL??\\D:", &device)?;
-                    if crate::ntos::init::boot_config::smss_boot() {
-                        crate::ntos::ob::object_manager::create_symlink("\\GLOBAL??\\C:", &device)?;
-                    }
-                    Ok(())
-                };
-                let mounted = crate::drivers::fs::ntfs::fixed().ok_or_else(|| crate::rtl::KernelError::new("NTFS sem volume")).and_then(|file_system| crate::drivers::fs::volume_device::mount(crate::drivers::fs::ntfs::DEVICE_INDEX, file_system)).and_then(link_drives);
+                let drive = if crate::ntos::init::boot_config::smss_boot() { "C:" } else { "D:" };
+                let mounted = crate::drivers::fs::ntfs::fixed()
+                    .ok_or_else(|| crate::rtl::KernelError::new("NTFS sem volume"))
+                    .and_then(|file_system| crate::drivers::fs::volume_device::mount(crate::drivers::fs::ntfs::DEVICE_INDEX, file_system))
+                    .and_then(|device| crate::ntos::ob::object_manager::create_symlink(&alloc::format!("\\GLOBAL??\\{drive}"), &device));
                 match mounted {
-                    Ok(_) => debug_print!("[boot] NTFS montado em D:"),
+                    Ok(_) => debug_print!("[boot] NTFS montado em {}", drive),
                     Err(error) => {
                         crate::drivers::fs::ntfs::set_mounted(None);
                         debug_print!("[boot] NTFS falhou: {}", error);

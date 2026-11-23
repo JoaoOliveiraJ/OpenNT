@@ -2647,10 +2647,10 @@ cadeia inteira passar com a opção. As decisões:
    OI/CI e ALL APPLICATION PACKAGES) antes de a cadeia rodar nele, senão os
    processos AppContainer não abrem nada.
 7. **O arquivo de paginação** no C: pelo ntfs.sys: o NtCreatePagingFile já
-   segue o MiCreatePagingFile, e com `--volume-sistema=ntfs.sys` o
-   PagingFiles da imagem é o C:\pagefile.sys (`hive_image::machine_hives`;
-   o boot comum continua com o D:), que o smss cria pelo ntfs.sys; falta o
-   PpPagePathAssign (DEVICE_USAGE_NOTIFICATION à pilha do volume).
+   segue o MiCreatePagingFile, e o PagingFiles do boot do smss é o
+   C:\pagefile.sys (`cm/session_manager.rs`), que o smss cria pelo ntfs.sys
+   com `--volume-sistema=ntfs.sys`; falta o PpPagePathAssign
+   (DEVICE_USAGE_NOTIFICATION à pilha do volume).
 
 Os marcos, cada um com um teste:
 
@@ -2716,9 +2716,9 @@ as tabelas NLS por ele, o ImagePath dos serviços vira o caminho embaixo de
 `/Windows`; as imagens do bundle, guardadas com o nome achatado, são
 achadas pelo nome do arquivo do caminho da instalação). Os consumidores já
 não dependem do leiaute: quando o leiaute real virar o padrão dos boots do
-NTFS do kernel, só o `real_layout` muda. No leiaute real, o C: e o D: só
-traduzem para o volume do kernel enquanto o `\GLOBAL??\X:` não existe ou
-leva ao dispositivo dele.
+NTFS do kernel, só o `real_layout` muda. No leiaute real, o C: (e o D:, que
+só o boot sem o smss tem) só traduz para o volume do kernel enquanto o
+`\GLOBAL??\X:` não existe ou leva ao dispositivo dele.
 
 O que o S1 faz (teste `volume-sistema`, `SYSTEM_VOLUME_SWITCHED_OK`):
 antes de o atapi.sys assumir a controladora, o NTFS do kernel deixa na
@@ -2780,8 +2780,8 @@ rodam dos arquivos do ntfs.sys. Para isso o locale.nls do
 NtInitializeNlsFiles é aberto pelo `\SystemRoot`, como no NT; o `\??\C:`
 com acesso além da abertura direta é a abertura do volume pelo file system
 (FO_VOLUME_OPEN) e o `\??\C:\` é a raiz do volume montado
-(`ps/user/files.rs`); o D: do volume do kernel sai depois da troca, e o
-smss faz o arquivo de paginação no C:, pelo ntfs.sys (item 7); e o
+(`ps/user/files.rs`); o volume do kernel não tem mais letra depois da
+troca, e o smss faz o arquivo de paginação no C:, pelo ntfs.sys (item 7); e o
 SystemFile e o ZwCreateFile do CmpOpenHiveFile rodam em KernelMode, como
 os serviços Zw: a descarga de uma hive pedida por um NtFlushKey de modo
 usuário grava pelo handle de kernel da hive (sem isso o lsass não gravava a
@@ -4202,9 +4202,10 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   FILE_DEVICE_DISK_FILE_SYSTEM (DRIVER_OBJECT `\FileSystem\KernelVolume`) e o
   IopMountInitializeVpb o marca montado. `\FS` e `\??\C:` levam ao
   primeiro, `\??\D:` e `\SystemRoot` (`...\Windows`) ao segundo; no boot do
-  smss o `\??\C:` também leva ao segundo, o volume do sistema, que é o C:
-  dos caminhos do modo usuário (o win32k abre o `\??\C:\WINDOWS\FONTS\X.TTF`
-  que o AddFontResource lhe passa); o nó do
+  smss o `\??\C:` leva ao segundo, o volume do sistema, que é o C: dos
+  caminhos do modo usuário (o win32k abre o `\??\C:\WINDOWS\FONTS\X.TTF`
+  que o AddFontResource lhe passa), e não há D:, como numa instalação de um
+  volume só; o nó do
   dispositivo entrega o resto do nome ao volume (`object_manager::mount_device`),
   e os nomes das fontes de imagem saem do dispositivo (`ntfs::nt_path`).
   Todo FILE_OBJECT aberto num desses volumes (ZwCreateFile do kernel, as
@@ -4373,7 +4374,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
   só o vão até ela e o leva ao fim dela, e o corte o traz ao tamanho novo. A
   E/S de paginação dos arquivos de paginação lê os clusters crus (o
   MiCreatePagingFile do 19041 só põe o EndOfFile, e o Mm só lê o que
-  gravou). Antes, os 448 MB do `D:\pagefile.sys` e do `C:\swapfile.sys`
+  gravou). Antes, os 448 MB do `pagefile.sys` e do `C:\swapfile.sys`
   eram gravados com zeros em todo boot do smss (de 5 a 17 s com a thread do
   smss parada). Teste: `ntfs_writer` na fase 4.
 - **Transações do NTFS do volume de boot** (`drivers/fs/ntfs_write.rs`): o
@@ -4904,7 +4905,8 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     página por E/S de paginação. O adaptador de usuário está em
     `ps/user/memory.rs`.
   - O smss.exe real chama o NtCreatePagingFile com o valor `PagingFiles` do
-    Session Manager (`cm/session_manager.rs`: `D:\pagefile.sys 192 256`).
+    Session Manager (`cm/session_manager.rs`: `C:\pagefile.sys 192 256`; uma
+    instalação nova tem `?:\pagefile.sys`, e o smss escolhe o tamanho).
     Antes ele abre `Control\CrashControl` e lista os volumes com o
     ProcessDeviceMap (`ob/device_map.rs`, montado a partir dos links `X:`
     do `\??` do processo, o `\GLOBAL??` para o SYSTEM).
@@ -4930,7 +4932,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     MiPageFileNoFreeSpace, que faz o pedido estático (commit acima de 80%
     do limite, ou 4096 páginas ou mais esperando o arquivo); quem grava
     páginas para conseguir memória espera esse pedido terminar e continua
-    gravando no espaço novo. No D: (file system embutido), o
+    gravando no espaço novo. No volume do file system embutido, o
     IoSetInformation de FileEndOfFileInformation num FILE_OBJECT muda o
     tamanho do arquivo no volume (`io/file/zw.rs`). O volume do boot do
     smss tem 800 MB livres: o máximo do arquivo, os 256 MB do
@@ -4939,7 +4941,7 @@ AX=0003h, com a posse do vídeo tirada do console (Inbv) durante as trocas.
     folga.
   - E/S: IoPageRead e IoSynchronousPageWrite (IRP_PAGING_IO,
     `io/paging_io.rs`), enviados ao dispositivo do IoGetRelatedDeviceObject.
-    No D: (file system embutido) o volume atende esses IRPs direto nas runs
+    No file system embutido o volume atende esses IRPs direto nas runs
     do arquivo (`drivers/fs/volume_device.rs`, `Ntfs::paging_write`).
   - Página fora do working set: entrada no `paging` da região
     (`ps/user/memory.rs`) e PTE de transição ou de arquivo de paginação

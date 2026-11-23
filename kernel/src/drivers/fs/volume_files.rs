@@ -274,8 +274,9 @@ pub fn system32_path(relative: &str) -> String {
     }
 }
 
-/// Normaliza separadores e prefixos NT/DOS, aceita as unidades C e D e
-/// preserva subdiretórios. Na raiz achatada, só os aliases de instalação
+/// Normaliza separadores e prefixos NT/DOS, aceita as unidades do volume do
+/// kernel (o C: e, no boot comum, o D:) e preserva subdiretórios. Na raiz
+/// achatada, só os aliases de instalação
 /// apontam para a raiz do disco de boot; no leiaute real ([`real_layout`]),
 /// o caminho é o da instalação (o `\SystemRoot` é o `\Windows`). `.`/`..` e
 /// caracteres proibidos são recusados.
@@ -289,7 +290,9 @@ pub fn nt_path_to_volume_path(nt_path: &str) -> Option<String> {
     }
     let bytes = path.as_bytes();
     if bytes.len() >= 2 && bytes[1] == b':' {
-        if !matches!(bytes[0].to_ascii_lowercase(), b'c' | b'd') || (real_layout() && !kernel_volume_letter(bytes[0])) {
+        let drive = bytes[0].to_ascii_lowercase();
+        let kernel_drive = drive == b'c' || (drive == b'd' && !crate::ntos::init::boot_config::smss_boot());
+        if !kernel_drive || (real_layout() && !kernel_volume_letter(bytes[0])) {
             return None;
         }
         path = String::from(&path[2..]);

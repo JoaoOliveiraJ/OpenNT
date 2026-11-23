@@ -427,7 +427,8 @@ pub fn mount(drive: u8) -> Result<Arc<Ntfs>, KernelError> {
     Ok(Arc::new(Ntfs { drive, base, geometry, boot, pending: SpinLock::new(Vec::new()), caches: SpinLock::new(Caches { generation, directories: BTreeMap::new(), layouts: BTreeMap::new() }), writer: super::ntfs_write::new_writer(), secure_cache: SpinLock::new(BTreeMap::new()) }))
 }
 
-/// Índice do dispositivo do volume (`\Device\KernelVolume1`, o D:).
+/// Índice do dispositivo do volume (`\Device\KernelVolume1`: o C: do boot do
+/// smss, o D: do boot comum).
 pub const DEVICE_INDEX: u32 = 1;
 
 /// O caminho NT de um arquivo do volume, pelo dispositivo dele.

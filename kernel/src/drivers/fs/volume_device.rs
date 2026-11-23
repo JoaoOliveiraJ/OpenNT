@@ -8,9 +8,9 @@
 //! embutido do kernel: o VPB fica VPB_MOUNTED, com DeviceObject = o
 //! dispositivo de volume do file system (FILE_DEVICE_DISK_FILE_SYSTEM, sem
 //! nome, do DRIVER_OBJECT `\FileSystem\KernelVolume`), o número de série e o
-//! rótulo do volume. `\SystemRoot`, `\??\C:` e `\??\D:` são links para esses
-//! dispositivos; o nó do dispositivo entrega o resto do caminho ao volume
-//! (`object_manager::mount_device`).
+//! rótulo do volume. `\SystemRoot`, `\??\C:` e, sem o smss, `\??\D:` são
+//! links para esses dispositivos; o nó do dispositivo entrega o resto do
+//! caminho ao volume (`object_manager::mount_device`).
 //!
 //! Um FILE_OBJECT aberto num desses volumes nasce como o do IopParseDevice
 //! ([`bind_file`]): DeviceObject = o dispositivo real, Vpb = o VPB (com uma

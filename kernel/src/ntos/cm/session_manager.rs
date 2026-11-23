@@ -11,10 +11,10 @@
 //! (`\SystemRoot\System32\win32k.sys`): o smss da sessão o carrega pela
 //! SystemExtendServiceTableInformation antes de criar o csrss. Ficam de fora
 //! o que pertence a outro marco ou à máquina de origem: o `BootExecute` (o
-//! autochk) e as renomeações pendentes; o arquivo de paginação fica no
-//! volume de dados (D:) em vez do C: da instalação; do
-//! ambiente saem os caminhos de programas de terceiros. Só o boot do
-//! processo inicial real (`--initial-process=smss`) leva esta configuração.
+//! autochk) e as renomeações pendentes; o arquivo de paginação tem tamanho
+//! fixo, o que cabe no volume da imagem; do ambiente saem os caminhos de
+//! programas de terceiros. Só o boot do processo inicial real
+//! (`--initial-process=smss`) leva esta configuração.
 //!
 //! Dados puros da hive SYSTEM (veja `cm/seed.rs`): o `xtask` grava estas
 //! chaves no arquivo da hive e o kernel só as semeia em memória quando o
@@ -144,13 +144,13 @@ const ENVIRONMENT: &[(&str, Value)] = &[
     ("windir", Value::Text(REG_EXPAND_SZ, "%SystemRoot%")),
 ];
 
-/// `Memory Management`. O `PagingFiles` segue o formato da instalação
-/// (`caminho mínimo máximo`, em MB), com o arquivo de paginação no volume de
-/// dados D:, que o smss cria pelo NtCreatePagingFile; a imagem de
-/// `--volume-sistema=ntfs.sys` troca o valor por
-/// [`SYSTEM_VOLUME_PAGING_FILES`].
+/// `Memory Management`. O `PagingFiles` de uma instalação nova é
+/// `?:\pagefile.sys`: o smss escolhe o volume e o tamanho. Aqui ele segue o
+/// formato com os tamanhos (`caminho mínimo máximo`, em MB), os que cabem no
+/// volume da imagem, e o arquivo fica no C:, o volume do sistema, onde uma
+/// instalação o põe.
 const MEMORY_MANAGEMENT: &[(&str, Value)] = &[
-    ("PagingFiles", Value::Strings(&["D:\\pagefile.sys 192 256"])),
+    ("PagingFiles", Value::Strings(&["C:\\pagefile.sys 192 256"])),
     ("ClearPageFileAtShutdown", Value::Number(0)),
     ("DisablePagingExecutive", Value::Number(0)),
     ("LargeSystemCache", Value::Number(0)),
@@ -219,9 +219,3 @@ pub fn seed_keys() -> Vec<SeedKey> {
     }
     alloc::vec![key("", ROOT), key("SubSystems", SUBSYSTEMS), key("KnownDLLs", &known), key("DOS Devices", &devices), key("Environment", ENVIRONMENT), key("Memory Management", MEMORY_MANAGEMENT), crash_control]
 }
-
-/// O `PagingFiles` da imagem de `--volume-sistema=ntfs.sys`
-/// (`hive_image::machine_hives` do xtask): o arquivo de paginação no C:,
-/// servido pelo ntfs.sys (depois da troca do `\SystemRoot` o volume do
-/// kernel não recebe E/S nem tem letra).
-pub const SYSTEM_VOLUME_PAGING_FILES: &[&str] = &["C:\\pagefile.sys 192 256"];

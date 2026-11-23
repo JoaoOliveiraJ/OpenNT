@@ -525,7 +525,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     }
     // As hives de máquina que o kernel carrega no boot, das tabelas de
     // semente dele.
-    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", !options.system_volume.is_empty(), setup_command.as_deref(), options.wow64) {
+    for (name, image) in crate::hive_image::machine_hives(options.initial_process == "smss", setup_command.as_deref(), options.wow64) {
         let path = format!("Windows/System32/config/{name}");
         origins.push((path.clone(), None));
         ntfs_files.push((path, image));
@@ -553,7 +553,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildOutput, String> {
     println!("descritores dos arquivos do Windows no volume NTFS: {} nos ({} pastas), raiz {}", security.nodes.len(), security.nodes.iter().filter(|node| node.directory).count(), if security.root.is_some() { "com o descritor de System32" } else { "com o descritor comum" });
     nodes.extend(security.nodes);
     // O boot do smss cria o arquivo de paginação do `PagingFiles` (192 MB a
-    // 256 MB em D:): o volume dele tem espaço livre para o arquivo crescer
+    // 256 MB em C:): o volume dele tem espaço livre para o arquivo crescer
     // até o máximo.
     let free_space_mib = if options.initial_process == "smss" { SMSS_FREE_SPACE_MIB } else { 32 };
     // `--volume-sistema=ntfs.sys`: o mesmo volume numa partição do disco,
